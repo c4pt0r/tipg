@@ -1,0 +1,19 @@
+DROP TABLE
+CREATE TABLE
+INSERT 1
+psql-18:tests/05_transaction.sql:12: could not interpret result from server: INSERT 1
+ id | val 
+----+-----
+(0 rows)
+
+INSERT 1
+psql-18:tests/05_transaction.sql:19: could not interpret result from server: INSERT 1
+INSERT 1
+psql-18:tests/05_transaction.sql:20: could not interpret result from server: INSERT 1
+ id |      val       
+----+----------------
+ 2  | committed
+ 3  | also_committed
+(2 rows)
+
+DROP TABLE

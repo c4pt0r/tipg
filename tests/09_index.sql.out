@@ -1,0 +1,19 @@
+DROP TABLE
+CREATE TABLE
+INSERT 1
+psql-18:tests/09_index.sql:11: could not interpret result from server: INSERT 1
+INSERT 1
+psql-18:tests/09_index.sql:12: could not interpret result from server: INSERT 1
+INSERT 1
+psql-18:tests/09_index.sql:13: could not interpret result from server: INSERT 1
+CREATE INDEX
+CREATE INDEX
+psql-18:tests/09_index.sql:23: ERROR:  Duplicate entry for unique index
+ id | name  | age 
+----+-------+-----
+ 1  | Alice | 20
+ 2  | Bob   | 30
+ 3  | Alice | 25
+(3 rows)
+
+DROP TABLE

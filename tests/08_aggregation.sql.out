@@ -1,0 +1,31 @@
+DROP TABLE
+CREATE TABLE
+INSERT 1
+psql-18:tests/08_aggregation.sql:12: could not interpret result from server: INSERT 1
+INSERT 1
+psql-18:tests/08_aggregation.sql:13: could not interpret result from server: INSERT 1
+INSERT 1
+psql-18:tests/08_aggregation.sql:14: could not interpret result from server: INSERT 1
+INSERT 1
+psql-18:tests/08_aggregation.sql:15: could not interpret result from server: INSERT 1
+ col 
+-----
+ 4
+(1 row)
+
+ col 
+-----
+ 45
+(1 row)
+
+ col | col 
+-----+-----
+ 20  | 5
+(1 row)
+
+ col 
+-----
+ 30
+(1 row)
+
+DROP TABLE

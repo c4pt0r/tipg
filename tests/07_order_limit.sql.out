@@ -1,0 +1,43 @@
+DROP TABLE
+CREATE TABLE
+INSERT 1
+psql-18:tests/07_order_limit.sql:10: could not interpret result from server: INSERT 1
+INSERT 1
+psql-18:tests/07_order_limit.sql:11: could not interpret result from server: INSERT 1
+INSERT 1
+psql-18:tests/07_order_limit.sql:12: could not interpret result from server: INSERT 1
+INSERT 1
+psql-18:tests/07_order_limit.sql:13: could not interpret result from server: INSERT 1
+INSERT 1
+psql-18:tests/07_order_limit.sql:14: could not interpret result from server: INSERT 1
+  name   | score 
+---------+-------
+ Charlie | 70
+ Alice   | 80
+ David   | 85
+ Bob     | 90
+ Eve     | 95
+(5 rows)
+
+  name   | score 
+---------+-------
+ Eve     | 95
+ Bob     | 90
+ David   | 85
+ Alice   | 80
+ Charlie | 70
+(5 rows)
+
+ name | score 
+------+-------
+ Eve  | 95
+ Bob  | 90
+(2 rows)
+
+ name  | score 
+-------+-------
+ David | 85
+ Alice | 80
+(2 rows)
+
+DROP TABLE

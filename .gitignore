@@ -1,0 +1,23 @@
+/target
+*.log
+*.txt
+!README.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp test files
+test_*.sql
+!tests/*.sql
+
+# Environment
+.env
+.env.local

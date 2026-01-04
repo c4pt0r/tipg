@@ -1,0 +1,27 @@
+DROP TABLE
+CREATE TABLE
+INSERT 1
+psql-18:tests/11_group_by.sql:11: could not interpret result from server: INSERT 1
+INSERT 1
+psql-18:tests/11_group_by.sql:12: could not interpret result from server: INSERT 1
+INSERT 1
+psql-18:tests/11_group_by.sql:13: could not interpret result from server: INSERT 1
+INSERT 1
+psql-18:tests/11_group_by.sql:14: could not interpret result from server: INSERT 1
+INSERT 1
+psql-18:tests/11_group_by.sql:15: could not interpret result from server: INSERT 1
+   col   | col 
+---------+-----
+ Bob     | 25
+ Charlie | 50
+ Alice   | 40
+(3 rows)
+
+   col   | col | col 
+---------+-----+-----
+ Charlie | 1   | 50
+ Alice   | 2   | 30
+ Bob     | 2   | 20
+(3 rows)
+
+DROP TABLE

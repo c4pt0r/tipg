@@ -1,0 +1,25 @@
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+INSERT 1
+psql-18:tests/10_index_scan.sql:13: could not interpret result from server: INSERT 1
+INSERT 1
+psql-18:tests/10_index_scan.sql:14: could not interpret result from server: INSERT 1
+INSERT 1
+psql-18:tests/10_index_scan.sql:15: could not interpret result from server: INSERT 1
+ id | name  | age 
+----+-------+-----
+ 1  | Alice | 20
+(1 row)
+
+ id | name | age 
+----+------+-----
+(0 rows)
+
+ id | name  | age 
+----+-------+-----
+ 3  | Alice | 25
+ 2  | Bob   | 30
+(2 rows)
+
+DROP TABLE

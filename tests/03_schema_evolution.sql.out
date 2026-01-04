@@ -1,0 +1,22 @@
+DROP TABLE
+CREATE TABLE
+INSERT 1
+psql-18:tests/03_schema_evolution.sql:11: could not interpret result from server: INSERT 1
+ALTER TABLE
+ id | v1  |     v2      
+----+-----+-------------
+ 1  | old | new_default
+(1 row)
+
+INSERT 1
+psql-18:tests/03_schema_evolution.sql:20: could not interpret result from server: INSERT 1
+INSERT 1
+psql-18:tests/03_schema_evolution.sql:23: could not interpret result from server: INSERT 1
+ id |      v1      |     v2      
+----+--------------+-------------
+ 1  | old          | new_default
+ 2  | new_implicit | new_default
+ 3  | new_explicit | overridden
+(3 rows)
+
+DROP TABLE

@@ -1,0 +1,24 @@
+DROP TABLE
+CREATE TABLE
+INSERT 1
+psql-18:tests/06_composite_pk.sql:14: could not interpret result from server: INSERT 1
+INSERT 1
+psql-18:tests/06_composite_pk.sql:15: could not interpret result from server: INSERT 1
+INSERT 1
+psql-18:tests/06_composite_pk.sql:16: could not interpret result from server: INSERT 1
+psql-18:tests/06_composite_pk.sql:19: ERROR:  Duplicate primary key: [Int32(1), Int32(1), Int32(100)]
+ w_id | d_id | o_id |  info   
+------+------+------+---------
+ 1    | 1    | 100  | Order 1
+ 1    | 1    | 101  | Order 2
+ 1    | 2    | 100  | Order 3
+(3 rows)
+
+DELETE 1
+ w_id | d_id | o_id |  info   
+------+------+------+---------
+ 1    | 1    | 101  | Order 2
+ 1    | 2    | 100  | Order 3
+(2 rows)
+
+DROP TABLE

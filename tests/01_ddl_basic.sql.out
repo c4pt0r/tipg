@@ -1,0 +1,21 @@
+DROP TABLE
+CREATE TABLE
+psql-18:tests/01_ddl_basic.sql:11: ERROR:  Table 't_ddl' already exists
+CREATE TABLE
+INSERT 1
+psql-18:tests/01_ddl_basic.sql:17: could not interpret result from server: INSERT 1
+INSERT 1
+psql-18:tests/01_ddl_basic.sql:18: could not interpret result from server: INSERT 1
+ id | val 
+----+-----
+ 1  | a
+ 2  | b
+(2 rows)
+
+TRUNCATE TABLE
+ id | val 
+----+-----
+(0 rows)
+
+DROP TABLE
+DROP TABLE
