@@ -39,7 +39,7 @@ A PostgreSQL-compatible distributed SQL database built on TiKV.
 |----------|----------|
 | **DDL** | `CREATE TABLE`, `DROP TABLE`, `TRUNCATE`, `ALTER TABLE ADD COLUMN`, `CREATE INDEX`, `SHOW TABLES` |
 | **DML** | `INSERT`, `UPDATE`, `DELETE` with `RETURNING`, `SELECT` with full `WHERE` support |
-| **Queries** | `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`, `GROUP BY`, `HAVING` |
+| **Queries** | `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`, `GROUP BY`, `HAVING`, `WITH ... AS` (CTEs) |
 | **Joins** | `INNER JOIN`, `LEFT JOIN` with `ON` clause |
 | **Aggregates** | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` |
 | **Expressions** | `+`, `-`, `*`, `/`, `%`, `\|\|`, `AND`, `OR`, `NOT`, comparisons |
@@ -109,8 +109,18 @@ INSERT INTO users (name, email) VALUES ('Bob', 'bob@example.com');
 SELECT * FROM users WHERE name LIKE 'A%';
 SELECT COUNT(*), DATE_TRUNC('day', created_at) FROM users GROUP BY DATE_TRUNC('day', created_at);
 
-UPDATE users SET name = 'Robert' WHERE name = 'Bob';
-DELETE FROM users WHERE id = 1;
+-- CTE example
+WITH active_users AS (
+    SELECT * FROM users WHERE created_at > NOW() - INTERVAL '7 days'
+)
+SELECT * FROM active_users ORDER BY name;
+
+-- Subquery example
+SELECT * FROM users WHERE id IN (SELECT id FROM users WHERE name LIKE 'A%');
+
+-- RETURNING clause
+UPDATE users SET name = 'Robert' WHERE name = 'Bob' RETURNING *;
+DELETE FROM users WHERE id = 1 RETURNING id, name;
 ```
 
 ### Restore a PostgreSQL Dump
@@ -133,7 +143,7 @@ pg_restore -h 127.0.0.1 -p 5433 -d postgres --no-owner --no-privileges ./backup/
 |---------|--------|-------|
 | RIGHT/FULL OUTER JOIN | ❌ | Only INNER and LEFT JOIN |
 | Window Functions | ❌ | `ROW_NUMBER()`, `RANK()`, etc. |
-| CTEs | ❌ | `WITH ... AS` not supported |
+| Recursive CTEs | ❌ | `WITH RECURSIVE` not supported |
 | Scalar Subqueries | ❌ | `SELECT (SELECT ...)` not supported |
 | Foreign Keys | ❌ | Parsed but not enforced |
 | CHECK Constraints | ❌ | Parsed but not enforced |
@@ -184,13 +194,14 @@ cargo test
 | Test Suite | Coverage |
 |------------|----------|
 | DDL | CREATE, DROP, ALTER, TRUNCATE |
-| DML | INSERT, UPDATE, DELETE, SELECT |
+| DML | INSERT, UPDATE, DELETE, SELECT, RETURNING |
 | Transactions | BEGIN, COMMIT, ROLLBACK, SELECT FOR UPDATE |
-| Queries | WHERE, ORDER BY, LIMIT, GROUP BY, HAVING, JOIN |
+| Queries | WHERE, ORDER BY, LIMIT, GROUP BY, HAVING, JOIN, CTEs |
+| Subqueries | IN (SELECT ...), EXISTS, NOT EXISTS |
 | Functions | String, Math, Date, CASE, CAST |
 | Indexes | CREATE INDEX, Index Scan optimization |
 | Types | UUID, INTERVAL, TIMESTAMP |
-| Compatibility | COPY protocol, pg_restore |
+| Compatibility | COPY protocol, pg_restore, Extended Query |
 
 ## License
 

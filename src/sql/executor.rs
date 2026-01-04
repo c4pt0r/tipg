@@ -495,6 +495,52 @@ impl Executor {
     }
 
     async fn execute_query(&self, txn: &mut Transaction, query: &Query) -> Result<ExecuteResult> {
+        let ctes = self.build_cte_context(txn, query).await?;
+        self.execute_query_with_ctes(txn, query, &ctes).await
+    }
+
+    async fn build_cte_context(&self, txn: &mut Transaction, query: &Query) -> Result<HashMap<String, (TableSchema, Vec<Row>)>> {
+        let mut ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
+        if let Some(with) = &query.with {
+            if with.recursive {
+                return Err(anyhow!("Recursive CTEs not yet supported"));
+            }
+            for cte in &with.cte_tables {
+                let cte_name = cte.alias.name.value.to_lowercase();
+                let cte_result = self.execute_query_with_ctes(txn, &cte.query, &ctes).await?;
+                match cte_result {
+                    ExecuteResult::Select { columns, rows } => {
+                        let col_names: Vec<String> = if cte.alias.columns.is_empty() {
+                            columns
+                        } else {
+                            cte.alias.columns.iter().map(|c| c.value.clone()).collect()
+                        };
+                        let schema = TableSchema {
+                            table_id: 0,
+                            name: cte_name.clone(),
+                            columns: col_names.iter().map(|n| ColumnDef { 
+                                name: n.clone(), 
+                                data_type: DataType::Text, 
+                                nullable: true, 
+                                primary_key: false,
+                                unique: false,
+                                is_serial: false, 
+                                default_expr: None 
+                            }).collect(),
+                            pk_indices: vec![],
+                            indexes: vec![],
+                            version: 1,
+                        };
+                        ctes.insert(cte_name, (schema, rows));
+                    }
+                    _ => return Err(anyhow!("CTE must be a SELECT query")),
+                }
+            }
+        }
+        Ok(ctes)
+    }
+
+    async fn execute_query_with_ctes(&self, txn: &mut Transaction, query: &Query, ctes: &HashMap<String, (TableSchema, Vec<Row>)>) -> Result<ExecuteResult> {
         let select = match &*query.body { SetExpr::Select(s) => s, _ => return Err(anyhow!("Only SELECT supported")) };
         
         if select.from.is_empty() {
@@ -504,11 +550,19 @@ impl Executor {
         let has_joins = !select.from[0].joins.is_empty();
         
         if has_joins {
-            return self.execute_join_query(txn, query, select).await;
+            return self.execute_join_query_with_ctes(txn, query, select, ctes).await;
         }
         
         let t = match &select.from[0].relation { TableFactor::Table { name, .. } => name.0.last().unwrap().value.clone(), _ => return Err(anyhow!("Unsupported table")) };
-        let schema = self.store.get_schema(txn, &t).await?.ok_or_else(|| anyhow!("Table not found"))?;
+        let t_lower = t.to_lowercase();
+        
+        let (schema, all_rows_base) = if let Some((cte_schema, cte_rows)) = ctes.get(&t_lower) {
+            (cte_schema.clone(), cte_rows.clone())
+        } else {
+            let schema = self.store.get_schema(txn, &t).await?.ok_or_else(|| anyhow!("Table '{}' not found", t))?;
+            let rows = self.scan_and_fill(txn, &t, &schema).await?;
+            (schema, rows)
+        };
         
         let resolved_selection = if let Some(sel) = &select.selection {
             Some(self.resolve_subqueries(txn, sel).await?)
@@ -516,27 +570,30 @@ impl Executor {
             None
         };
         
-        let mut index_scan_rows = None;
-        if let Some(ref sel) = resolved_selection {
-            for index in &schema.indexes {
-                if let Some(values) = extract_eq_conditions(sel, &index.columns) {
-                    debug!("Using Index Scan on {}", index.name);
-                    let pks = self.store.scan_index(txn, schema.table_id, index.id, &values, index.unique).await?;
-                    if !pks.is_empty() {
-                        let mut rows = self.store.batch_get_rows(txn, schema.table_id, pks.clone(), &schema).await?;
-                        if rows.is_empty() {
-                            debug!("Index scan returned {} PKs but no rows found, falling back to full scan", pks.len());
-                        } else {
-                            for r in &mut rows { fill_row_defaults(r, &schema)?; }
-                            index_scan_rows = Some(rows);
+        let all_rows = if ctes.contains_key(&t_lower) {
+            all_rows_base
+        } else {
+            let mut index_scan_rows = None;
+            if let Some(ref sel) = resolved_selection {
+                for index in &schema.indexes {
+                    if let Some(values) = extract_eq_conditions(sel, &index.columns) {
+                        debug!("Using Index Scan on {}", index.name);
+                        let pks = self.store.scan_index(txn, schema.table_id, index.id, &values, index.unique).await?;
+                        if !pks.is_empty() {
+                            let mut rows = self.store.batch_get_rows(txn, schema.table_id, pks.clone(), &schema).await?;
+                            if rows.is_empty() {
+                                debug!("Index scan returned {} PKs but no rows found, falling back to full scan", pks.len());
+                            } else {
+                                for r in &mut rows { fill_row_defaults(r, &schema)?; }
+                                index_scan_rows = Some(rows);
+                            }
                         }
+                        break; 
                     }
-                    break; 
                 }
             }
-        }
-
-        let all_rows = if let Some(rows) = index_scan_rows { rows } else { self.scan_and_fill(txn, &t, &schema).await? };
+            index_scan_rows.unwrap_or(all_rows_base)
+        };
         
         let mut filtered_rows = if let Some(ref sel) = resolved_selection {
             let mut v = Vec::new();
@@ -724,6 +781,22 @@ impl Executor {
     }
 
     async fn execute_join_query(&self, txn: &mut Transaction, query: &Query, select: &sqlparser::ast::Select) -> Result<ExecuteResult> {
+        self.execute_join_query_with_ctes(txn, query, select, &HashMap::new()).await
+    }
+
+    async fn get_table_data(&self, txn: &mut Transaction, table_name: &str, ctes: &HashMap<String, (TableSchema, Vec<Row>)>) -> Result<(TableSchema, Vec<Row>)> {
+        let t_lower = table_name.to_lowercase();
+        if let Some((schema, rows)) = ctes.get(&t_lower) {
+            Ok((schema.clone(), rows.clone()))
+        } else {
+            let schema = self.store.get_schema(txn, table_name).await?
+                .ok_or_else(|| anyhow!("Table '{}' not found", table_name))?;
+            let rows = self.scan_and_fill(txn, table_name, &schema).await?;
+            Ok((schema, rows))
+        }
+    }
+
+    async fn execute_join_query_with_ctes(&self, txn: &mut Transaction, query: &Query, select: &sqlparser::ast::Select, ctes: &HashMap<String, (TableSchema, Vec<Row>)>) -> Result<ExecuteResult> {
         let (base_table, base_alias) = match &select.from[0].relation {
             TableFactor::Table { name, alias, .. } => {
                 let tbl = name.0.last().unwrap().value.clone();
@@ -733,9 +806,7 @@ impl Executor {
             _ => return Err(anyhow!("Unsupported base table")),
         };
         
-        let base_schema = self.store.get_schema(txn, &base_table).await?
-            .ok_or_else(|| anyhow!("Table '{}' not found", base_table))?;
-        let base_rows = self.scan_and_fill(txn, &base_table, &base_schema).await?;
+        let (base_schema, base_rows) = self.get_table_data(txn, &base_table, ctes).await?;
 
         let mut combined_schemas: Vec<(String, TableSchema)> = vec![(base_alias.clone(), base_schema.clone())];
         let mut combined_rows: Vec<Row> = base_rows;
@@ -750,9 +821,7 @@ impl Executor {
                 _ => return Err(anyhow!("Unsupported join table")),
             };
 
-            let join_schema = self.store.get_schema(txn, &join_table).await?
-                .ok_or_else(|| anyhow!("Table '{}' not found", join_table))?;
-            let join_rows = self.scan_and_fill(txn, &join_table, &join_schema).await?;
+            let (join_schema, join_rows) = self.get_table_data(txn, &join_table, ctes).await?;
 
             let join_condition = match &join.join_operator {
                 JoinOperator::Inner(JoinConstraint::On(expr)) => Some(expr),
