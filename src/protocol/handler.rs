@@ -540,6 +540,14 @@ fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> 
             Ok(Response::Execution(Tag::new("CREATE INDEX")))
         }
 
+        ExecuteResult::CreateView { .. } => {
+            Ok(Response::Execution(Tag::new("CREATE VIEW")))
+        }
+
+        ExecuteResult::DropView { .. } => {
+            Ok(Response::Execution(Tag::new("DROP VIEW")))
+        }
+
         ExecuteResult::AlterTable { .. } => {
             Ok(Response::Execution(Tag::new("ALTER TABLE")))
         }

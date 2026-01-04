@@ -11,30 +11,58 @@ pub enum ExecuteResult {
         rows: Vec<Row>,
     },
     /// CREATE TABLE result
-    CreateTable { table_name: String },
+    CreateTable {
+        table_name: String,
+    },
     /// DROP TABLE result  
-    DropTable { table_name: String },
+    DropTable {
+        table_name: String,
+    },
     /// TRUNCATE TABLE result
-    TruncateTable { table_name: String },
+    TruncateTable {
+        table_name: String,
+    },
     /// ALTER TABLE result
-    AlterTable { table_name: String },
+    AlterTable {
+        table_name: String,
+    },
     /// CREATE INDEX result
-    CreateIndex { index_name: String },
+    CreateIndex {
+        index_name: String,
+    },
+    CreateView {
+        view_name: String,
+    },
+    DropView {
+        view_name: String,
+    },
 
     /// INSERT result with affected row count
-    Insert { affected_rows: u64 },
+    Insert {
+        affected_rows: u64,
+    },
     /// DELETE result with affected row count
-    Delete { affected_rows: u64 },
+    Delete {
+        affected_rows: u64,
+    },
     /// UPDATE result with affected row count
-    Update { affected_rows: u64 },
+    Update {
+        affected_rows: u64,
+    },
     /// SHOW TABLES result
-    ShowTables { tables: Vec<String> },
+    ShowTables {
+        tables: Vec<String>,
+    },
     /// DESCRIBE table result
-    Describe { schema: TableSchema },
+    Describe {
+        schema: TableSchema,
+    },
     /// Empty result (for unsupported/noop statements)
     Empty,
     /// Skipped statement with warning message
-    Skipped { message: String },
+    Skipped {
+        message: String,
+    },
 }
 
 impl ExecuteResult {

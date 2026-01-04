@@ -1,5 +1,3 @@
-//! TiKV storage implementation
-
 use super::encoding::*;
 use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Context, Result};
@@ -305,5 +303,54 @@ impl TikvStore {
             }
         }
         Ok(rows)
+    }
+
+    pub async fn create_view(&self, txn: &mut Transaction, name: &str, query: &str) -> Result<()> {
+        let key = self.key(&encode_view_key(name));
+        if txn.get(key.clone()).await?.is_some() {
+            return Err(anyhow!("View '{}' already exists", name));
+        }
+        txn.put(key, query.as_bytes().to_vec()).await?;
+        info!("Created view '{}'", name);
+        Ok(())
+    }
+
+    pub async fn get_view(&self, txn: &mut Transaction, name: &str) -> Result<Option<String>> {
+        let key = self.key(&encode_view_key(name));
+        match txn.get(key).await? {
+            Some(data) => Ok(Some(String::from_utf8(data)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn drop_view(&self, txn: &mut Transaction, name: &str) -> Result<bool> {
+        let key = self.key(&encode_view_key(name));
+        if txn.get(key.clone()).await?.is_some() {
+            txn.delete(key).await?;
+            info!("Dropped view '{}'", name);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn list_views(&self, txn: &mut Transaction) -> Result<Vec<String>> {
+        let raw_start = encode_view_prefix();
+        let mut raw_end = raw_start.clone();
+        raw_end.push(0xFF);
+        let start = self.key(&raw_start);
+        let end = self.key(&raw_end);
+        let range: BoundRange = (start..end).into();
+        let pairs = txn.scan(range, u32::MAX).await?;
+        let mut views = Vec::new();
+        for pair in pairs {
+            let full_key: &[u8] = pair.key().as_ref().into();
+            let raw_key = strip_namespace(&self.namespace, full_key);
+            if raw_key.starts_with(&raw_start) {
+                let name = String::from_utf8_lossy(&raw_key[raw_start.len()..]).to_string();
+                views.push(name);
+            }
+        }
+        Ok(views)
     }
 }

@@ -37,13 +37,14 @@ A PostgreSQL-compatible distributed SQL database built on TiKV.
 
 | Category | Features |
 |----------|----------|
-| **DDL** | `CREATE TABLE`, `DROP TABLE`, `TRUNCATE`, `ALTER TABLE ADD COLUMN`, `CREATE INDEX`, `SHOW TABLES` |
+| **DDL** | `CREATE TABLE`, `DROP TABLE`, `TRUNCATE`, `ALTER TABLE ADD COLUMN`, `CREATE INDEX`, `CREATE VIEW`, `DROP VIEW`, `SHOW TABLES` |
 | **DML** | `INSERT`, `UPDATE`, `DELETE` with `RETURNING`, `SELECT` with full `WHERE` support |
 | **Queries** | `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`, `GROUP BY`, `HAVING`, `WITH ... AS` (CTEs) |
 | **Joins** | `INNER JOIN`, `LEFT JOIN` with `ON` clause |
 | **Aggregates** | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` |
+| **Window Functions** | `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LEAD`, `LAG`, `SUM/AVG/COUNT/MIN/MAX OVER` |
 | **Expressions** | `+`, `-`, `*`, `/`, `%`, `\|\|`, `AND`, `OR`, `NOT`, comparisons |
-| **Predicates** | `IN (...)`, `IN (SELECT ...)`, `EXISTS`, `BETWEEN`, `LIKE`, `ILIKE`, `IS NULL`, `IS NOT NULL` |
+| **Predicates** | `IN (...)`, `IN (SELECT ...)`, `EXISTS`, `BETWEEN`, `LIKE`, `ILIKE`, `IS NULL`, `IS NOT NULL`, Scalar Subqueries |
 | **Functions** | String, Math, Date/Time, `CASE WHEN`, `CAST`, `COALESCE`, `NULLIF` |
 | **Transactions** | `BEGIN`, `COMMIT`, `ROLLBACK`, `SELECT FOR UPDATE` |
 | **COPY** | `COPY FROM stdin` for bulk loading, pg_restore compatible |
@@ -115,8 +116,21 @@ WITH active_users AS (
 )
 SELECT * FROM active_users ORDER BY name;
 
--- Subquery example
+-- Subquery examples
 SELECT * FROM users WHERE id IN (SELECT id FROM users WHERE name LIKE 'A%');
+SELECT id, name, (SELECT COUNT(*) FROM users) as total_users FROM users;
+SELECT * FROM users WHERE id = (SELECT MIN(id) FROM users);
+
+-- View example
+CREATE VIEW recent_users AS SELECT * FROM users WHERE created_at > NOW() - INTERVAL '30 days';
+SELECT * FROM recent_users WHERE name LIKE 'A%';
+
+-- Window function examples
+SELECT id, name, ROW_NUMBER() OVER (ORDER BY created_at) as rn FROM users;
+SELECT id, name, RANK() OVER (ORDER BY name) as rank FROM users;
+SELECT id, name, SUM(id) OVER (ORDER BY id) as running_total FROM users;
+SELECT id, name, LAG(name) OVER (ORDER BY id) as prev_name FROM users;
+SELECT id, name, LEAD(name, 1, 'N/A') OVER (ORDER BY id) as next_name FROM users;
 
 -- RETURNING clause
 UPDATE users SET name = 'Robert' WHERE name = 'Bob' RETURNING *;
@@ -142,12 +156,10 @@ pg_restore -h 127.0.0.1 -p 5433 -d postgres --no-owner --no-privileges ./backup/
 | Feature | Status | Notes |
 |---------|--------|-------|
 | RIGHT/FULL OUTER JOIN | ❌ | Only INNER and LEFT JOIN |
-| Window Functions | ❌ | `ROW_NUMBER()`, `RANK()`, etc. |
 | Recursive CTEs | ❌ | `WITH RECURSIVE` not supported |
-| Scalar Subqueries | ❌ | `SELECT (SELECT ...)` not supported |
+| Materialized Views | ❌ | Only regular views supported |
 | Foreign Keys | ❌ | Parsed but not enforced |
 | CHECK Constraints | ❌ | Parsed but not enforced |
-| Views | ❌ | Not implemented |
 | Stored Procedures | ❌ | Not implemented |
 
 ## Project Structure
@@ -174,11 +186,15 @@ src/
     └── mod.rs           # Value, Row, Schema types
 
 tests/
-├── 01_ddl_basic.sql     # DDL tests
-├── 02_dml_crud.sql      # CRUD tests
+├── 01_ddl_basic.sql        # DDL tests
+├── 02_dml_crud.sql         # CRUD tests
 ├── ...
-├── 17_dvdrental.sql     # Integration tests
-└── dvdrental/           # Sample database for pg_restore
+├── 17_dvdrental.sql        # Integration tests
+├── 18_window_functions.sql # Window function tests
+├── 19_subqueries.sql       # Subquery tests
+├── 20_cte.sql              # CTE tests
+├── 21_views.sql            # View tests
+└── dvdrental/              # Sample database for pg_restore
 ```
 
 ## Tests
@@ -193,11 +209,12 @@ cargo test
 
 | Test Suite | Coverage |
 |------------|----------|
-| DDL | CREATE, DROP, ALTER, TRUNCATE |
+| DDL | CREATE, DROP, ALTER, TRUNCATE, Views |
 | DML | INSERT, UPDATE, DELETE, SELECT, RETURNING |
 | Transactions | BEGIN, COMMIT, ROLLBACK, SELECT FOR UPDATE |
 | Queries | WHERE, ORDER BY, LIMIT, GROUP BY, HAVING, JOIN, CTEs |
-| Subqueries | IN (SELECT ...), EXISTS, NOT EXISTS |
+| Subqueries | IN (SELECT ...), EXISTS, NOT EXISTS, Scalar Subqueries |
+| Window Functions | ROW_NUMBER, RANK, DENSE_RANK, LEAD, LAG, SUM/AVG/COUNT OVER |
 | Functions | String, Math, Date, CASE, CAST |
 | Indexes | CREATE INDEX, Index Scan optimization |
 | Types | UUID, INTERVAL, TIMESTAMP |

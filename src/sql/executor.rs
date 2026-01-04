@@ -8,7 +8,7 @@ use sqlparser::ast::{
     AlterTableOperation, Assignment, ColumnDef as SqlColumnDef, ColumnOption, DataType as SqlDataType, Expr, Ident,
     ObjectName, Query, SelectItem, SetExpr, Statement, TableConstraint, Values, FunctionArg, FunctionArgExpr, 
     OrderByExpr, BinaryOperator, GroupByExpr, JoinOperator, JoinConstraint, TableFactor, LockType,
-    Value as SqlValue, Cte
+    Value as SqlValue, Cte, WindowType
 };
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -109,7 +109,8 @@ impl Executor {
                 use sqlparser::ast::ObjectType;
                 match object_type {
                     ObjectType::Table => self.execute_drop_table(txn, names, *if_exists).await,
-                    ObjectType::View | ObjectType::Sequence | ObjectType::Index => Ok(ExecuteResult::Empty),
+                    ObjectType::View => self.execute_drop_view(txn, names, *if_exists).await,
+                    ObjectType::Sequence | ObjectType::Index => Ok(ExecuteResult::Empty),
                     _ => Ok(ExecuteResult::Empty),
                 }
             }
@@ -143,8 +144,8 @@ impl Executor {
             Statement::CreateSequence { .. } => {
                 Ok(ExecuteResult::Empty)
             }
-            Statement::CreateView { .. } => {
-                Ok(ExecuteResult::Empty)
+            Statement::CreateView { name, query, or_replace, .. } => {
+                self.execute_create_view(txn, name, query, *or_replace).await
             }
             Statement::AlterIndex { .. } => {
                 Ok(ExecuteResult::Empty)
@@ -236,6 +237,35 @@ impl Executor {
         schema.indexes.push(new_index);
         self.store.update_schema(txn, schema).await?;
         Ok(ExecuteResult::CreateIndex { index_name: idx_name_str })
+    }
+
+    async fn execute_create_view(&self, txn: &mut Transaction, name: &ObjectName, query: &Query, or_replace: bool) -> Result<ExecuteResult> {
+        let view_name = name.0.last().ok_or_else(|| anyhow!("Invalid view name"))?.value.clone();
+        let view_name_lower = view_name.to_lowercase();
+        
+        if self.store.get_view(txn, &view_name_lower).await?.is_some() {
+            if or_replace {
+                self.store.drop_view(txn, &view_name_lower).await?;
+            } else {
+                return Err(anyhow!("View '{}' already exists", view_name));
+            }
+        }
+        
+        let query_str = query.to_string();
+        self.store.create_view(txn, &view_name_lower, &query_str).await?;
+        Ok(ExecuteResult::CreateView { view_name })
+    }
+
+    async fn execute_drop_view(&self, txn: &mut Transaction, names: &[ObjectName], if_exists: bool) -> Result<ExecuteResult> {
+        let mut last = String::new();
+        for name in names {
+            let v = name.0.last().unwrap().value.to_lowercase();
+            if !self.store.drop_view(txn, &v).await? && !if_exists {
+                return Err(anyhow!("View '{}' does not exist", v));
+            }
+            last = v;
+        }
+        Ok(ExecuteResult::DropView { view_name: last })
     }
 
     async fn execute_drop_table(&self, txn: &mut Transaction, names: &[ObjectName], if_exists: bool) -> Result<ExecuteResult> {
@@ -544,7 +574,7 @@ impl Executor {
         let select = match &*query.body { SetExpr::Select(s) => s, _ => return Err(anyhow!("Only SELECT supported")) };
         
         if select.from.is_empty() {
-            return self.execute_tableless_query(select).await;
+            return self.execute_tableless_query(txn, select).await;
         }
         
         let has_joins = !select.from[0].joins.is_empty();
@@ -556,13 +586,8 @@ impl Executor {
         let t = match &select.from[0].relation { TableFactor::Table { name, .. } => name.0.last().unwrap().value.clone(), _ => return Err(anyhow!("Unsupported table")) };
         let t_lower = t.to_lowercase();
         
-        let (schema, all_rows_base) = if let Some((cte_schema, cte_rows)) = ctes.get(&t_lower) {
-            (cte_schema.clone(), cte_rows.clone())
-        } else {
-            let schema = self.store.get_schema(txn, &t).await?.ok_or_else(|| anyhow!("Table '{}' not found", t))?;
-            let rows = self.scan_and_fill(txn, &t, &schema).await?;
-            (schema, rows)
-        };
+        let (schema, all_rows_base) = self.get_table_data(txn, &t, ctes).await?;
+        let is_virtual = ctes.contains_key(&t_lower) || self.store.get_view(txn, &t_lower).await?.is_some();
         
         let resolved_selection = if let Some(sel) = &select.selection {
             Some(self.resolve_subqueries(txn, sel).await?)
@@ -570,7 +595,9 @@ impl Executor {
             None
         };
         
-        let all_rows = if ctes.contains_key(&t_lower) {
+        let resolved_projection = self.resolve_projection_subqueries(txn, &select.projection).await?;
+        
+        let all_rows = if is_virtual {
             all_rows_base
         } else {
             let mut index_scan_rows = None;
@@ -612,11 +639,16 @@ impl Executor {
             GroupByExpr::Expressions(exprs) => exprs,
             GroupByExpr::All => return Err(anyhow!("GROUP BY ALL not supported")),
         };
+        
+        let window_funcs = extract_window_functions(&select.projection);
+        
         let mut agg_funcs = Vec::new(); 
         for (i, item) in select.projection.iter().enumerate() {
             match item {
                 SelectItem::UnnamedExpr(Expr::Function(f)) | SelectItem::ExprWithAlias { expr: Expr::Function(f), .. } => {
-                    agg_funcs.push((i, f.clone()));
+                    if f.over.is_none() {
+                        agg_funcs.push((i, f.clone()));
+                    }
                 }
                 _ => {}
             }
@@ -677,7 +709,7 @@ impl Executor {
                 
                 let mut row_values = Vec::new();
                 
-                for (i, item) in select.projection.iter().enumerate() {
+                for (i, item) in resolved_projection.iter().enumerate() {
                     if let Some(agg_pos) = agg_funcs.iter().position(|(idx, _)| *idx == i) {
                         row_values.push(aggs[agg_pos].result());
                     } else {
@@ -694,8 +726,15 @@ impl Executor {
             return Ok(ExecuteResult::Select { columns: col_names, rows: final_rows });
         }
 
-        if !query.order_by.is_empty() {
-            filtered_rows.sort_by(|a, b| {
+        let window_results = if !window_funcs.is_empty() {
+            Some(compute_window_functions(&filtered_rows, &schema, &window_funcs)?)
+        } else {
+            None
+        };
+
+        let (filtered_rows, window_results) = if !query.order_by.is_empty() {
+            let mut indexed: Vec<(usize, Row)> = filtered_rows.into_iter().enumerate().collect();
+            indexed.sort_by(|(_, a), (_, b)| {
                 for order_expr in &query.order_by {
                     let val_a = eval_expr(&order_expr.expr, Some(a), Some(&schema)).unwrap_or(Value::Null);
                     let val_b = eval_expr(&order_expr.expr, Some(b), Some(&schema)).unwrap_or(Value::Null);
@@ -708,7 +747,14 @@ impl Executor {
                 }
                 std::cmp::Ordering::Equal
             });
-        }
+            let reordered_wr = window_results.map(|wr| {
+                indexed.iter().map(|(orig_idx, _)| wr[*orig_idx].clone()).collect()
+            });
+            let reordered_rows: Vec<Row> = indexed.into_iter().map(|(_, r)| r).collect();
+            (reordered_rows, reordered_wr)
+        } else {
+            (filtered_rows, window_results)
+        };
 
         let mut final_rows = filtered_rows;
         if let Some(offset) = &query.offset {
@@ -724,46 +770,60 @@ impl Executor {
              }
         }
 
-        let mut cols = Vec::new();
-        let mut indices = Vec::new();
+        let has_window_funcs = !window_funcs.is_empty();
         let wildcard = select.projection.iter().any(|p| matches!(p, SelectItem::Wildcard(_)));
-        if wildcard {
+        
+        let mut cols = Vec::new();
+        let mut result_rows = Vec::new();
+        
+        if wildcard && !has_window_funcs {
             for c in &schema.columns { cols.push(c.name.clone()); }
-            for i in 0..schema.columns.len() { indices.push(i); }
+            result_rows = final_rows;
         } else {
             for item in &select.projection {
-                match item {
-                    SelectItem::UnnamedExpr(Expr::Identifier(id)) => {
-                        let idx = schema.column_index(&id.value).ok_or_else(|| anyhow!("Unknown col"))?;
-                        cols.push(id.value.clone()); indices.push(idx);
-                    },
-                    SelectItem::ExprWithAlias { expr: Expr::Identifier(id), alias } => {
-                        let idx = schema.column_index(&id.value).ok_or_else(|| anyhow!("Unknown col"))?;
-                        cols.push(alias.value.clone()); indices.push(idx);
-                    },
-                    _ => return Err(anyhow!("Unsupported select item"))
+                cols.push(get_select_item_name(item));
+            }
+            
+            for (row_idx, row) in final_rows.iter().enumerate() {
+                let mut row_values = Vec::new();
+                for (proj_idx, item) in resolved_projection.iter().enumerate() {
+                    if let Some(wf_pos) = window_funcs.iter().position(|wf| wf.proj_idx == proj_idx) {
+                        if let Some(ref wr) = window_results {
+                            row_values.push(wr[row_idx][wf_pos].clone());
+                        } else {
+                            row_values.push(Value::Null);
+                        }
+                    } else {
+                        let expr = match item {
+                            SelectItem::UnnamedExpr(e) => e,
+                            SelectItem::ExprWithAlias { expr: e, .. } => e,
+                            SelectItem::Wildcard(_) => {
+                                row_values.extend(row.values.clone());
+                                continue;
+                            }
+                            _ => return Err(anyhow!("Unsupported select item")),
+                        };
+                        row_values.push(eval_expr(expr, Some(row), Some(&schema))?);
+                    }
                 }
+                result_rows.push(Row::new(row_values));
             }
         }
-
-        let mut rows: Vec<Row> = final_rows.into_iter().map(|r| {
-            if wildcard { r } else {
-                Row::new(indices.iter().map(|&i| r.values[i].clone()).collect())
-            }
-        }).collect();
 
         if select.distinct.is_some() {
-            rows = dedup_rows(rows);
+            result_rows = dedup_rows(result_rows);
         }
 
-        Ok(ExecuteResult::Select { columns: cols, rows })
+        Ok(ExecuteResult::Select { columns: cols, rows: result_rows })
     }
 
-    async fn execute_tableless_query(&self, select: &sqlparser::ast::Select) -> Result<ExecuteResult> {
+    async fn execute_tableless_query(&self, txn: &mut Transaction, select: &sqlparser::ast::Select) -> Result<ExecuteResult> {
+        let resolved_projection = self.resolve_projection_subqueries(txn, &select.projection).await?;
+        
         let mut cols = Vec::new();
         let mut values = Vec::new();
         
-        for item in &select.projection {
+        for item in &resolved_projection {
             match item {
                 SelectItem::UnnamedExpr(expr) => {
                     cols.push("?column?".to_string());
@@ -787,13 +847,50 @@ impl Executor {
     async fn get_table_data(&self, txn: &mut Transaction, table_name: &str, ctes: &HashMap<String, (TableSchema, Vec<Row>)>) -> Result<(TableSchema, Vec<Row>)> {
         let t_lower = table_name.to_lowercase();
         if let Some((schema, rows)) = ctes.get(&t_lower) {
-            Ok((schema.clone(), rows.clone()))
-        } else {
-            let schema = self.store.get_schema(txn, table_name).await?
-                .ok_or_else(|| anyhow!("Table '{}' not found", table_name))?;
-            let rows = self.scan_and_fill(txn, table_name, &schema).await?;
-            Ok((schema, rows))
+            return Ok((schema.clone(), rows.clone()));
         }
+        
+        if let Some(view_query) = self.store.get_view(txn, &t_lower).await? {
+            let result = self.execute_view_query(txn, &view_query, ctes).await?;
+            return match result {
+                ExecuteResult::Select { columns, rows } => {
+                    let schema = TableSchema {
+                        table_id: 0,
+                        name: t_lower,
+                        columns: columns.iter().map(|n| ColumnDef { 
+                            name: n.clone(), 
+                            data_type: DataType::Text, 
+                            nullable: true, 
+                            primary_key: false,
+                            unique: false,
+                            is_serial: false, 
+                            default_expr: None 
+                        }).collect(),
+                        pk_indices: vec![],
+                        indexes: vec![],
+                        version: 1,
+                    };
+                    Ok((schema, rows))
+                }
+                _ => Err(anyhow!("View must return SELECT result")),
+            };
+        }
+        
+        let schema = self.store.get_schema(txn, table_name).await?
+            .ok_or_else(|| anyhow!("Table '{}' not found", table_name))?;
+        let rows = self.scan_and_fill(txn, table_name, &schema).await?;
+        Ok((schema, rows))
+    }
+
+    fn execute_view_query<'a>(&'a self, txn: &'a mut Transaction, view_query: &'a str, ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExecuteResult>> + Send + 'a>> {
+        Box::pin(async move {
+            let ast = parse_sql(view_query)?;
+            if let Some(Statement::Query(q)) = ast.into_iter().next() {
+                self.execute_query_with_ctes(txn, &q, ctes).await
+            } else {
+                Err(anyhow!("Invalid view query"))
+            }
+        })
     }
 
     async fn execute_join_query_with_ctes(&self, txn: &mut Transaction, query: &Query, select: &sqlparser::ast::Select, ctes: &HashMap<String, (TableSchema, Vec<Row>)>) -> Result<ExecuteResult> {
@@ -945,6 +1042,8 @@ impl Executor {
             combined_rows
         };
 
+        let resolved_projection = self.resolve_projection_subqueries(txn, &select.projection).await?;
+
         let group_keys_exprs = match &select.group_by {
             GroupByExpr::Expressions(exprs) => exprs,
             GroupByExpr::All => return Err(anyhow!("GROUP BY ALL not supported")),
@@ -1031,7 +1130,7 @@ impl Executor {
                 }
                 
                 let mut row_values = Vec::new();
-                for (i, item) in select.projection.iter().enumerate() {
+                for (i, item) in resolved_projection.iter().enumerate() {
                     if let Some(agg_pos) = agg_funcs.iter().position(|(idx, _)| *idx == i) {
                         row_values.push(aggs[agg_pos].result());
                     } else {
@@ -1127,7 +1226,7 @@ impl Executor {
                     combined_schema: &final_schema,
                 };
                 let mut vals = Vec::new();
-                for item in &select.projection {
+                for item in &resolved_projection {
                     let expr = match item {
                         SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
                         SelectItem::Wildcard(_) => continue,
@@ -1189,6 +1288,22 @@ impl Executor {
                     let resolved = Box::new(self.resolve_subqueries(txn, inner).await?);
                     Ok(Expr::Nested(resolved))
                 }
+                Expr::Subquery(subquery) => {
+                    let result = self.execute_query(txn, subquery).await?;
+                    match result {
+                        ExecuteResult::Select { rows, .. } => {
+                            if rows.is_empty() {
+                                Ok(Expr::Value(SqlValue::Null))
+                            } else if rows.len() == 1 {
+                                let value = rows[0].values.first().cloned().unwrap_or(Value::Null);
+                                Ok(value_to_sql_expr(&value))
+                            } else {
+                                Err(anyhow!("Scalar subquery returned more than one row"))
+                            }
+                        }
+                        _ => Err(anyhow!("Subquery must return a SELECT result")),
+                    }
+                }
                 Expr::Exists { subquery, negated } => {
                     let result = self.execute_query(txn, subquery).await?;
                     let exists = match result {
@@ -1201,6 +1316,26 @@ impl Executor {
                 _ => Ok(expr.clone()),
             }
         })
+    }
+
+    async fn resolve_projection_subqueries(&self, txn: &mut Transaction, projection: &[SelectItem]) -> Result<Vec<SelectItem>> {
+        let mut resolved = Vec::with_capacity(projection.len());
+        for item in projection {
+            let resolved_item = match item {
+                SelectItem::UnnamedExpr(e) => {
+                    SelectItem::UnnamedExpr(self.resolve_subqueries(txn, e).await?)
+                }
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    SelectItem::ExprWithAlias {
+                        expr: self.resolve_subqueries(txn, expr).await?,
+                        alias: alias.clone(),
+                    }
+                }
+                other => other.clone(),
+            };
+            resolved.push(resolved_item);
+        }
+        Ok(resolved)
     }
 
     async fn scan_and_fill(&self, txn: &mut Transaction, table_name: &str, schema: &TableSchema) -> Result<Vec<Row>> {
@@ -1334,6 +1469,260 @@ fn dedup_rows(rows: Vec<Row>) -> Vec<Row> {
         }
     }
     result
+}
+
+struct WindowFuncInfo {
+    proj_idx: usize,
+    func_name: String,
+    arg_expr: Option<Expr>,
+    partition_by: Vec<Expr>,
+    order_by: Vec<OrderByExpr>,
+    offset_expr: Option<Expr>,
+    default_value_expr: Option<Expr>,
+}
+
+fn extract_window_functions(projection: &[SelectItem]) -> Vec<WindowFuncInfo> {
+    let mut result = Vec::new();
+    for (idx, item) in projection.iter().enumerate() {
+        let func = match item {
+            SelectItem::UnnamedExpr(Expr::Function(f)) => Some(f),
+            SelectItem::ExprWithAlias { expr: Expr::Function(f), .. } => Some(f),
+            _ => None,
+        };
+        if let Some(f) = func {
+            if let Some(WindowType::WindowSpec(spec)) = &f.over {
+                let func_name = f.name.0.last().map(|i| i.value.to_lowercase()).unwrap_or_default();
+                let extract_arg = |index: usize| -> Option<Expr> {
+                    f.args.get(index).and_then(|a| match a {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e.clone()),
+                        _ => None,
+                    })
+                };
+                let arg_expr = extract_arg(0);
+                let offset_expr = extract_arg(1);
+                let default_value_expr = extract_arg(2);
+                result.push(WindowFuncInfo {
+                    proj_idx: idx,
+                    func_name,
+                    arg_expr,
+                    partition_by: spec.partition_by.clone(),
+                    order_by: spec.order_by.clone(),
+                    offset_expr,
+                    default_value_expr,
+                });
+            }
+        }
+    }
+    result
+}
+
+fn compute_window_functions(
+    rows: &[Row],
+    schema: &TableSchema,
+    window_funcs: &[WindowFuncInfo],
+) -> Result<Vec<Vec<Value>>> {
+    let mut results: Vec<Vec<Value>> = vec![vec![Value::Null; window_funcs.len()]; rows.len()];
+    
+    for (wf_idx, wf) in window_funcs.iter().enumerate() {
+        let mut partitions: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+        for (row_idx, row) in rows.iter().enumerate() {
+            let mut key = Vec::new();
+            for expr in &wf.partition_by {
+                key.push(eval_expr(expr, Some(row), Some(schema))?);
+            }
+            let key_bytes = bincode::serialize(&key).unwrap_or_default();
+            partitions.entry(key_bytes).or_default().push(row_idx);
+        }
+        
+        for (_partition_key, mut row_indices) in partitions {
+            if !wf.order_by.is_empty() {
+                row_indices.sort_by(|&a, &b| {
+                    for order_expr in &wf.order_by {
+                        let val_a = eval_expr(&order_expr.expr, Some(&rows[a]), Some(schema)).unwrap_or(Value::Null);
+                        let val_b = eval_expr(&order_expr.expr, Some(&rows[b]), Some(schema)).unwrap_or(Value::Null);
+                        let cmp = super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
+                        if cmp != 0 {
+                            let asc = order_expr.asc.unwrap_or(true);
+                            return if asc { 
+                                if cmp > 0 { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less } 
+                            } else { 
+                                if cmp > 0 { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater } 
+                            };
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+            }
+            
+            match wf.func_name.as_str() {
+                "row_number" => {
+                    for (pos, &row_idx) in row_indices.iter().enumerate() {
+                        results[row_idx][wf_idx] = Value::Int64((pos + 1) as i64);
+                    }
+                }
+                "rank" => {
+                    let mut current_rank = 1i64;
+                    let mut prev_values: Option<Vec<Value>> = None;
+                    for (pos, &row_idx) in row_indices.iter().enumerate() {
+                        let current_values: Vec<Value> = wf.order_by.iter()
+                            .map(|o| eval_expr(&o.expr, Some(&rows[row_idx]), Some(schema)).unwrap_or(Value::Null))
+                            .collect();
+                        if let Some(prev) = &prev_values {
+                            if prev != &current_values {
+                                current_rank = (pos + 1) as i64;
+                            }
+                        }
+                        results[row_idx][wf_idx] = Value::Int64(current_rank);
+                        prev_values = Some(current_values);
+                    }
+                }
+                "dense_rank" => {
+                    let mut current_rank = 1i64;
+                    let mut prev_values: Option<Vec<Value>> = None;
+                    for &row_idx in &row_indices {
+                        let current_values: Vec<Value> = wf.order_by.iter()
+                            .map(|o| eval_expr(&o.expr, Some(&rows[row_idx]), Some(schema)).unwrap_or(Value::Null))
+                            .collect();
+                        if let Some(prev) = &prev_values {
+                            if prev != &current_values {
+                                current_rank += 1;
+                            }
+                        }
+                        results[row_idx][wf_idx] = Value::Int64(current_rank);
+                        prev_values = Some(current_values);
+                    }
+                }
+                "sum" => {
+                    let mut running_sum = 0.0f64;
+                    for &row_idx in &row_indices {
+                        if let Some(ref arg) = wf.arg_expr {
+                            let val = eval_expr(arg, Some(&rows[row_idx]), Some(schema))?;
+                            match val {
+                                Value::Int32(n) => running_sum += n as f64,
+                                Value::Int64(n) => running_sum += n as f64,
+                                Value::Float64(n) => running_sum += n,
+                                _ => {}
+                            }
+                        }
+                        results[row_idx][wf_idx] = Value::Float64(running_sum);
+                    }
+                }
+                "count" => {
+                    let mut running_count = 0i64;
+                    for &row_idx in &row_indices {
+                        running_count += 1;
+                        results[row_idx][wf_idx] = Value::Int64(running_count);
+                    }
+                }
+                "avg" => {
+                    let mut running_sum = 0.0f64;
+                    let mut running_count = 0i64;
+                    for &row_idx in &row_indices {
+                        if let Some(ref arg) = wf.arg_expr {
+                            let val = eval_expr(arg, Some(&rows[row_idx]), Some(schema))?;
+                            match val {
+                                Value::Int32(n) => { running_sum += n as f64; running_count += 1; }
+                                Value::Int64(n) => { running_sum += n as f64; running_count += 1; }
+                                Value::Float64(n) => { running_sum += n; running_count += 1; }
+                                Value::Null => {}
+                                _ => { running_count += 1; }
+                            }
+                        }
+                        results[row_idx][wf_idx] = if running_count > 0 {
+                            Value::Float64(running_sum / running_count as f64)
+                        } else {
+                            Value::Null
+                        };
+                    }
+                }
+                "min" => {
+                    let mut min_val: Option<Value> = None;
+                    for &row_idx in &row_indices {
+                        if let Some(ref arg) = wf.arg_expr {
+                            let val = eval_expr(arg, Some(&rows[row_idx]), Some(schema))?;
+                            if !matches!(val, Value::Null) {
+                                min_val = Some(match &min_val {
+                                    None => val.clone(),
+                                    Some(m) => if super::expr::compare_values(&val, m).unwrap_or(0) < 0 { val.clone() } else { m.clone() },
+                                });
+                            }
+                        }
+                        results[row_idx][wf_idx] = min_val.clone().unwrap_or(Value::Null);
+                    }
+                }
+                "max" => {
+                    let mut max_val: Option<Value> = None;
+                    for &row_idx in &row_indices {
+                        if let Some(ref arg) = wf.arg_expr {
+                            let val = eval_expr(arg, Some(&rows[row_idx]), Some(schema))?;
+                            if !matches!(val, Value::Null) {
+                                max_val = Some(match &max_val {
+                                    None => val.clone(),
+                                    Some(m) => if super::expr::compare_values(&val, m).unwrap_or(0) > 0 { val.clone() } else { m.clone() },
+                                });
+                            }
+                        }
+                        results[row_idx][wf_idx] = max_val.clone().unwrap_or(Value::Null);
+                    }
+                }
+                "lag" => {
+                    let offset = wf.offset_expr.as_ref()
+                        .and_then(|e| match e {
+                            Expr::Value(SqlValue::Number(n, _)) => n.parse::<usize>().ok(),
+                            _ => None,
+                        })
+                        .unwrap_or(1);
+                    let default_val = wf.default_value_expr.as_ref()
+                        .map(|e| eval_expr(e, None, None).unwrap_or(Value::Null))
+                        .unwrap_or(Value::Null);
+                    
+                    for (pos, &row_idx) in row_indices.iter().enumerate() {
+                        let val = if pos >= offset {
+                            let lag_row_idx = row_indices[pos - offset];
+                            if let Some(ref arg) = wf.arg_expr {
+                                eval_expr(arg, Some(&rows[lag_row_idx]), Some(schema))?
+                            } else {
+                                Value::Null
+                            }
+                        } else {
+                            default_val.clone()
+                        };
+                        results[row_idx][wf_idx] = val;
+                    }
+                }
+                "lead" => {
+                    let offset = wf.offset_expr.as_ref()
+                        .and_then(|e| match e {
+                            Expr::Value(SqlValue::Number(n, _)) => n.parse::<usize>().ok(),
+                            _ => None,
+                        })
+                        .unwrap_or(1);
+                    let default_val = wf.default_value_expr.as_ref()
+                        .map(|e| eval_expr(e, None, None).unwrap_or(Value::Null))
+                        .unwrap_or(Value::Null);
+                    
+                    for (pos, &row_idx) in row_indices.iter().enumerate() {
+                        let val = if pos + offset < row_indices.len() {
+                            let lead_row_idx = row_indices[pos + offset];
+                            if let Some(ref arg) = wf.arg_expr {
+                                eval_expr(arg, Some(&rows[lead_row_idx]), Some(schema))?
+                            } else {
+                                Value::Null
+                            }
+                        } else {
+                            default_val.clone()
+                        };
+                        results[row_idx][wf_idx] = val;
+                    }
+                }
+                _ => {
+                    return Err(anyhow!("Unsupported window function: {}", wf.func_name));
+                }
+            }
+        }
+    }
+    
+    Ok(results)
 }
 
 fn value_to_sql_expr(v: &Value) -> Expr {

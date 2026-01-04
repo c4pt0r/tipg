@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 /// System key prefixes
 const SYS_NEXT_TABLE_ID: &[u8] = b"_sys_next_table_id";
 const SYS_SCHEMA_PREFIX: &[u8] = b"_sys_schema_";
+const SYS_VIEW_PREFIX: &[u8] = b"_sys_view_";
 const TABLE_DATA_PREFIX: &[u8] = b"t_";
 const TABLE_INDEX_PREFIX: &[u8] = b"i_";
 
@@ -53,6 +54,16 @@ pub fn encode_schema_key(table_name: &str) -> Vec<u8> {
     let mut key = SYS_SCHEMA_PREFIX.to_vec();
     key.extend_from_slice(table_name.as_bytes());
     key
+}
+
+pub fn encode_view_key(view_name: &str) -> Vec<u8> {
+    let mut key = SYS_VIEW_PREFIX.to_vec();
+    key.extend_from_slice(view_name.as_bytes());
+    key
+}
+
+pub fn encode_view_prefix() -> Vec<u8> {
+    SYS_VIEW_PREFIX.to_vec()
 }
 
 /// Encode a data key for a row
