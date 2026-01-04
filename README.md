@@ -6,16 +6,16 @@ A PostgreSQL-compatible distributed SQL database built on TiKV.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    PostgreSQL Clients                        │
-│              (psql, pgcli, pg_dump, pg_restore)              │
+│                    PostgreSQL Clients                       │
+│              (psql, pgcli, pg_dump, pg_restore)             │
 └─────────────────────────────────────────────────────────────┘
                               │
                               │ PostgreSQL Wire Protocol (pgwire 0.28)
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                      pg-tikv Server                          │
+│                      pg-tikv Server                         │
 │  ┌───────────────────────────────────────────────────────┐  │
-│  │  Protocol: Simple Query, Extended Query, COPY          │  │
+│  │  Protocol: Simple Query, Extended Query, COPY         │  │
 │  ├───────────────────────────────────────────────────────┤  │
 │  │  SQL: Parser (sqlparser-rs) → Executor                │  │
 │  ├───────────────────────────────────────────────────────┤  │
@@ -26,8 +26,8 @@ A PostgreSQL-compatible distributed SQL database built on TiKV.
                               │ gRPC (TiKV Pessimistic Transactions)
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                          TiKV                                │
-│                Distributed KV Storage (Raft)                 │
+│                          TiKV                               │
+│                Distributed KV Storage (Raft)                │
 └─────────────────────────────────────────────────────────────┘
 ```
 
