@@ -6,8 +6,10 @@ use async_trait::async_trait;
 use futures::{stream, Sink, SinkExt};
 use pgwire::api::auth::{ServerParameterProvider, StartupHandler};
 use pgwire::api::copy::CopyHandler;
-use pgwire::api::query::{PlaceholderExtendedQueryHandler, SimpleQueryHandler};
-use pgwire::api::results::{CopyResponse, DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
+use pgwire::api::portal::{Format, Portal};
+use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
+use pgwire::api::results::{CopyResponse, DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
+use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, NoopErrorHandler, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
@@ -18,7 +20,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub struct PgServerParameterProvider;
 
@@ -44,6 +46,7 @@ pub struct PgHandler {
     executor: Arc<Executor>,
     session: Mutex<Session>,
     copy_context: Mutex<Option<CopyContext>>,
+    query_parser: Arc<NoopQueryParser>,
 }
 
 impl PgHandler {
@@ -53,6 +56,7 @@ impl PgHandler {
             executor,
             session: Mutex::new(Session::new(store)),
             copy_context: Mutex::new(None),
+            query_parser: Arc::new(NoopQueryParser::new()),
         }
     }
 
@@ -304,6 +308,155 @@ impl CopyHandler for PgHandler {
     }
 }
 
+#[async_trait]
+impl ExtendedQueryHandler for PgHandler {
+    type Statement = String;
+    type QueryParser = NoopQueryParser;
+
+    fn query_parser(&self) -> Arc<Self::QueryParser> {
+        self.query_parser.clone()
+    }
+
+    async fn do_query<'a, 'b: 'a, C>(
+        &'b self,
+        _client: &mut C,
+        portal: &'a Portal<Self::Statement>,
+        _max_rows: usize,
+    ) -> PgWireResult<Response<'a>>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        let query = &portal.statement.statement;
+        debug!("Extended query: {}", query);
+
+        let final_query = substitute_parameters(query, portal);
+        debug!("Final query after substitution: {}", final_query);
+
+        let mut session = self.session.lock().await;
+        match self.executor.execute(&mut session, &final_query).await {
+            Ok(result) => result_to_response(result),
+            Err(e) => {
+                error!("Extended query execution error: {}", e);
+                Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "XX000".to_string(),
+                    e.to_string(),
+                ))))
+            }
+        }
+    }
+
+    async fn do_describe_statement<C>(
+        &self,
+        _client: &mut C,
+        stmt: &StoredStatement<Self::Statement>,
+    ) -> PgWireResult<DescribeStatementResponse>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        let param_types: Vec<Type> = stmt.parameter_types.clone();
+        let fields = infer_result_fields(&stmt.statement);
+        Ok(DescribeStatementResponse::new(param_types, fields))
+    }
+
+    async fn do_describe_portal<C>(
+        &self,
+        _client: &mut C,
+        portal: &Portal<Self::Statement>,
+    ) -> PgWireResult<DescribePortalResponse>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        let fields = infer_result_fields(&portal.statement.statement);
+        Ok(DescribePortalResponse::new(fields))
+    }
+}
+
+fn substitute_parameters(query: &str, portal: &Portal<String>) -> String {
+    let mut result = query.to_string();
+    
+    for i in 0..portal.parameter_len() {
+        let placeholder = format!("${}", i + 1);
+        let param_type = portal
+            .statement
+            .parameter_types
+            .get(i)
+            .cloned()
+            .unwrap_or(Type::TEXT);
+        
+        let value_str = match &param_type {
+            t if *t == Type::BOOL => {
+                portal.parameter::<bool>(i, &param_type)
+                    .ok()
+                    .flatten()
+                    .map(|v| if v { "true" } else { "false" }.to_string())
+                    .unwrap_or_else(|| "NULL".to_string())
+            }
+            t if *t == Type::INT2 => {
+                portal.parameter::<i16>(i, &param_type)
+                    .ok()
+                    .flatten()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "NULL".to_string())
+            }
+            t if *t == Type::INT4 => {
+                portal.parameter::<i32>(i, &param_type)
+                    .ok()
+                    .flatten()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "NULL".to_string())
+            }
+            t if *t == Type::INT8 => {
+                portal.parameter::<i64>(i, &param_type)
+                    .ok()
+                    .flatten()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "NULL".to_string())
+            }
+            t if *t == Type::FLOAT4 => {
+                portal.parameter::<f32>(i, &param_type)
+                    .ok()
+                    .flatten()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "NULL".to_string())
+            }
+            t if *t == Type::FLOAT8 => {
+                portal.parameter::<f64>(i, &param_type)
+                    .ok()
+                    .flatten()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "NULL".to_string())
+            }
+            _ => {
+                portal.parameter::<String>(i, &param_type)
+                    .ok()
+                    .flatten()
+                    .map(|v| format!("'{}'", v.replace("'", "''")))
+                    .unwrap_or_else(|| "NULL".to_string())
+            }
+        };
+        
+        result = result.replace(&placeholder, &value_str);
+    }
+    
+    result
+}
+
+fn infer_result_fields(query: &str) -> Vec<FieldInfo> {
+    let query_upper = query.to_uppercase();
+    if query_upper.starts_with("SELECT") {
+        vec![FieldInfo::new(
+            "column".to_string(),
+            None,
+            None,
+            Type::TEXT,
+            FieldFormat::Text,
+        )]
+    } else {
+        vec![]
+    }
+}
+
 pub struct HandlerFactory {
     handler: Arc<PgHandler>,
 }
@@ -319,7 +472,7 @@ impl HandlerFactory {
 impl PgWireServerHandlers for HandlerFactory {
     type StartupHandler = PgHandler;
     type SimpleQueryHandler = PgHandler;
-    type ExtendedQueryHandler = PlaceholderExtendedQueryHandler;
+    type ExtendedQueryHandler = PgHandler;
     type CopyHandler = PgHandler;
     type ErrorHandler = NoopErrorHandler;
 
@@ -328,7 +481,7 @@ impl PgWireServerHandlers for HandlerFactory {
     }
 
     fn extended_query_handler(&self) -> Arc<Self::ExtendedQueryHandler> {
-        Arc::new(PlaceholderExtendedQueryHandler)
+        self.handler.clone()
     }
 
     fn startup_handler(&self) -> Arc<Self::StartupHandler> {

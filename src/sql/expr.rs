@@ -1632,6 +1632,64 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
         (Value::Null, Value::Null) => Ok(0),
         (Value::Null, _) => Ok(-1),
         (_, Value::Null) => Ok(1),
+        (Value::Text(t), Value::Int32(i)) => {
+            if let Ok(n) = t.parse::<i32>() {
+                Ok(n.cmp(i) as i8)
+            } else {
+                Ok(t.cmp(&i.to_string()) as i8)
+            }
+        }
+        (Value::Int32(i), Value::Text(t)) => {
+            if let Ok(n) = t.parse::<i32>() {
+                Ok(i.cmp(&n) as i8)
+            } else {
+                Ok(i.to_string().cmp(t) as i8)
+            }
+        }
+        (Value::Text(t), Value::Int64(i)) => {
+            if let Ok(n) = t.parse::<i64>() {
+                Ok(n.cmp(i) as i8)
+            } else {
+                Ok(t.cmp(&i.to_string()) as i8)
+            }
+        }
+        (Value::Int64(i), Value::Text(t)) => {
+            if let Ok(n) = t.parse::<i64>() {
+                Ok(i.cmp(&n) as i8)
+            } else {
+                Ok(i.to_string().cmp(t) as i8)
+            }
+        }
+        (Value::Text(t), Value::Float64(f)) => {
+            if let Ok(n) = t.parse::<f64>() {
+                Ok(n.partial_cmp(f).unwrap_or(std::cmp::Ordering::Equal) as i8)
+            } else {
+                Err(anyhow!("Cannot compare"))
+            }
+        }
+        (Value::Float64(f), Value::Text(t)) => {
+            if let Ok(n) = t.parse::<f64>() {
+                Ok(f.partial_cmp(&n).unwrap_or(std::cmp::Ordering::Equal) as i8)
+            } else {
+                Err(anyhow!("Cannot compare"))
+            }
+        }
+        (Value::Int32(i), Value::Float64(f)) => Ok(((*i as f64)
+            .partial_cmp(f)
+            .unwrap_or(std::cmp::Ordering::Equal))
+            as i8),
+        (Value::Float64(f), Value::Int32(i)) => {
+            Ok(f.partial_cmp(&(*i as f64))
+                .unwrap_or(std::cmp::Ordering::Equal) as i8)
+        }
+        (Value::Int64(i), Value::Float64(f)) => Ok(((*i as f64)
+            .partial_cmp(f)
+            .unwrap_or(std::cmp::Ordering::Equal))
+            as i8),
+        (Value::Float64(f), Value::Int64(i)) => {
+            Ok(f.partial_cmp(&(*i as f64))
+                .unwrap_or(std::cmp::Ordering::Equal) as i8)
+        }
         _ => Err(anyhow!(
             "Cannot compare distinct types: {:?} vs {:?}",
             left,

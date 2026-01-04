@@ -15,7 +15,7 @@ A PostgreSQL-compatible distributed SQL database built on TiKV.
 ┌─────────────────────────────────────────────────────────────┐
 │                      pg-tikv Server                          │
 │  ┌───────────────────────────────────────────────────────┐  │
-│  │  Protocol: Simple Query, COPY FROM stdin              │  │
+│  │  Protocol: Simple Query, Extended Query, COPY          │  │
 │  ├───────────────────────────────────────────────────────┤  │
 │  │  SQL: Parser (sqlparser-rs) → Executor                │  │
 │  ├───────────────────────────────────────────────────────┤  │
@@ -38,12 +38,12 @@ A PostgreSQL-compatible distributed SQL database built on TiKV.
 | Category | Features |
 |----------|----------|
 | **DDL** | `CREATE TABLE`, `DROP TABLE`, `TRUNCATE`, `ALTER TABLE ADD COLUMN`, `CREATE INDEX`, `SHOW TABLES` |
-| **DML** | `INSERT`, `UPDATE`, `DELETE`, `SELECT` with full `WHERE` support |
+| **DML** | `INSERT`, `UPDATE`, `DELETE` with `RETURNING`, `SELECT` with full `WHERE` support |
 | **Queries** | `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`, `GROUP BY`, `HAVING` |
 | **Joins** | `INNER JOIN`, `LEFT JOIN` with `ON` clause |
 | **Aggregates** | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` |
 | **Expressions** | `+`, `-`, `*`, `/`, `%`, `\|\|`, `AND`, `OR`, `NOT`, comparisons |
-| **Predicates** | `IN (...)`, `BETWEEN`, `LIKE`, `ILIKE`, `IS NULL`, `IS NOT NULL` |
+| **Predicates** | `IN (...)`, `IN (SELECT ...)`, `EXISTS`, `BETWEEN`, `LIKE`, `ILIKE`, `IS NULL`, `IS NOT NULL` |
 | **Functions** | String, Math, Date/Time, `CASE WHEN`, `CAST`, `COALESCE`, `NULLIF` |
 | **Transactions** | `BEGIN`, `COMMIT`, `ROLLBACK`, `SELECT FOR UPDATE` |
 | **COPY** | `COPY FROM stdin` for bulk loading, pg_restore compatible |
@@ -131,12 +131,10 @@ pg_restore -h 127.0.0.1 -p 5433 -d postgres --no-owner --no-privileges ./backup/
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Extended Query Protocol | ❌ | Simple query only (no prepared statements) |
-| Subqueries | ❌ | `WHERE x IN (SELECT ...)` not supported |
 | RIGHT/FULL OUTER JOIN | ❌ | Only INNER and LEFT JOIN |
 | Window Functions | ❌ | `ROW_NUMBER()`, `RANK()`, etc. |
 | CTEs | ❌ | `WITH ... AS` not supported |
-| RETURNING on UPDATE/DELETE | ❌ | Only on INSERT |
+| Scalar Subqueries | ❌ | `SELECT (SELECT ...)` not supported |
 | Foreign Keys | ❌ | Parsed but not enforced |
 | CHECK Constraints | ❌ | Parsed but not enforced |
 | Views | ❌ | Not implemented |

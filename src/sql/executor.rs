@@ -7,7 +7,8 @@ use anyhow::{anyhow, Result};
 use sqlparser::ast::{
     AlterTableOperation, Assignment, ColumnDef as SqlColumnDef, ColumnOption, DataType as SqlDataType, Expr, Ident,
     ObjectName, Query, SelectItem, SetExpr, Statement, TableConstraint, Values, FunctionArg, FunctionArgExpr, 
-    OrderByExpr, BinaryOperator, GroupByExpr, JoinOperator, JoinConstraint, TableFactor, LockType
+    OrderByExpr, BinaryOperator, GroupByExpr, JoinOperator, JoinConstraint, TableFactor, LockType,
+    Value as SqlValue, Cte
 };
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -125,11 +126,11 @@ impl Executor {
             Statement::Insert { table_name, columns, source, returning, .. } => {
                 self.execute_insert(txn, table_name, columns, source, returning).await
             }
-            Statement::Delete { from, selection, .. } => {
-                self.execute_delete(txn, from, selection).await
+            Statement::Delete { from, selection, returning, .. } => {
+                self.execute_delete(txn, from, selection, returning).await
             }
-            Statement::Update { table, assignments, selection, .. } => {
-                self.execute_update(txn, table, assignments, selection).await
+            Statement::Update { table, assignments, selection, returning, .. } => {
+                self.execute_update(txn, table, assignments, selection, returning).await
             }
             Statement::Query(query) => self.execute_query(txn, query).await,
             Statement::ShowTables { .. } => self.execute_show_tables(txn).await,
@@ -379,15 +380,43 @@ impl Executor {
         if returning.is_some() { Ok(ExecuteResult::Select { columns: ret_cols, rows: ret_rows }) } else { Ok(ExecuteResult::Insert { affected_rows: affected }) }
     }
 
-    async fn execute_delete(&self, txn: &mut Transaction, from: &[sqlparser::ast::TableWithJoins], selection: &Option<Expr>) -> Result<ExecuteResult> {
+    async fn execute_delete(&self, txn: &mut Transaction, from: &[sqlparser::ast::TableWithJoins], selection: &Option<Expr>, returning: &Option<Vec<SelectItem>>) -> Result<ExecuteResult> {
         let t = match &from[0].relation { sqlparser::ast::TableFactor::Table { name, .. } => name.0.last().unwrap().value.clone(), _ => return Err(anyhow!("Unsupported")) };
         let schema = self.store.get_schema(txn, &t).await?.ok_or_else(|| anyhow!("Table not found"))?;
         if schema.pk_indices.is_empty() { return Err(anyhow!("No PK")); }
+        let resolved_selection = if let Some(sel) = selection {
+            Some(self.resolve_subqueries(txn, sel).await?)
+        } else {
+            None
+        };
         let rows = self.scan_and_fill(txn, &t, &schema).await?;
         let mut cnt = 0;
+        let mut ret_rows = Vec::new();
+        let mut ret_cols = Vec::new();
+        if let Some(items) = returning {
+            for item in items {
+                match item {
+                    SelectItem::UnnamedExpr(Expr::Identifier(id)) => ret_cols.push(id.value.clone()),
+                    SelectItem::ExprWithAlias { alias, .. } => ret_cols.push(alias.value.clone()),
+                    SelectItem::Wildcard(_) => for c in &schema.columns { ret_cols.push(c.name.clone()); },
+                    _ => return Err(anyhow!("Unsupported RETURNING")),
+                }
+            }
+        }
         for r in rows {
-            if let Some(e) = selection {
+            if let Some(ref e) = resolved_selection {
                 if !matches!(eval_expr(e, Some(&r), Some(&schema))?, Value::Boolean(true)) { continue; }
+            }
+            if let Some(items) = returning {
+                let mut vals = Vec::new();
+                for item in items {
+                    match item {
+                        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => vals.push(eval_expr(e, Some(&r), Some(&schema))?),
+                        SelectItem::Wildcard(_) => vals.extend(r.values.clone()),
+                        _ => {}
+                    }
+                }
+                ret_rows.push(Row::new(vals));
             }
             let pks = schema.get_pk_values(&r);
             self.store.delete_by_pk(txn, &t, &pks).await?;
@@ -397,13 +426,18 @@ impl Executor {
             }
             cnt += 1;
         }
-        Ok(ExecuteResult::Delete { affected_rows: cnt })
+        if returning.is_some() { Ok(ExecuteResult::Select { columns: ret_cols, rows: ret_rows }) } else { Ok(ExecuteResult::Delete { affected_rows: cnt }) }
     }
 
-    async fn execute_update(&self, txn: &mut Transaction, table: &sqlparser::ast::TableWithJoins, assignments: &[Assignment], selection: &Option<Expr>) -> Result<ExecuteResult> {
+    async fn execute_update(&self, txn: &mut Transaction, table: &sqlparser::ast::TableWithJoins, assignments: &[Assignment], selection: &Option<Expr>, returning: &Option<Vec<SelectItem>>) -> Result<ExecuteResult> {
         let t = match &table.relation { sqlparser::ast::TableFactor::Table { name, .. } => name.0.last().unwrap().value.clone(), _ => return Err(anyhow!("Unsupported")) };
         let schema = self.store.get_schema(txn, &t).await?.ok_or_else(|| anyhow!("Table not found"))?;
         if schema.pk_indices.is_empty() { return Err(anyhow!("No PK")); }
+        let resolved_selection = if let Some(sel) = selection {
+            Some(self.resolve_subqueries(txn, sel).await?)
+        } else {
+            None
+        };
         let mut indices = Vec::new();
         for a in assignments {
             let c = a.id.last().unwrap().value.clone();
@@ -413,8 +447,20 @@ impl Executor {
         }
         let rows = self.scan_and_fill(txn, &t, &schema).await?;
         let mut cnt = 0;
+        let mut ret_rows = Vec::new();
+        let mut ret_cols = Vec::new();
+        if let Some(items) = returning {
+            for item in items {
+                match item {
+                    SelectItem::UnnamedExpr(Expr::Identifier(id)) => ret_cols.push(id.value.clone()),
+                    SelectItem::ExprWithAlias { alias, .. } => ret_cols.push(alias.value.clone()),
+                    SelectItem::Wildcard(_) => for c in &schema.columns { ret_cols.push(c.name.clone()); },
+                    _ => return Err(anyhow!("Unsupported RETURNING")),
+                }
+            }
+        }
         for r in rows {
-            if let Some(e) = selection {
+            if let Some(ref e) = resolved_selection {
                 if !matches!(eval_expr(e, Some(&r), Some(&schema))?, Value::Boolean(true)) { continue; }
             }
             let mut vals = r.values.clone();
@@ -432,9 +478,20 @@ impl Executor {
                 let new_idx = schema.get_index_values(index, &new_row);
                 self.store.create_index_entry(txn, schema.table_id, index.id, &new_idx, &pks, index.unique).await?;
             }
+            if let Some(items) = returning {
+                let mut ret_vals = Vec::new();
+                for item in items {
+                    match item {
+                        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => ret_vals.push(eval_expr(e, Some(&new_row), Some(&schema))?),
+                        SelectItem::Wildcard(_) => ret_vals.extend(new_row.values.clone()),
+                        _ => {}
+                    }
+                }
+                ret_rows.push(Row::new(ret_vals));
+            }
             cnt += 1;
         }
-        Ok(ExecuteResult::Update { affected_rows: cnt })
+        if returning.is_some() { Ok(ExecuteResult::Select { columns: ret_cols, rows: ret_rows }) } else { Ok(ExecuteResult::Update { affected_rows: cnt }) }
     }
 
     async fn execute_query(&self, txn: &mut Transaction, query: &Query) -> Result<ExecuteResult> {
@@ -453,15 +510,27 @@ impl Executor {
         let t = match &select.from[0].relation { TableFactor::Table { name, .. } => name.0.last().unwrap().value.clone(), _ => return Err(anyhow!("Unsupported table")) };
         let schema = self.store.get_schema(txn, &t).await?.ok_or_else(|| anyhow!("Table not found"))?;
         
+        let resolved_selection = if let Some(sel) = &select.selection {
+            Some(self.resolve_subqueries(txn, sel).await?)
+        } else {
+            None
+        };
+        
         let mut index_scan_rows = None;
-        if let Some(sel) = &select.selection {
+        if let Some(ref sel) = resolved_selection {
             for index in &schema.indexes {
                 if let Some(values) = extract_eq_conditions(sel, &index.columns) {
                     debug!("Using Index Scan on {}", index.name);
                     let pks = self.store.scan_index(txn, schema.table_id, index.id, &values, index.unique).await?;
-                    let mut rows = self.store.batch_get_rows(txn, schema.table_id, pks, &schema).await?;
-                    for r in &mut rows { fill_row_defaults(r, &schema)?; }
-                    index_scan_rows = Some(rows);
+                    if !pks.is_empty() {
+                        let mut rows = self.store.batch_get_rows(txn, schema.table_id, pks.clone(), &schema).await?;
+                        if rows.is_empty() {
+                            debug!("Index scan returned {} PKs but no rows found, falling back to full scan", pks.len());
+                        } else {
+                            for r in &mut rows { fill_row_defaults(r, &schema)?; }
+                            index_scan_rows = Some(rows);
+                        }
+                    }
                     break; 
                 }
             }
@@ -469,7 +538,7 @@ impl Executor {
 
         let all_rows = if let Some(rows) = index_scan_rows { rows } else { self.scan_and_fill(txn, &t, &schema).await? };
         
-        let mut filtered_rows = if let Some(sel) = &select.selection {
+        let mut filtered_rows = if let Some(ref sel) = resolved_selection {
             let mut v = Vec::new();
             for r in all_rows {
                 if matches!(eval_expr(sel, Some(&r), Some(&schema))?, Value::Boolean(true)) { v.push(r); }
@@ -537,8 +606,7 @@ impl Executor {
             }
             
             let mut final_rows = Vec::new();
-            let mut col_names = Vec::new(); 
-            for _ in 0..select.projection.len() { col_names.push("col".to_string()); }
+            let col_names: Vec<String> = select.projection.iter().map(get_select_item_name).collect();
 
             for (key_bytes, aggs) in groups {
                 let representative = &group_rows[&key_bytes];
@@ -875,10 +943,7 @@ impl Executor {
             }
 
             let mut final_rows = Vec::new();
-            let mut col_names = Vec::new();
-            for _ in 0..select.projection.len() {
-                col_names.push("col".to_string());
-            }
+            let col_names: Vec<String> = select.projection.iter().map(get_select_item_name).collect();
 
             for (key_bytes, aggs) in groups {
                 let representative = &group_rows[&key_bytes];
@@ -1017,6 +1082,58 @@ impl Executor {
         Ok(ExecuteResult::ShowTables { tables })
     }
 
+    fn resolve_subqueries<'a>(&'a self, txn: &'a mut Transaction, expr: &'a Expr) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Expr>> + Send + 'a>> {
+        Box::pin(async move {
+            match expr {
+                Expr::InSubquery { expr: inner_expr, subquery, negated } => {
+                    let result = self.execute_query(txn, subquery).await?;
+                    let values = match result {
+                        ExecuteResult::Select { rows, .. } => {
+                            rows.iter()
+                                .filter_map(|row| row.values.first().cloned())
+                                .map(|v| value_to_sql_expr(&v))
+                                .collect::<Vec<_>>()
+                        }
+                        _ => return Err(anyhow!("Subquery must return a SELECT result")),
+                    };
+                    let resolved_inner = Box::new(self.resolve_subqueries(txn, inner_expr).await?);
+                    Ok(Expr::InList {
+                        expr: resolved_inner,
+                        list: values,
+                        negated: *negated,
+                    })
+                }
+                Expr::BinaryOp { left, op, right } => {
+                    let resolved_left = Box::new(self.resolve_subqueries(txn, left).await?);
+                    let resolved_right = Box::new(self.resolve_subqueries(txn, right).await?);
+                    Ok(Expr::BinaryOp {
+                        left: resolved_left,
+                        op: op.clone(),
+                        right: resolved_right,
+                    })
+                }
+                Expr::UnaryOp { op, expr: inner } => {
+                    let resolved = Box::new(self.resolve_subqueries(txn, inner).await?);
+                    Ok(Expr::UnaryOp { op: op.clone(), expr: resolved })
+                }
+                Expr::Nested(inner) => {
+                    let resolved = Box::new(self.resolve_subqueries(txn, inner).await?);
+                    Ok(Expr::Nested(resolved))
+                }
+                Expr::Exists { subquery, negated } => {
+                    let result = self.execute_query(txn, subquery).await?;
+                    let exists = match result {
+                        ExecuteResult::Select { rows, .. } => !rows.is_empty(),
+                        _ => false,
+                    };
+                    let result_bool = if *negated { !exists } else { exists };
+                    Ok(Expr::Value(SqlValue::Boolean(result_bool)))
+                }
+                _ => Ok(expr.clone()),
+            }
+        })
+    }
+
     async fn scan_and_fill(&self, txn: &mut Transaction, table_name: &str, schema: &TableSchema) -> Result<Vec<Row>> {
         let rows = self.store.scan(txn, table_name).await?;
         let mut filled_rows = Vec::with_capacity(rows.len());
@@ -1148,6 +1265,42 @@ fn dedup_rows(rows: Vec<Row>) -> Vec<Row> {
         }
     }
     result
+}
+
+fn value_to_sql_expr(v: &Value) -> Expr {
+    match v {
+        Value::Null => Expr::Value(SqlValue::Null),
+        Value::Boolean(b) => Expr::Value(SqlValue::Boolean(*b)),
+        Value::Int32(i) => Expr::Value(SqlValue::Number(i.to_string(), false)),
+        Value::Int64(i) => Expr::Value(SqlValue::Number(i.to_string(), false)),
+        Value::Float64(f) => Expr::Value(SqlValue::Number(f.to_string(), false)),
+        Value::Text(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
+        Value::Bytes(b) => Expr::Value(SqlValue::SingleQuotedString(format!("\\x{}", hex::encode(b)))),
+        Value::Timestamp(ts) => Expr::Value(SqlValue::Number(ts.to_string(), false)),
+        Value::Interval(ms) => Expr::Value(SqlValue::Number(ms.to_string(), false)),
+        Value::Uuid(bytes) => {
+            let uuid = uuid::Uuid::from_bytes(*bytes);
+            Expr::Value(SqlValue::SingleQuotedString(uuid.to_string()))
+        }
+    }
+}
+
+fn get_select_item_name(item: &SelectItem) -> String {
+    match item {
+        SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+        SelectItem::UnnamedExpr(expr) => get_expr_name(expr),
+        SelectItem::Wildcard(_) => "*".to_string(),
+        _ => "?column?".to_string(),
+    }
+}
+
+fn get_expr_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Identifier(id) => id.value.clone(),
+        Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()).unwrap_or_else(|| "?column?".to_string()),
+        Expr::Function(f) => f.name.to_string().to_lowercase(),
+        _ => "?column?".to_string(),
+    }
 }
 
 fn fill_row_defaults(row: &mut Row, schema: &TableSchema) -> Result<()> {

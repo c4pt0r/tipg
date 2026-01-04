@@ -296,8 +296,8 @@ impl TikvStore {
     /// Batch get rows by PKs
     pub async fn batch_get_rows(&self, txn: &mut Transaction, table_id: u64, pks: Vec<Vec<Value>>, _schema: &TableSchema) -> Result<Vec<Row>> {
         let mut rows = Vec::new();
-        for pk in pks {
-            let row_key = encode_pk_values(&pk);
+        for pk in &pks {
+            let row_key = encode_pk_values(pk);
             let data_key = self.key(&encode_data_key(table_id, &row_key));
             if let Some(val) = txn.get(data_key).await? {
                 let row = deserialize_row(&val)?;
