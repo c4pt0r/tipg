@@ -1,5 +1,6 @@
 //! PostgreSQL protocol handler using pgwire
 
+use crate::auth::AuthManager;
 use crate::sql::{ExecuteResult, Executor, Session};
 use crate::storage::TikvStore;
 use crate::types::Value;
@@ -19,7 +20,6 @@ use pgwire::messages::response::{CommandComplete, ErrorResponse};
 use pgwire::messages::startup::Authentication;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use std::collections::HashMap;
-
 use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell};
@@ -73,12 +73,11 @@ fn parse_tenant_username(username: &str) -> (Option<String>, String) {
     (None, username.to_string())
 }
 
-/// Dynamic handler that creates executor lazily after authentication
 pub struct DynamicPgHandler {
     pd_endpoints: Vec<String>,
     namespace: Option<String>,
     default_keyspace: Option<String>,
-    expected_password: Option<String>,
+    fallback_password: Option<String>,
     executor: OnceCell<Arc<Executor>>,
     session: Mutex<Option<Session>>,
     copy_context: Mutex<Option<CopyContext>>,
@@ -90,13 +89,13 @@ impl DynamicPgHandler {
         pd_endpoints: Vec<String>,
         namespace: Option<String>,
         default_keyspace: Option<String>,
-        expected_password: Option<String>,
+        fallback_password: Option<String>,
     ) -> Self {
         Self {
             pd_endpoints,
             namespace,
             default_keyspace,
-            expected_password,
+            fallback_password,
             executor: OnceCell::new(),
             session: Mutex::new(None),
             copy_context: Mutex::new(None),
@@ -104,7 +103,7 @@ impl DynamicPgHandler {
         }
     }
 
-    async fn init_executor(&self, keyspace: Option<String>) -> Result<(), String> {
+    async fn init_executor(&self, keyspace: Option<String>, username: Option<String>, is_superuser: bool) -> Result<(), String> {
         let effective_keyspace = keyspace
             .or_else(|| self.default_keyspace.clone())
             .or_else(|| Some("default".to_string()));
@@ -116,13 +115,15 @@ impl DynamicPgHandler {
         ).await {
             Ok(store) => {
                 let store = Arc::new(store);
-                let executor = Arc::new(Executor::new(store.clone()));
-                let session = Session::new(store);
+                let executor = Arc::new(Executor::new_with_namespace(store.clone(), self.namespace.clone()));
                 
-                // Set executor (ignore if already set - race condition)
+                let session = match username {
+                    Some(user) => Session::new_with_user(store, user, is_superuser),
+                    None => Session::new(store),
+                };
+                
                 let _ = self.executor.set(executor);
                 
-                // Set session
                 let mut session_guard = self.session.lock().await;
                 *session_guard = Some(session);
                 
@@ -173,6 +174,46 @@ impl DynamicPgHandler {
 
         None
     }
+
+    async fn authenticate_user(&self, keyspace: &Option<String>, username: &str, password: &str) -> Result<(bool, bool), String> {
+        let effective_keyspace = keyspace.clone()
+            .or_else(|| self.default_keyspace.clone())
+            .or_else(|| Some("default".to_string()));
+        
+        let store = TikvStore::new_with_keyspace(
+            self.pd_endpoints.clone(),
+            self.namespace.clone(),
+            effective_keyspace,
+        ).await.map_err(|e| format!("Failed to connect to TiKV: {}", e))?;
+        
+        let auth_manager = AuthManager::new(self.namespace.clone());
+        let mut txn = store.begin().await.map_err(|e| format!("Failed to begin transaction: {}", e))?;
+        
+        auth_manager.bootstrap(&mut txn).await.map_err(|e| format!("Failed to bootstrap auth: {}", e))?;
+        txn.commit().await.map_err(|e| format!("Failed to commit bootstrap: {}", e))?;
+        
+        let mut txn = store.begin().await.map_err(|e| format!("Failed to begin transaction: {}", e))?;
+        
+        match auth_manager.authenticate(&mut txn, username, password).await {
+            Ok(Some(user)) => {
+                txn.commit().await.map_err(|e| format!("Failed to commit: {}", e))?;
+                Ok((true, user.is_superuser))
+            }
+            Ok(None) => {
+                txn.rollback().await.ok();
+                if let Some(fallback) = &self.fallback_password {
+                    if password == fallback {
+                        return Ok((true, true));
+                    }
+                }
+                Ok((false, false))
+            }
+            Err(e) => {
+                txn.rollback().await.ok();
+                Err(format!("Authentication error: {}", e))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -189,10 +230,8 @@ impl StartupHandler for DynamicPgHandler {
     {
         match message {
             PgWireFrontendMessage::Startup(ref startup) => {
-                // Save startup parameters to metadata
                 pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
                 
-                // Parse username to extract keyspace
                 if let Some(raw_user) = client.metadata().get(METADATA_USER).cloned() {
                     let (keyspace, actual_user) = parse_tenant_username(&raw_user);
                     
@@ -204,71 +243,48 @@ impl StartupHandler for DynamicPgHandler {
                     info!("Actual user: {}", actual_user);
                 }
                 
-                // Check if password auth is required
-                if self.expected_password.is_some() {
-                    // Request password
-                    client.set_state(PgWireConnectionState::AuthenticationInProgress);
-                    client
-                        .send(PgWireBackendMessage::Authentication(
-                            Authentication::CleartextPassword,
-                        ))
-                        .await?;
-                } else {
-                    // No password required - initialize executor and finish auth
-                    let keyspace = client.metadata().get(METADATA_KEYSPACE).cloned();
-                    
-                    if let Err(e) = self.init_executor(keyspace).await {
-                        let error_info = ErrorInfo::new(
-                            "FATAL".to_owned(),
-                            "XX000".to_owned(),
-                            e,
-                        );
-                        client.feed(PgWireBackendMessage::ErrorResponse(ErrorResponse::from(error_info))).await?;
-                        client.close().await?;
-                        return Ok(());
-                    }
-                    
-                    pgwire::api::auth::finish_authentication(client, &PgServerParameterProvider).await?;
-                }
+                client.set_state(PgWireConnectionState::AuthenticationInProgress);
+                client
+                    .send(PgWireBackendMessage::Authentication(
+                        Authentication::CleartextPassword,
+                    ))
+                    .await?;
             }
             PgWireFrontendMessage::PasswordMessageFamily(pwd) => {
                 let pwd = pwd.into_password()?;
                 let provided_password = pwd.password.clone();
+                let keyspace = client.metadata().get(METADATA_KEYSPACE).cloned();
+                let actual_user = client.metadata().get(METADATA_ACTUAL_USER).cloned().unwrap_or_else(|| "admin".to_string());
                 
-                // Validate password
-                let password_valid = match &self.expected_password {
-                    Some(expected) => provided_password == *expected,
-                    None => true,
-                };
+                let auth_result = self.authenticate_user(&keyspace, &actual_user, &provided_password).await;
                 
-                if password_valid {
-                    // Initialize executor with extracted keyspace
-                    let keyspace = client.metadata().get(METADATA_KEYSPACE).cloned();
-                    
-                    if let Err(e) = self.init_executor(keyspace).await {
-                        let error_info = ErrorInfo::new(
-                            "FATAL".to_owned(),
-                            "XX000".to_owned(),
-                            e,
-                        );
+                match auth_result {
+                    Ok((is_authenticated, is_superuser)) => {
+                        if is_authenticated {
+                            if let Err(e) = self.init_executor(keyspace.clone(), Some(actual_user.clone()), is_superuser).await {
+                                let error_info = ErrorInfo::new("FATAL".to_owned(), "XX000".to_owned(), e);
+                                client.feed(PgWireBackendMessage::ErrorResponse(ErrorResponse::from(error_info))).await?;
+                                client.close().await?;
+                                return Ok(());
+                            }
+                            
+                            pgwire::api::auth::finish_authentication(client, &PgServerParameterProvider).await?;
+                            info!("Authentication successful for user '{}' with keyspace {:?}", actual_user, keyspace);
+                        } else {
+                            let error_info = ErrorInfo::new(
+                                "FATAL".to_owned(),
+                                "28P01".to_owned(),
+                                format!("Password authentication failed for user \"{}\"", actual_user),
+                            );
+                            client.feed(PgWireBackendMessage::ErrorResponse(ErrorResponse::from(error_info))).await?;
+                            client.close().await?;
+                        }
+                    }
+                    Err(e) => {
+                        let error_info = ErrorInfo::new("FATAL".to_owned(), "XX000".to_owned(), e);
                         client.feed(PgWireBackendMessage::ErrorResponse(ErrorResponse::from(error_info))).await?;
                         client.close().await?;
-                        return Ok(());
                     }
-                    
-                    pgwire::api::auth::finish_authentication(client, &PgServerParameterProvider).await?;
-                    
-                    let actual_user = client.metadata().get(METADATA_ACTUAL_USER).cloned().unwrap_or_default();
-                    let keyspace = client.metadata().get(METADATA_KEYSPACE).cloned();
-                    info!("Authentication successful for user '{}' with keyspace {:?}", actual_user, keyspace);
-                } else {
-                    let error_info = ErrorInfo::new(
-                        "FATAL".to_owned(),
-                        "28P01".to_owned(),
-                        "Password authentication failed".to_owned(),
-                    );
-                    client.feed(PgWireBackendMessage::ErrorResponse(ErrorResponse::from(error_info))).await?;
-                    client.close().await?;
                 }
             }
             _ => {}
@@ -1223,6 +1239,26 @@ fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> 
 
         ExecuteResult::Empty => {
             Ok(Response::EmptyQuery)
+        }
+
+        ExecuteResult::CreateRole => {
+            Ok(Response::Execution(Tag::new("CREATE ROLE")))
+        }
+
+        ExecuteResult::AlterRole => {
+            Ok(Response::Execution(Tag::new("ALTER ROLE")))
+        }
+
+        ExecuteResult::DropRole => {
+            Ok(Response::Execution(Tag::new("DROP ROLE")))
+        }
+
+        ExecuteResult::Grant => {
+            Ok(Response::Execution(Tag::new("GRANT")))
+        }
+
+        ExecuteResult::Revoke => {
+            Ok(Response::Execution(Tag::new("REVOKE")))
         }
 
         ExecuteResult::Skipped { message } => {

@@ -30,12 +30,20 @@ pub enum ExecuteResult {
     CreateIndex {
         index_name: String,
     },
+    DropIndex {
+        index_name: String,
+    },
     CreateView {
         view_name: String,
     },
     DropView {
         view_name: String,
     },
+    CreateRole,
+    AlterRole,
+    DropRole,
+    Grant,
+    Revoke,
 
     /// INSERT result with affected row count
     Insert {

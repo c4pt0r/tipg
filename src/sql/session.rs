@@ -13,6 +13,8 @@ pub enum TransactionState {
 pub struct Session {
     store: Arc<TikvStore>,
     state: TransactionState,
+    current_user: Option<String>,
+    is_superuser: bool,
 }
 
 impl Session {
@@ -20,11 +22,35 @@ impl Session {
         Self {
             store,
             state: TransactionState::Idle,
+            current_user: None,
+            is_superuser: false,
+        }
+    }
+
+    pub fn new_with_user(store: Arc<TikvStore>, username: String, is_superuser: bool) -> Self {
+        Self {
+            store,
+            state: TransactionState::Idle,
+            current_user: Some(username),
+            is_superuser,
         }
     }
 
     pub fn store(&self) -> Arc<TikvStore> {
         self.store.clone()
+    }
+
+    pub fn current_user(&self) -> Option<&str> {
+        self.current_user.as_deref()
+    }
+
+    pub fn is_superuser(&self) -> bool {
+        self.is_superuser
+    }
+
+    pub fn set_user(&mut self, username: String, is_superuser: bool) {
+        self.current_user = Some(username);
+        self.is_superuser = is_superuser;
     }
 
     /// Check if currently in a transaction block

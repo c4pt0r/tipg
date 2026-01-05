@@ -1,33 +1,49 @@
 //! SQL executor
 
 use super::{parse_sql, ExecuteResult, expr::{eval_expr, eval_expr_join, JoinContext}, Session, Aggregator};
+use crate::auth::{AuthManager, User, Role, Privilege, PrivilegeObject};
 use crate::storage::TikvStore;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value, IndexDef};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
-    AlterTableOperation, Assignment, ColumnDef as SqlColumnDef, ColumnOption, DataType as SqlDataType, Expr, Ident,
-    ObjectName, Query, SelectItem, SetExpr, Statement, TableConstraint, Values, FunctionArg, FunctionArgExpr, 
-    OrderByExpr, BinaryOperator, GroupByExpr, JoinOperator, JoinConstraint, TableFactor, LockType,
-    Value as SqlValue, Cte, WindowType
+    AlterTableOperation, AlterRoleOperation, Assignment, ColumnDef as SqlColumnDef, ColumnOption, 
+    DataType as SqlDataType, Expr, Ident, ObjectName, Query, SelectItem, SetExpr, Statement, 
+    TableConstraint, Values, FunctionArg, FunctionArgExpr, OrderByExpr, BinaryOperator, GroupByExpr, 
+    JoinOperator, JoinConstraint, TableFactor, LockType, Password as SqlPassword,
+    Value as SqlValue, Cte, WindowType, SetOperator, SetQuantifier, OnInsert, OnConflictAction,
+    GrantObjects, Privileges,
 };
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
 use tikv_client::Transaction;
 use tracing::debug;
 
-/// SQL Executor that operates on TiKV storage
 pub struct Executor {
     store: Arc<TikvStore>,
+    auth_manager: AuthManager,
 }
 
 impl Executor {
     pub fn new(store: Arc<TikvStore>) -> Self {
-        Self { store }
+        Self { 
+            store,
+            auth_manager: AuthManager::new(None),
+        }
+    }
+
+    pub fn new_with_namespace(store: Arc<TikvStore>, namespace: Option<String>) -> Self {
+        Self {
+            store,
+            auth_manager: AuthManager::new(namespace),
+        }
     }
 
     pub fn store(&self) -> Arc<TikvStore> {
         self.store.clone()
+    }
+
+    pub fn auth_manager(&self) -> &AuthManager {
+        &self.auth_manager
     }
 
     /// Execute a SQL statement string using the provided session
@@ -110,7 +126,9 @@ impl Executor {
                 match object_type {
                     ObjectType::Table => self.execute_drop_table(txn, names, *if_exists).await,
                     ObjectType::View => self.execute_drop_view(txn, names, *if_exists).await,
-                    ObjectType::Sequence | ObjectType::Index => Ok(ExecuteResult::Empty),
+                    ObjectType::Index => self.execute_drop_index(txn, names, *if_exists).await,
+                    ObjectType::Role => self.execute_drop_role(txn, names, *if_exists).await,
+                    ObjectType::Sequence => Ok(ExecuteResult::Empty),
                     _ => Ok(ExecuteResult::Empty),
                 }
             }
@@ -124,8 +142,8 @@ impl Executor {
                 let table_name = name.0.last().unwrap().value.clone();
                 Ok(ExecuteResult::AlterTable { table_name })
             }
-            Statement::Insert { table_name, columns, source, returning, .. } => {
-                self.execute_insert(txn, table_name, columns, source, returning).await
+            Statement::Insert { table_name, columns, source, returning, on, .. } => {
+                self.execute_insert(txn, table_name, columns, source, returning, on).await
             }
             Statement::Delete { from, selection, returning, .. } => {
                 self.execute_delete(txn, from, selection, returning).await
@@ -150,8 +168,17 @@ impl Executor {
             Statement::AlterIndex { .. } => {
                 Ok(ExecuteResult::Empty)
             }
-            Statement::Grant { .. } | Statement::Revoke { .. } => {
-                Ok(ExecuteResult::Empty)
+            Statement::CreateRole { names, if_not_exists, login, inherit, password, superuser, create_db, create_role, connection_limit, valid_until, .. } => {
+                self.execute_create_role(txn, names, *if_not_exists, login, inherit, password, superuser, create_db, create_role, connection_limit, valid_until).await
+            }
+            Statement::AlterRole { name, operation } => {
+                self.execute_alter_role(txn, name, operation).await
+            }
+            Statement::Grant { privileges, objects, grantees, with_grant_option, .. } => {
+                self.execute_grant(txn, privileges, &Some(objects.clone()), grantees, *with_grant_option).await
+            }
+            Statement::Revoke { privileges, objects, grantees, .. } => {
+                self.execute_revoke(txn, privileges, &Some(objects.clone()), grantees).await
             }
             Statement::Comment { .. } => {
                 Ok(ExecuteResult::Empty)
@@ -268,6 +295,41 @@ impl Executor {
         Ok(ExecuteResult::DropView { view_name: last })
     }
 
+    async fn execute_drop_index(&self, txn: &mut Transaction, names: &[ObjectName], if_exists: bool) -> Result<ExecuteResult> {
+        let mut last_index = String::new();
+        for name in names {
+            let idx_name = name.0.last().unwrap().value.clone();
+            let mut found = false;
+            
+            let tables = self.store.list_tables(txn).await?;
+            for table_name in tables {
+                let mut schema = match self.store.get_schema(txn, &table_name).await? {
+                    Some(s) => s,
+                    None => continue,
+                };
+                
+                if let Some(pos) = schema.indexes.iter().position(|i| i.name == idx_name) {
+                    let index = schema.indexes.remove(pos);
+                    let rows = self.scan_and_fill(txn, &table_name, &schema).await?;
+                    for row in rows {
+                        let idx_values = schema.get_index_values(&index, &row);
+                        let pk_values = schema.get_pk_values(&row);
+                        self.store.delete_index_entry(txn, schema.table_id, index.id, &idx_values, &pk_values, index.unique).await?;
+                    }
+                    self.store.update_schema(txn, schema).await?;
+                    found = true;
+                    last_index = idx_name.clone();
+                    break;
+                }
+            }
+            
+            if !found && !if_exists {
+                return Err(anyhow!("Index '{}' does not exist", idx_name));
+            }
+        }
+        Ok(ExecuteResult::DropIndex { index_name: last_index })
+    }
+
     async fn execute_drop_table(&self, txn: &mut Transaction, names: &[ObjectName], if_exists: bool) -> Result<ExecuteResult> {
         let mut last = String::new();
         for name in names {
@@ -338,15 +400,64 @@ impl Executor {
                 }
             },
             AlterTableOperation::DropConstraint { .. } => {},
-            AlterTableOperation::DropColumn { .. } => {},
-            AlterTableOperation::RenameColumn { .. } => {},
+            AlterTableOperation::DropColumn { column_name, if_exists, .. } => {
+                let col_name = column_name.value.clone();
+                let col_idx = schema.column_index(&col_name);
+                match col_idx {
+                    Some(idx) => {
+                        if schema.pk_indices.contains(&idx) {
+                            return Err(anyhow!("Cannot drop primary key column '{}'", col_name));
+                        }
+                        for index in &schema.indexes {
+                            if index.columns.contains(&col_name) {
+                                return Err(anyhow!("Cannot drop column '{}' used in index '{}'", col_name, index.name));
+                            }
+                        }
+                        let rows = self.scan_and_fill(txn, &t, &schema).await?;
+                        for row in rows {
+                            let pk_values = schema.get_pk_values(&row);
+                            let mut new_values = row.values.clone();
+                            new_values.remove(idx);
+                            let new_row = Row::new(new_values);
+                            self.store.upsert(txn, &t, new_row).await?;
+                        }
+                        schema.columns.remove(idx);
+                        for pk_idx in &mut schema.pk_indices {
+                            if *pk_idx > idx { *pk_idx -= 1; }
+                        }
+                        schema.version += 1;
+                        self.store.update_schema(txn, schema).await?;
+                    }
+                    None => {
+                        if !if_exists {
+                            return Err(anyhow!("Column '{}' does not exist", col_name));
+                        }
+                    }
+                }
+            },
+            AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
+                let old_name = old_column_name.value.clone();
+                let new_name = new_column_name.value.clone();
+                let col_idx = schema.column_index(&old_name).ok_or_else(|| anyhow!("Column '{}' does not exist", old_name))?;
+                if schema.column_index(&new_name).is_some() {
+                    return Err(anyhow!("Column '{}' already exists", new_name));
+                }
+                schema.columns[col_idx].name = new_name.clone();
+                for index in &mut schema.indexes {
+                    for col in &mut index.columns {
+                        if *col == old_name { *col = new_name.clone(); }
+                    }
+                }
+                schema.version += 1;
+                self.store.update_schema(txn, schema).await?;
+            },
             AlterTableOperation::RenameTable { .. } => {},
             _ => return Err(anyhow!("Unsupported ALTER")),
         }
         Ok(ExecuteResult::AlterTable { table_name: t })
     }
 
-    async fn execute_insert(&self, txn: &mut Transaction, table_name: &ObjectName, columns: &[Ident], source: &Option<Box<Query>>, returning: &Option<Vec<SelectItem>>) -> Result<ExecuteResult> {
+    async fn execute_insert(&self, txn: &mut Transaction, table_name: &ObjectName, columns: &[Ident], source: &Option<Box<Query>>, returning: &Option<Vec<SelectItem>>, on_conflict: &Option<OnInsert>) -> Result<ExecuteResult> {
         let t = table_name.0.last().unwrap().value.clone();
         let schema = self.store.get_schema(txn, &t).await?.ok_or_else(|| anyhow!("Table '{}' does not exist", t))?;
         let source = source.as_ref().ok_or_else(|| anyhow!("INSERT requires VALUES"))?;
@@ -387,20 +498,90 @@ impl Executor {
                     } else if !c.nullable { return Err(anyhow!("Column '{}' cannot be null", c.name)); }
                 }
             }
-            let row = Row::new(row_vals);
-            self.store.insert(txn, &t, row.clone()).await?;
-            let pk_values = schema.get_pk_values(&row);
-            for index in &schema.indexes {
-                let idx_values = schema.get_index_values(index, &row);
-                self.store.create_index_entry(txn, schema.table_id, index.id, &idx_values, &pk_values, index.unique).await?;
+            for (i, c) in schema.columns.iter().enumerate() {
+                row_vals[i] = coerce_value_for_column(row_vals[i].clone(), c)?;
             }
+            let row = Row::new(row_vals);
+            let pk_values = schema.get_pk_values(&row);
+            
+            let insert_result = self.store.insert(txn, &t, row.clone()).await;
+            let final_row = match insert_result {
+                Ok(()) => {
+                    for index in &schema.indexes {
+                        let idx_values = schema.get_index_values(index, &row);
+                        self.store.create_index_entry(txn, schema.table_id, index.id, &idx_values, &pk_values, index.unique).await?;
+                    }
+                    row
+                }
+                Err(e) if e.to_string().contains("Duplicate primary key") => {
+                    match on_conflict {
+                        Some(OnInsert::OnConflict(oc)) => {
+                            match &oc.action {
+                                OnConflictAction::DoNothing => continue,
+                                OnConflictAction::DoUpdate(do_update) => {
+                                    let existing_rows = self.store.batch_get_rows(txn, schema.table_id, vec![pk_values.clone()], &schema).await?;
+                                    if existing_rows.is_empty() {
+                                        return Err(anyhow!("Failed to fetch existing row for upsert"));
+                                    }
+                                    let existing_row = &existing_rows[0];
+                                    let mut updated_vals = existing_row.values.clone();
+                                    for assignment in &do_update.assignments {
+                                        let col_name = assignment.id.last().unwrap().value.clone();
+                                        let col_idx = schema.column_index(&col_name).ok_or_else(|| anyhow!("Unknown column in DO UPDATE: {}", col_name))?;
+                                        updated_vals[col_idx] = eval_expr(&assignment.value, Some(existing_row), Some(&schema))?;
+                                    }
+                                    let updated_row = Row::new(updated_vals);
+                                    for index in &schema.indexes {
+                                        let old_idx = schema.get_index_values(index, existing_row);
+                                        self.store.delete_index_entry(txn, schema.table_id, index.id, &old_idx, &pk_values, index.unique).await?;
+                                    }
+                                    self.store.upsert(txn, &t, updated_row.clone()).await?;
+                                    for index in &schema.indexes {
+                                        let new_idx = schema.get_index_values(index, &updated_row);
+                                        self.store.create_index_entry(txn, schema.table_id, index.id, &new_idx, &pk_values, index.unique).await?;
+                                    }
+                                    updated_row
+                                }
+                            }
+                        }
+                        Some(OnInsert::DuplicateKeyUpdate(assignments)) => {
+                            let existing_rows = self.store.batch_get_rows(txn, schema.table_id, vec![pk_values.clone()], &schema).await?;
+                            if existing_rows.is_empty() {
+                                return Err(anyhow!("Failed to fetch existing row for upsert"));
+                            }
+                            let existing_row = &existing_rows[0];
+                            let mut updated_vals = existing_row.values.clone();
+                            for assignment in assignments {
+                                let col_name = assignment.id.last().unwrap().value.clone();
+                                let col_idx = schema.column_index(&col_name).ok_or_else(|| anyhow!("Unknown column: {}", col_name))?;
+                                updated_vals[col_idx] = eval_expr(&assignment.value, Some(existing_row), Some(&schema))?;
+                            }
+                            let updated_row = Row::new(updated_vals);
+                            for index in &schema.indexes {
+                                let old_idx = schema.get_index_values(index, existing_row);
+                                self.store.delete_index_entry(txn, schema.table_id, index.id, &old_idx, &pk_values, index.unique).await?;
+                            }
+                            self.store.upsert(txn, &t, updated_row.clone()).await?;
+                            for index in &schema.indexes {
+                                let new_idx = schema.get_index_values(index, &updated_row);
+                                self.store.create_index_entry(txn, schema.table_id, index.id, &new_idx, &pk_values, index.unique).await?;
+                            }
+                            updated_row
+                        }
+                        None => return Err(e),
+                        _ => return Err(e),
+                    }
+                }
+                Err(e) => return Err(e),
+            };
+            
             affected += 1;
             if let Some(items) = returning {
                 let mut vals = Vec::new();
                 for item in items {
                     match item {
-                        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => vals.push(eval_expr(e, Some(&row), Some(&schema))?),
-                        SelectItem::Wildcard(_) => vals.extend(row.values.clone()),
+                        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => vals.push(eval_expr(e, Some(&final_row), Some(&schema))?),
+                        SelectItem::Wildcard(_) => vals.extend(final_row.values.clone()),
                         _ => {}
                     }
                 }
@@ -495,7 +676,8 @@ impl Executor {
             }
             let mut vals = r.values.clone();
             for (i, a) in assignments.iter().enumerate() {
-                vals[indices[i]] = eval_expr(&a.value, Some(&r), Some(&schema))?;
+                let raw_val = eval_expr(&a.value, Some(&r), Some(&schema))?;
+                vals[indices[i]] = coerce_value_for_column(raw_val, &schema.columns[indices[i]])?;
             }
             let new_row = Row::new(vals);
             let pks = schema.get_pk_values(&r);
@@ -571,6 +753,11 @@ impl Executor {
     }
 
     async fn execute_query_with_ctes(&self, txn: &mut Transaction, query: &Query, ctes: &HashMap<String, (TableSchema, Vec<Row>)>) -> Result<ExecuteResult> {
+        // Handle UNION/INTERSECT/EXCEPT
+        if let SetExpr::SetOperation { op, set_quantifier, left, right } = &*query.body {
+            return self.execute_set_operation(txn, op, set_quantifier, left, right, ctes).await;
+        }
+        
         let select = match &*query.body { SetExpr::Select(s) => s, _ => return Err(anyhow!("Only SELECT supported")) };
         
         if select.from.is_empty() {
@@ -840,6 +1027,137 @@ impl Executor {
         Ok(ExecuteResult::Select { columns: cols, rows: vec![Row::new(values)] })
     }
 
+    fn execute_set_operation<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        op: &'a SetOperator,
+        quantifier: &'a SetQuantifier,
+        left: &'a SetExpr,
+        right: &'a SetExpr,
+        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExecuteResult>> + Send + 'a>> {
+        Box::pin(async move {
+            let left_result = self.execute_set_expr(txn, left, ctes).await?;
+            let right_result = self.execute_set_expr(txn, right, ctes).await?;
+
+        let (left_cols, left_rows) = match left_result {
+            ExecuteResult::Select { columns, rows } => (columns, rows),
+            _ => return Err(anyhow!("Left side of set operation must be SELECT")),
+        };
+        let (right_cols, right_rows) = match right_result {
+            ExecuteResult::Select { columns, rows } => (columns, rows),
+            _ => return Err(anyhow!("Right side of set operation must be SELECT")),
+        };
+
+        if left_cols.len() != right_cols.len() {
+            return Err(anyhow!("Column count mismatch in set operation"));
+        }
+
+        let columns = left_cols;
+        let is_all = matches!(quantifier, SetQuantifier::All);
+
+        let rows = match op {
+            SetOperator::Union => {
+                let mut result = left_rows;
+                if is_all {
+                    result.extend(right_rows);
+                } else {
+                    let existing: std::collections::HashSet<Vec<u8>> = result
+                        .iter()
+                        .map(|r| bincode::serialize(&r.values).unwrap_or_default())
+                        .collect();
+                    for row in right_rows {
+                        let key = bincode::serialize(&row.values).unwrap_or_default();
+                        if !existing.contains(&key) {
+                            result.push(row);
+                        }
+                    }
+                    let mut seen = std::collections::HashSet::new();
+                    result.retain(|r| {
+                        let key = bincode::serialize(&r.values).unwrap_or_default();
+                        seen.insert(key)
+                    });
+                }
+                result
+            }
+            SetOperator::Intersect => {
+                let right_set: std::collections::HashSet<Vec<u8>> = right_rows
+                    .iter()
+                    .map(|r| bincode::serialize(&r.values).unwrap_or_default())
+                    .collect();
+                let mut result: Vec<Row> = left_rows
+                    .into_iter()
+                    .filter(|r| {
+                        let key = bincode::serialize(&r.values).unwrap_or_default();
+                        right_set.contains(&key)
+                    })
+                    .collect();
+                if !is_all {
+                    let mut seen = std::collections::HashSet::new();
+                    result.retain(|r| {
+                        let key = bincode::serialize(&r.values).unwrap_or_default();
+                        seen.insert(key)
+                    });
+                }
+                result
+            }
+            SetOperator::Except => {
+                let right_set: std::collections::HashSet<Vec<u8>> = right_rows
+                    .iter()
+                    .map(|r| bincode::serialize(&r.values).unwrap_or_default())
+                    .collect();
+                let mut result: Vec<Row> = left_rows
+                    .into_iter()
+                    .filter(|r| {
+                        let key = bincode::serialize(&r.values).unwrap_or_default();
+                        !right_set.contains(&key)
+                    })
+                    .collect();
+                if !is_all {
+                    let mut seen = std::collections::HashSet::new();
+                    result.retain(|r| {
+                        let key = bincode::serialize(&r.values).unwrap_or_default();
+                        seen.insert(key)
+                    });
+                }
+                result
+            }
+        };
+
+            Ok(ExecuteResult::Select { columns, rows })
+        })
+    }
+
+    fn execute_set_expr<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        expr: &'a SetExpr,
+        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExecuteResult>> + Send + 'a>> {
+        Box::pin(async move {
+            match expr {
+                SetExpr::Select(s) => {
+                    let query = Query {
+                        with: None,
+                        body: Box::new(SetExpr::Select(s.clone())),
+                        order_by: vec![],
+                        limit: None,
+                        offset: None,
+                        fetch: None,
+                        locks: vec![],
+                        limit_by: vec![],
+                        for_clause: None,
+                    };
+                    self.execute_query_with_ctes(txn, &query, ctes).await
+                }
+                SetExpr::SetOperation { op, set_quantifier, left, right } => {
+                    self.execute_set_operation(txn, op, set_quantifier, left, right, ctes).await
+                }
+                _ => Err(anyhow!("Unsupported set expression")),
+            }
+        })
+    }
+
     async fn execute_join_query(&self, txn: &mut Transaction, query: &Query, select: &sqlparser::ast::Select) -> Result<ExecuteResult> {
         self.execute_join_query_with_ctes(txn, query, select, &HashMap::new()).await
     }
@@ -924,11 +1242,16 @@ impl Executor {
                 JoinOperator::Inner(JoinConstraint::On(expr)) => Some(expr),
                 JoinOperator::LeftOuter(JoinConstraint::On(expr)) => Some(expr),
                 JoinOperator::RightOuter(JoinConstraint::On(expr)) => Some(expr),
+                JoinOperator::FullOuter(JoinConstraint::On(expr)) => Some(expr),
                 JoinOperator::CrossJoin => None,
                 _ => return Err(anyhow!("Unsupported JOIN type")),
             };
 
             let is_left_join = matches!(&join.join_operator, JoinOperator::LeftOuter(_));
+            let is_right_join = matches!(&join.join_operator, JoinOperator::RightOuter(_));
+            let is_full_join = matches!(&join.join_operator, JoinOperator::FullOuter(_));
+            
+            let left_col_count: usize = combined_schemas.iter().map(|(_, s)| s.columns.len()).sum();
             
             let mut column_offsets: HashMap<String, usize> = HashMap::new();
             let mut offset = 0;
@@ -941,7 +1264,7 @@ impl Executor {
                     offset += 1;
                 }
             }
-            let join_start_offset = offset;
+            let _join_start_offset = offset;
             for col in &join_schema.columns {
                 column_offsets.insert(format!("{}.{}", join_alias, col.name), offset);
                 if !column_offsets.contains_key(&col.name) {
@@ -965,9 +1288,11 @@ impl Executor {
             };
 
             let mut new_combined_rows = Vec::new();
+            let mut right_matched: Vec<bool> = vec![false; join_rows.len()];
+            
             for left_row in &combined_rows {
                 let mut matched = false;
-                for right_row in &join_rows {
+                for (right_idx, right_row) in join_rows.iter().enumerate() {
                     let mut combined_values = left_row.values.clone();
                     combined_values.extend(right_row.values.clone());
                     let combined_row = Row::new(combined_values);
@@ -987,14 +1312,28 @@ impl Executor {
                     if matches {
                         new_combined_rows.push(combined_row);
                         matched = true;
+                        right_matched[right_idx] = true;
                     }
                 }
-                if is_left_join && !matched {
+                if (is_left_join || is_full_join) && !matched {
                     let mut combined_values = left_row.values.clone();
                     for _ in 0..join_schema.columns.len() {
                         combined_values.push(Value::Null);
                     }
                     new_combined_rows.push(Row::new(combined_values));
+                }
+            }
+            
+            if is_right_join || is_full_join {
+                for (right_idx, right_row) in join_rows.iter().enumerate() {
+                    if !right_matched[right_idx] {
+                        let mut combined_values: Vec<Value> = Vec::new();
+                        for _ in 0..left_col_count {
+                            combined_values.push(Value::Null);
+                        }
+                        combined_values.extend(right_row.values.clone());
+                        new_combined_rows.push(Row::new(combined_values));
+                    }
                 }
             }
 
@@ -1398,6 +1737,27 @@ impl Executor {
                 }
             }
             DataType::Text | DataType::Interval => Value::Text(unescaped),
+            DataType::Array(_) => {
+                if let Ok(arr) = parse_pg_array(&unescaped) {
+                    Value::Array(arr)
+                } else {
+                    Value::Text(unescaped)
+                }
+            }
+            DataType::Json => {
+                if serde_json::from_str::<serde_json::Value>(&unescaped).is_ok() {
+                    Value::Json(unescaped)
+                } else {
+                    Value::Text(unescaped)
+                }
+            }
+            DataType::Jsonb => {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&unescaped) {
+                    Value::Jsonb(parsed.to_string())
+                } else {
+                    Value::Text(unescaped)
+                }
+            }
         }
     }
 
@@ -1456,6 +1816,290 @@ impl Executor {
         
         result
     }
+
+    async fn execute_create_role(
+        &self,
+        txn: &mut Transaction,
+        names: &[ObjectName],
+        if_not_exists: bool,
+        login: &Option<bool>,
+        _inherit: &Option<bool>,
+        password: &Option<SqlPassword>,
+        superuser: &Option<bool>,
+        create_db: &Option<bool>,
+        create_role: &Option<bool>,
+        _connection_limit: &Option<Expr>,
+        _valid_until: &Option<Expr>,
+    ) -> Result<ExecuteResult> {
+        for name in names {
+            let role_name = name.0.last().ok_or_else(|| anyhow!("Invalid role name"))?.value.clone();
+            
+            if if_not_exists {
+                if self.auth_manager.get_user(txn, &role_name).await?.is_some() {
+                    continue;
+                }
+            }
+
+            let pwd = match password {
+                Some(SqlPassword::Password(expr)) => {
+                    if let Expr::Value(SqlValue::SingleQuotedString(s)) = expr {
+                        s.clone()
+                    } else {
+                        "".to_string()
+                    }
+                }
+                Some(SqlPassword::NullPassword) => "".to_string(),
+                None => "".to_string(),
+            };
+
+            let is_superuser = superuser.unwrap_or(false);
+            let can_login = login.unwrap_or(false);
+
+            let mut user = if is_superuser {
+                User::new_superuser(&role_name, &pwd)
+            } else {
+                User::new(&role_name, &pwd)
+            };
+
+            user.can_login = can_login;
+            user.can_create_db = create_db.unwrap_or(false);
+            user.can_create_role = create_role.unwrap_or(false);
+
+            self.auth_manager.create_user(txn, user).await?;
+        }
+
+        Ok(ExecuteResult::CreateRole)
+    }
+
+    async fn execute_alter_role(
+        &self,
+        txn: &mut Transaction,
+        name: &Ident,
+        operation: &AlterRoleOperation,
+    ) -> Result<ExecuteResult> {
+        let role_name = name.value.clone();
+        let mut user = self.auth_manager.get_user(txn, &role_name).await?
+            .ok_or_else(|| anyhow!("Role '{}' does not exist", role_name))?;
+
+        match operation {
+            AlterRoleOperation::RenameRole { role_name: new_name } => {
+                self.auth_manager.drop_user(txn, &role_name).await?;
+                user.name = new_name.value.clone();
+                self.auth_manager.create_user(txn, user).await?;
+            }
+            AlterRoleOperation::WithOptions { options } => {
+                for opt in options {
+                    match opt {
+                        sqlparser::ast::RoleOption::SuperUser(v) => user.is_superuser = *v,
+                        sqlparser::ast::RoleOption::CreateDB(v) => user.can_create_db = *v,
+                        sqlparser::ast::RoleOption::CreateRole(v) => user.can_create_role = *v,
+                        sqlparser::ast::RoleOption::Login(v) => user.can_login = *v,
+                        sqlparser::ast::RoleOption::Password(p) => {
+                            if let SqlPassword::Password(expr) = p {
+                                if let Expr::Value(SqlValue::SingleQuotedString(s)) = expr {
+                                    user.set_password(s);
+                                }
+                            }
+                        }
+                        sqlparser::ast::RoleOption::ConnectionLimit(expr) => {
+                            if let Expr::Value(SqlValue::Number(n, _)) = expr {
+                                user.connection_limit = n.parse().unwrap_or(-1);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                self.auth_manager.update_user(txn, user).await?;
+            }
+            AlterRoleOperation::AddMember { member_name } => {
+                self.auth_manager.grant_role_to_user(txn, &member_name.value, &role_name).await?;
+            }
+            AlterRoleOperation::DropMember { member_name } => {
+                self.auth_manager.revoke_role_from_user(txn, &member_name.value, &role_name).await?;
+            }
+            _ => {}
+        }
+
+        Ok(ExecuteResult::AlterRole)
+    }
+
+    async fn execute_drop_role(
+        &self,
+        txn: &mut Transaction,
+        names: &[ObjectName],
+        if_exists: bool,
+    ) -> Result<ExecuteResult> {
+        for name in names {
+            let role_name = name.0.last().ok_or_else(|| anyhow!("Invalid role name"))?.value.clone();
+            
+            let dropped = self.auth_manager.drop_user(txn, &role_name).await?;
+            if !dropped && !if_exists {
+                return Err(anyhow!("Role '{}' does not exist", role_name));
+            }
+            
+            if !dropped {
+                let role_dropped = self.auth_manager.drop_role(txn, &role_name).await?;
+                if !role_dropped && !if_exists {
+                    return Err(anyhow!("Role '{}' does not exist", role_name));
+                }
+            }
+        }
+        
+        Ok(ExecuteResult::DropRole)
+    }
+
+    async fn execute_grant(
+        &self,
+        txn: &mut Transaction,
+        privileges: &Privileges,
+        objects: &Option<GrantObjects>,
+        grantees: &[Ident],
+        with_grant_option: bool,
+    ) -> Result<ExecuteResult> {
+        let privs = match privileges {
+            Privileges::All { .. } => vec![Privilege::All],
+            Privileges::Actions(actions) => {
+                actions.iter().filter_map(|a| {
+                    match a {
+                        sqlparser::ast::Action::Select { .. } => Some(Privilege::Select),
+                        sqlparser::ast::Action::Insert { .. } => Some(Privilege::Insert),
+                        sqlparser::ast::Action::Update { .. } => Some(Privilege::Update),
+                        sqlparser::ast::Action::Delete { .. } => Some(Privilege::Delete),
+                        sqlparser::ast::Action::Truncate => Some(Privilege::Truncate),
+                        sqlparser::ast::Action::References { .. } => Some(Privilege::References),
+                        sqlparser::ast::Action::Trigger => Some(Privilege::Trigger),
+                        sqlparser::ast::Action::Connect => Some(Privilege::Connect),
+                        sqlparser::ast::Action::Create => Some(Privilege::CreateTable),
+                        sqlparser::ast::Action::Execute => Some(Privilege::Execute),
+                        sqlparser::ast::Action::Usage => Some(Privilege::Usage),
+                        _ => None,
+                    }
+                }).collect()
+            }
+        };
+
+        let obj = match objects {
+            Some(GrantObjects::Tables(tables)) => {
+                if tables.is_empty() {
+                    PrivilegeObject::Global
+                } else {
+                    let table_name = tables[0].0.last()
+                        .map(|i| i.value.clone())
+                        .unwrap_or_default();
+                    PrivilegeObject::table(&table_name)
+                }
+            }
+            Some(GrantObjects::AllTablesInSchema { schemas }) => {
+                let schema = schemas.first()
+                    .map(|s| s.0.last().map(|i| i.value.clone()).unwrap_or("public".to_string()))
+                    .unwrap_or("public".to_string());
+                PrivilegeObject::AllTablesInSchema(schema)
+            }
+            Some(GrantObjects::Schemas(schemas)) => {
+                let schema = schemas.first()
+                    .map(|s| s.0.last().map(|i| i.value.clone()).unwrap_or("public".to_string()))
+                    .unwrap_or("public".to_string());
+                PrivilegeObject::Schema(schema)
+            }
+            _ => PrivilegeObject::Global,
+        };
+
+        for grantee in grantees {
+            let username = grantee.value.clone();
+            if let Some(mut user) = self.auth_manager.get_user(txn, &username).await? {
+                for priv_type in &privs {
+                    user.grant_privilege(priv_type.clone(), obj.clone(), with_grant_option);
+                }
+                self.auth_manager.update_user(txn, user).await?;
+            } else if let Some(mut role) = self.auth_manager.get_role(txn, &username).await? {
+                for priv_type in &privs {
+                    role.privileges.push(crate::auth::GrantedPrivilege {
+                        privilege: priv_type.clone(),
+                        object: obj.clone(),
+                        with_grant_option,
+                    });
+                }
+                self.auth_manager.update_role(txn, role).await?;
+            } else {
+                return Err(anyhow!("Role or user '{}' does not exist", username));
+            }
+        }
+
+        Ok(ExecuteResult::Grant)
+    }
+
+    async fn execute_revoke(
+        &self,
+        txn: &mut Transaction,
+        privileges: &Privileges,
+        objects: &Option<GrantObjects>,
+        grantees: &[Ident],
+    ) -> Result<ExecuteResult> {
+        let privs: Vec<Privilege> = match privileges {
+            Privileges::All { .. } => vec![Privilege::All],
+            Privileges::Actions(actions) => {
+                actions.iter().filter_map(|a| {
+                    match a {
+                        sqlparser::ast::Action::Select { .. } => Some(Privilege::Select),
+                        sqlparser::ast::Action::Insert { .. } => Some(Privilege::Insert),
+                        sqlparser::ast::Action::Update { .. } => Some(Privilege::Update),
+                        sqlparser::ast::Action::Delete { .. } => Some(Privilege::Delete),
+                        sqlparser::ast::Action::Truncate => Some(Privilege::Truncate),
+                        sqlparser::ast::Action::References { .. } => Some(Privilege::References),
+                        sqlparser::ast::Action::Trigger => Some(Privilege::Trigger),
+                        sqlparser::ast::Action::Connect => Some(Privilege::Connect),
+                        sqlparser::ast::Action::Create => Some(Privilege::CreateTable),
+                        sqlparser::ast::Action::Execute => Some(Privilege::Execute),
+                        sqlparser::ast::Action::Usage => Some(Privilege::Usage),
+                        _ => None,
+                    }
+                }).collect()
+            }
+        };
+
+        let obj = match objects {
+            Some(GrantObjects::Tables(tables)) => {
+                if tables.is_empty() {
+                    PrivilegeObject::Global
+                } else {
+                    let table_name = tables[0].0.last()
+                        .map(|i| i.value.clone())
+                        .unwrap_or_default();
+                    PrivilegeObject::table(&table_name)
+                }
+            }
+            Some(GrantObjects::AllTablesInSchema { schemas }) => {
+                let schema = schemas.first()
+                    .map(|s| s.0.last().map(|i| i.value.clone()).unwrap_or("public".to_string()))
+                    .unwrap_or("public".to_string());
+                PrivilegeObject::AllTablesInSchema(schema)
+            }
+            Some(GrantObjects::Schemas(schemas)) => {
+                let schema = schemas.first()
+                    .map(|s| s.0.last().map(|i| i.value.clone()).unwrap_or("public".to_string()))
+                    .unwrap_or("public".to_string());
+                PrivilegeObject::Schema(schema)
+            }
+            _ => PrivilegeObject::Global,
+        };
+
+        for grantee in grantees {
+            let username = grantee.value.clone();
+            if let Some(mut user) = self.auth_manager.get_user(txn, &username).await? {
+                for priv_type in &privs {
+                    user.revoke_privilege(priv_type, &obj);
+                }
+                self.auth_manager.update_user(txn, user).await?;
+            } else if let Some(mut role) = self.auth_manager.get_role(txn, &username).await? {
+                role.privileges.retain(|p| !privs.contains(&p.privilege) || p.object != obj);
+                self.auth_manager.update_role(txn, role).await?;
+            } else {
+                return Err(anyhow!("Role or user '{}' does not exist", username));
+            }
+        }
+
+        Ok(ExecuteResult::Revoke)
+    }
 }
 
 fn dedup_rows(rows: Vec<Row>) -> Vec<Row> {
@@ -1469,6 +2113,31 @@ fn dedup_rows(rows: Vec<Row>) -> Vec<Row> {
         }
     }
     result
+}
+
+fn coerce_value_for_column(val: Value, col: &crate::types::ColumnDef) -> Result<Value> {
+    match (&val, &col.data_type) {
+        (Value::Null, _) => Ok(Value::Null),
+        (Value::Text(s), DataType::Json) => {
+            serde_json::from_str::<serde_json::Value>(s)
+                .map_err(|e| anyhow!("invalid input syntax for type json: {}", e))?;
+            Ok(Value::Json(s.clone()))
+        }
+        (Value::Text(s), DataType::Jsonb) => {
+            let parsed: serde_json::Value = serde_json::from_str(s)
+                .map_err(|e| anyhow!("invalid input syntax for type jsonb: {}", e))?;
+            Ok(Value::Jsonb(parsed.to_string()))
+        }
+        (Value::Json(s), DataType::Json) => Ok(Value::Json(s.clone())),
+        (Value::Json(s), DataType::Jsonb) => {
+            let parsed: serde_json::Value = serde_json::from_str(s)
+                .map_err(|e| anyhow!("invalid input syntax for type jsonb: {}", e))?;
+            Ok(Value::Jsonb(parsed.to_string()))
+        }
+        (Value::Jsonb(s), DataType::Json) => Ok(Value::Json(s.clone())),
+        (Value::Jsonb(s), DataType::Jsonb) => Ok(Value::Jsonb(s.clone())),
+        _ => Ok(val),
+    }
 }
 
 struct WindowFuncInfo {
@@ -1740,7 +2409,84 @@ fn value_to_sql_expr(v: &Value) -> Expr {
             let uuid = uuid::Uuid::from_bytes(*bytes);
             Expr::Value(SqlValue::SingleQuotedString(uuid.to_string()))
         }
+        Value::Array(elems) => {
+            let elem_exprs: Vec<Expr> = elems.iter().map(value_to_sql_expr).collect();
+            Expr::Array(sqlparser::ast::Array {
+                elem: elem_exprs,
+                named: true,
+            })
+        }
+        Value::Json(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
+        Value::Jsonb(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
     }
+}
+
+fn parse_pg_array(s: &str) -> Result<Vec<Value>> {
+    let s = s.trim();
+    if !s.starts_with('{') || !s.ends_with('}') {
+        return Err(anyhow!("Invalid array format"));
+    }
+
+    let inner = &s[1..s.len() - 1];
+    if inner.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut escape_next = false;
+
+    for c in inner.chars() {
+        if escape_next {
+            current.push(c);
+            escape_next = false;
+            continue;
+        }
+
+        match c {
+            '\\' => escape_next = true,
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                let val = parse_array_element(&current);
+                result.push(val);
+                current.clear();
+            }
+            _ => current.push(c),
+        }
+    }
+
+    if !current.is_empty() || inner.ends_with(',') {
+        let val = parse_array_element(&current);
+        result.push(val);
+    }
+
+    Ok(result)
+}
+
+fn parse_array_element(s: &str) -> Value {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("NULL") {
+        return Value::Null;
+    }
+
+    if let Ok(i) = s.parse::<i32>() {
+        return Value::Int32(i);
+    }
+    if let Ok(i) = s.parse::<i64>() {
+        return Value::Int64(i);
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        return Value::Float64(f);
+    }
+    if s.eq_ignore_ascii_case("true") {
+        return Value::Boolean(true);
+    }
+    if s.eq_ignore_ascii_case("false") {
+        return Value::Boolean(false);
+    }
+
+    Value::Text(s.to_string())
 }
 
 fn get_select_item_name(item: &SelectItem) -> String {
@@ -1819,6 +2565,8 @@ fn convert_data_type(sql_type: &SqlDataType) -> Result<DataType> {
                 match type_name.as_str() {
                     "SERIAL" => Ok(DataType::Int32),
                     "BIGSERIAL" => Ok(DataType::Int64),
+                    "JSON" => Ok(DataType::Json),
+                    "JSONB" => Ok(DataType::Jsonb),
                     _ => Ok(DataType::Text)
                 }
             } else {
