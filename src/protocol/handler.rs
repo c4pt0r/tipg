@@ -1,6 +1,5 @@
-//! PostgreSQL protocol handler using pgwire
-
 use crate::auth::AuthManager;
+use crate::pool::TikvClientPool;
 use crate::sql::{ExecuteResult, Executor, Session};
 use crate::storage::TikvStore;
 use crate::types::Value;
@@ -74,6 +73,7 @@ fn parse_tenant_username(username: &str) -> (Option<String>, String) {
 }
 
 pub struct DynamicPgHandler {
+    client_pool: Option<Arc<TikvClientPool>>,
     pd_endpoints: Vec<String>,
     namespace: Option<String>,
     default_keyspace: Option<String>,
@@ -92,8 +92,27 @@ impl DynamicPgHandler {
         fallback_password: Option<String>,
     ) -> Self {
         Self {
+            client_pool: None,
             pd_endpoints,
             namespace,
+            default_keyspace,
+            fallback_password,
+            executor: OnceCell::new(),
+            session: Mutex::new(None),
+            copy_context: Mutex::new(None),
+            query_parser: Arc::new(NoopQueryParser::new()),
+        }
+    }
+
+    pub fn new_with_pool(
+        client_pool: Arc<TikvClientPool>,
+        default_keyspace: Option<String>,
+        fallback_password: Option<String>,
+    ) -> Self {
+        Self {
+            client_pool: Some(client_pool),
+            pd_endpoints: Vec::new(),
+            namespace: None,
             default_keyspace,
             fallback_password,
             executor: OnceCell::new(),
@@ -108,33 +127,33 @@ impl DynamicPgHandler {
             .or_else(|| self.default_keyspace.clone())
             .or_else(|| Some("default".to_string()));
         
-        match TikvStore::new_with_keyspace(
-            self.pd_endpoints.clone(),
-            self.namespace.clone(),
-            effective_keyspace.clone(),
-        ).await {
-            Ok(store) => {
-                let store = Arc::new(store);
-                let executor = Arc::new(Executor::new_with_namespace(store.clone(), self.namespace.clone()));
-                
-                let session = match username {
-                    Some(user) => Session::new_with_user(store, user, is_superuser),
-                    None => Session::new(store),
-                };
-                
-                let _ = self.executor.set(executor);
-                
-                let mut session_guard = self.session.lock().await;
-                *session_guard = Some(session);
-                
-                info!("Initialized executor with keyspace: {:?}", effective_keyspace);
-                Ok(())
-            }
-            Err(e) => {
-                error!("Failed to create TikvStore: {}", e);
-                Err(format!("Failed to connect to TiKV: {}", e))
-            }
-        }
+        let store = if let Some(pool) = &self.client_pool {
+            pool.get_client(effective_keyspace.clone())
+                .await
+                .map_err(|e| format!("Failed to get client from pool: {}", e))?
+        } else {
+            let s = TikvStore::new_with_keyspace(
+                self.pd_endpoints.clone(),
+                self.namespace.clone(),
+                effective_keyspace.clone(),
+            ).await.map_err(|e| format!("Failed to connect to TiKV: {}", e))?;
+            Arc::new(s)
+        };
+
+        let executor = Arc::new(Executor::new_with_namespace(store.clone(), self.namespace.clone()));
+        
+        let session = match username {
+            Some(user) => Session::new_with_user(store, user, is_superuser),
+            None => Session::new(store),
+        };
+        
+        let _ = self.executor.set(executor);
+        
+        let mut session_guard = self.session.lock().await;
+        *session_guard = Some(session);
+        
+        info!("Initialized executor with keyspace: {:?}", effective_keyspace);
+        Ok(())
     }
 
     fn get_executor(&self) -> Result<&Arc<Executor>, PgWireError> {
@@ -180,11 +199,18 @@ impl DynamicPgHandler {
             .or_else(|| self.default_keyspace.clone())
             .or_else(|| Some("default".to_string()));
         
-        let store = TikvStore::new_with_keyspace(
-            self.pd_endpoints.clone(),
-            self.namespace.clone(),
-            effective_keyspace,
-        ).await.map_err(|e| format!("Failed to connect to TiKV: {}", e))?;
+        let store = if let Some(pool) = &self.client_pool {
+            pool.get_client(effective_keyspace)
+                .await
+                .map_err(|e| format!("Failed to get client from pool: {}", e))?
+        } else {
+            let s = TikvStore::new_with_keyspace(
+                self.pd_endpoints.clone(),
+                self.namespace.clone(),
+                effective_keyspace,
+            ).await.map_err(|e| format!("Failed to connect to TiKV: {}", e))?;
+            Arc::new(s)
+        };
         
         let auth_manager = AuthManager::new(self.namespace.clone());
         let mut txn = store.begin().await.map_err(|e| format!("Failed to begin transaction: {}", e))?;
@@ -668,8 +694,8 @@ fn infer_result_fields(query: &str) -> Vec<FieldInfo> {
     }
 }
 
-/// Dynamic handler factory that creates per-connection handlers with dynamic keyspace
 pub struct DynamicHandlerFactory {
+    client_pool: Option<Arc<TikvClientPool>>,
     pd_endpoints: Vec<String>,
     namespace: Option<String>,
     default_keyspace: Option<String>,
@@ -684,8 +710,23 @@ impl DynamicHandlerFactory {
         expected_password: Option<String>,
     ) -> Self {
         Self {
+            client_pool: None,
             pd_endpoints,
             namespace,
+            default_keyspace,
+            expected_password,
+        }
+    }
+
+    pub fn new_with_pool(
+        client_pool: Arc<TikvClientPool>,
+        default_keyspace: Option<String>,
+        expected_password: Option<String>,
+    ) -> Self {
+        Self {
+            client_pool: Some(client_pool),
+            pd_endpoints: Vec::new(),
+            namespace: None,
             default_keyspace,
             expected_password,
         }
@@ -700,39 +741,71 @@ impl PgWireServerHandlers for DynamicHandlerFactory {
     type ErrorHandler = NoopErrorHandler;
 
     fn simple_query_handler(&self) -> Arc<Self::SimpleQueryHandler> {
-        Arc::new(DynamicPgHandler::new(
-            self.pd_endpoints.clone(),
-            self.namespace.clone(),
-            self.default_keyspace.clone(),
-            self.expected_password.clone(),
-        ))
+        if let Some(pool) = &self.client_pool {
+            Arc::new(DynamicPgHandler::new_with_pool(
+                pool.clone(),
+                self.default_keyspace.clone(),
+                self.expected_password.clone(),
+            ))
+        } else {
+            Arc::new(DynamicPgHandler::new(
+                self.pd_endpoints.clone(),
+                self.namespace.clone(),
+                self.default_keyspace.clone(),
+                self.expected_password.clone(),
+            ))
+        }
     }
 
     fn extended_query_handler(&self) -> Arc<Self::ExtendedQueryHandler> {
-        Arc::new(DynamicPgHandler::new(
-            self.pd_endpoints.clone(),
-            self.namespace.clone(),
-            self.default_keyspace.clone(),
-            self.expected_password.clone(),
-        ))
+        if let Some(pool) = &self.client_pool {
+            Arc::new(DynamicPgHandler::new_with_pool(
+                pool.clone(),
+                self.default_keyspace.clone(),
+                self.expected_password.clone(),
+            ))
+        } else {
+            Arc::new(DynamicPgHandler::new(
+                self.pd_endpoints.clone(),
+                self.namespace.clone(),
+                self.default_keyspace.clone(),
+                self.expected_password.clone(),
+            ))
+        }
     }
 
     fn startup_handler(&self) -> Arc<Self::StartupHandler> {
-        Arc::new(DynamicPgHandler::new(
-            self.pd_endpoints.clone(),
-            self.namespace.clone(),
-            self.default_keyspace.clone(),
-            self.expected_password.clone(),
-        ))
+        if let Some(pool) = &self.client_pool {
+            Arc::new(DynamicPgHandler::new_with_pool(
+                pool.clone(),
+                self.default_keyspace.clone(),
+                self.expected_password.clone(),
+            ))
+        } else {
+            Arc::new(DynamicPgHandler::new(
+                self.pd_endpoints.clone(),
+                self.namespace.clone(),
+                self.default_keyspace.clone(),
+                self.expected_password.clone(),
+            ))
+        }
     }
 
     fn copy_handler(&self) -> Arc<Self::CopyHandler> {
-        Arc::new(DynamicPgHandler::new(
-            self.pd_endpoints.clone(),
-            self.namespace.clone(),
-            self.default_keyspace.clone(),
-            self.expected_password.clone(),
-        ))
+        if let Some(pool) = &self.client_pool {
+            Arc::new(DynamicPgHandler::new_with_pool(
+                pool.clone(),
+                self.default_keyspace.clone(),
+                self.expected_password.clone(),
+            ))
+        } else {
+            Arc::new(DynamicPgHandler::new(
+                self.pd_endpoints.clone(),
+                self.namespace.clone(),
+                self.default_keyspace.clone(),
+                self.expected_password.clone(),
+            ))
+        }
     }
 
     fn error_handler(&self) -> Arc<Self::ErrorHandler> {

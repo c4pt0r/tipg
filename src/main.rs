@@ -1,17 +1,20 @@
-//! pg-tikv: A PostgreSQL-compatible SQL layer on TiKV
-
 mod auth;
+mod pool;
 mod protocol;
 mod sql;
 mod storage;
+mod tls;
 mod types;
 
 use anyhow::Result;
 use pgwire::tokio::process_socket;
+use pool::TikvClientPool;
 use protocol::DynamicHandlerFactory;
 use std::env;
+use std::sync::Arc;
 use tokio::net::TcpListener;
-use tracing::{info, Level};
+use tokio_rustls::TlsAcceptor;
+use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 const DEFAULT_PG_PORT: u16 = 5433;
@@ -33,6 +36,9 @@ async fn main() -> Result<()> {
     let namespace = env::var("PG_NAMESPACE").ok();
     let default_keyspace = env::var("PG_KEYSPACE").ok();
     let password = env::var("PG_PASSWORD").ok();
+
+    let tls_cert = env::var("PG_TLS_CERT").ok();
+    let tls_key = env::var("PG_TLS_KEY").ok();
 
     info!("pg-tikv starting up...");
     info!("PD endpoints: {}", pd_endpoints);
@@ -58,6 +64,32 @@ async fn main() -> Result<()> {
         .map(|s| s.trim().to_string())
         .collect();
 
+    let tls_acceptor: Option<Arc<TlsAcceptor>> = match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => {
+            match tls::setup_tls(&cert, &key) {
+                Ok(acceptor) => {
+                    info!("TLS enabled with cert: {}, key: {}", cert, key);
+                    Some(Arc::new(acceptor))
+                }
+                Err(e) => {
+                    warn!("Failed to setup TLS: {}. Running without TLS.", e);
+                    None
+                }
+            }
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            warn!("Both PG_TLS_CERT and PG_TLS_KEY must be set. Running without TLS.");
+            None
+        }
+        (None, None) => {
+            info!("TLS: disabled (set PG_TLS_CERT and PG_TLS_KEY to enable)");
+            None
+        }
+    };
+
+    let client_pool = Arc::new(TikvClientPool::new(pd_addrs.clone(), namespace.clone()));
+    info!("TiKV client pool initialized");
+
     let addr = format!("0.0.0.0:{}", pg_port);
     let listener = TcpListener::bind(&addr).await?;
     info!("PostgreSQL server listening on {}", addr);
@@ -67,15 +99,19 @@ async fn main() -> Result<()> {
         let (socket, peer_addr) = listener.accept().await?;
         info!("New connection from {}", peer_addr);
 
-        let factory = DynamicHandlerFactory::new(
-            pd_addrs.clone(),
-            namespace.clone(),
-            default_keyspace.clone(),
-            password.clone(),
+        let tls_acceptor = tls_acceptor.clone();
+        let client_pool = client_pool.clone();
+        let default_keyspace = default_keyspace.clone();
+        let password = password.clone();
+
+        let factory = DynamicHandlerFactory::new_with_pool(
+            client_pool,
+            default_keyspace,
+            password,
         );
 
         tokio::spawn(async move {
-            if let Err(e) = process_socket(socket, None, factory).await {
+            if let Err(e) = process_socket(socket, tls_acceptor, factory).await {
                 tracing::error!("Connection error: {}", e);
             }
             info!("Connection closed: {}", peer_addr);
