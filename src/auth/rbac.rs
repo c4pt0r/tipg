@@ -549,4 +549,267 @@ mod tests {
         let key = mgr.user_key("admin");
         assert!(key.starts_with(USER_KEY_PREFIX));
     }
+
+    #[test]
+    fn test_privilege_from_str_all_types() {
+        assert_eq!(Privilege::from_str("INSERT"), Some(Privilege::Insert));
+        assert_eq!(Privilege::from_str("UPDATE"), Some(Privilege::Update));
+        assert_eq!(Privilege::from_str("DELETE"), Some(Privilege::Delete));
+        assert_eq!(Privilege::from_str("TRUNCATE"), Some(Privilege::Truncate));
+        assert_eq!(Privilege::from_str("REFERENCES"), Some(Privilege::References));
+        assert_eq!(Privilege::from_str("TRIGGER"), Some(Privilege::Trigger));
+        assert_eq!(Privilege::from_str("CREATE"), Some(Privilege::CreateTable));
+        assert_eq!(Privilege::from_str("CONNECT"), Some(Privilege::Connect));
+        assert_eq!(Privilege::from_str("TEMPORARY"), Some(Privilege::Temporary));
+        assert_eq!(Privilege::from_str("TEMP"), Some(Privilege::Temporary));
+        assert_eq!(Privilege::from_str("EXECUTE"), Some(Privilege::Execute));
+        assert_eq!(Privilege::from_str("USAGE"), Some(Privilege::Usage));
+        assert_eq!(Privilege::from_str("SUPERUSER"), Some(Privilege::SuperUser));
+        assert_eq!(Privilege::from_str("CREATEDB"), Some(Privilege::CreateDB));
+        assert_eq!(Privilege::from_str("CREATEROLE"), Some(Privilege::CreateRole));
+    }
+
+    #[test]
+    fn test_user_new_defaults() {
+        let user = User::new("testuser", "testpass");
+        assert_eq!(user.name, "testuser");
+        assert!(!user.is_superuser);
+        assert!(user.can_login);
+        assert!(!user.can_create_db);
+        assert!(!user.can_create_role);
+        assert_eq!(user.connection_limit, -1);
+        assert!(user.valid_until.is_none());
+        assert!(user.roles.is_empty());
+        assert!(user.privileges.is_empty());
+    }
+
+    #[test]
+    fn test_user_new_superuser_defaults() {
+        let user = User::new_superuser("admin", "admin");
+        assert_eq!(user.name, "admin");
+        assert!(user.is_superuser);
+        assert!(user.can_login);
+        assert!(user.can_create_db);
+        assert!(user.can_create_role);
+    }
+
+    #[test]
+    fn test_privilege_object_table() {
+        let obj = PrivilegeObject::table("users");
+        match obj {
+            PrivilegeObject::Table { schema, name } => {
+                assert_eq!(schema, "public");
+                assert_eq!(name, "users");
+            }
+            _ => panic!("Expected Table variant"),
+        }
+    }
+
+    #[test]
+    fn test_privilege_object_all_tables() {
+        let obj = PrivilegeObject::all_tables();
+        match obj {
+            PrivilegeObject::AllTablesInSchema(schema) => {
+                assert_eq!(schema, "public");
+            }
+            _ => panic!("Expected AllTablesInSchema variant"),
+        }
+    }
+
+    #[test]
+    fn test_privilege_object_database() {
+        let obj = PrivilegeObject::database("mydb");
+        match obj {
+            PrivilegeObject::Database(name) => {
+                assert_eq!(name, "mydb");
+            }
+            _ => panic!("Expected Database variant"),
+        }
+    }
+
+    #[test]
+    fn test_grant_replaces_existing() {
+        let mut user = User::new("test", "pass");
+        user.grant_privilege(Privilege::Select, PrivilegeObject::table("t1"), false);
+        assert_eq!(user.privileges.len(), 1);
+        assert!(!user.privileges[0].with_grant_option);
+        
+        user.grant_privilege(Privilege::Select, PrivilegeObject::table("t1"), true);
+        assert_eq!(user.privileges.len(), 1);
+        assert!(user.privileges[0].with_grant_option);
+    }
+
+    #[test]
+    fn test_revoke_nonexistent_privilege() {
+        let mut user = User::new("test", "pass");
+        user.grant_privilege(Privilege::Select, PrivilegeObject::table("t1"), false);
+        assert_eq!(user.privileges.len(), 1);
+        
+        user.revoke_privilege(&Privilege::Insert, &PrivilegeObject::table("t1"));
+        assert_eq!(user.privileges.len(), 1);
+        
+        user.revoke_privilege(&Privilege::Select, &PrivilegeObject::table("t2"));
+        assert_eq!(user.privileges.len(), 1);
+    }
+
+    #[test]
+    fn test_has_privilege_global_object() {
+        let mut user = User::new("test", "pass");
+        user.grant_privilege(Privilege::Select, PrivilegeObject::Global, false);
+        
+        assert!(user.has_privilege(&Privilege::Select, &PrivilegeObject::table("any")));
+        assert!(user.has_privilege(&Privilege::Select, &PrivilegeObject::database("any")));
+    }
+
+    #[test]
+    fn test_all_privilege_matches_specific() {
+        let mut user = User::new("test", "pass");
+        user.grant_privilege(Privilege::All, PrivilegeObject::table("users"), false);
+        
+        assert!(user.has_privilege(&Privilege::Select, &PrivilegeObject::table("users")));
+        assert!(user.has_privilege(&Privilege::Insert, &PrivilegeObject::table("users")));
+        assert!(user.has_privilege(&Privilege::Update, &PrivilegeObject::table("users")));
+        assert!(user.has_privilege(&Privilege::Delete, &PrivilegeObject::table("users")));
+        assert!(user.has_privilege(&Privilege::Truncate, &PrivilegeObject::table("users")));
+    }
+
+    #[test]
+    fn test_all_tables_in_schema_matches_table() {
+        let mut user = User::new("test", "pass");
+        user.grant_privilege(
+            Privilege::Select, 
+            PrivilegeObject::AllTablesInSchema("public".to_string()), 
+            false
+        );
+        
+        assert!(user.has_privilege(&Privilege::Select, &PrivilegeObject::Table {
+            schema: "public".to_string(),
+            name: "users".to_string(),
+        }));
+        assert!(user.has_privilege(&Privilege::Select, &PrivilegeObject::Table {
+            schema: "public".to_string(),
+            name: "orders".to_string(),
+        }));
+        assert!(!user.has_privilege(&Privilege::Select, &PrivilegeObject::Table {
+            schema: "private".to_string(),
+            name: "secrets".to_string(),
+        }));
+    }
+
+    #[test]
+    fn test_role_key_with_namespace() {
+        let mgr = AuthManager::new(Some("tenant_x".to_string()));
+        let key = mgr.role_key("reader");
+        assert!(key.starts_with(b"tenant_x_"));
+        assert!(key.ends_with(b"reader"));
+    }
+
+    #[test]
+    fn test_role_key_without_namespace() {
+        let mgr = AuthManager::new(None);
+        let key = mgr.role_key("writer");
+        assert!(key.starts_with(ROLE_KEY_PREFIX));
+        assert!(key.ends_with(b"writer"));
+    }
+
+    #[test]
+    fn test_user_roles_management() {
+        let mut user = User::new("test", "pass");
+        assert!(user.roles.is_empty());
+        
+        user.roles.insert("reader".to_string());
+        user.roles.insert("writer".to_string());
+        assert_eq!(user.roles.len(), 2);
+        assert!(user.roles.contains("reader"));
+        assert!(user.roles.contains("writer"));
+        
+        user.roles.remove("reader");
+        assert_eq!(user.roles.len(), 1);
+        assert!(!user.roles.contains("reader"));
+    }
+
+    #[test]
+    fn test_granted_privilege_with_grant_option() {
+        let gp = GrantedPrivilege {
+            privilege: Privilege::Select,
+            object: PrivilegeObject::table("users"),
+            with_grant_option: true,
+        };
+        assert_eq!(gp.privilege, Privilege::Select);
+        assert!(gp.with_grant_option);
+    }
+
+    #[test]
+    fn test_password_empty_string() {
+        let user = User::new("test", "");
+        assert!(user.verify_password(""));
+        assert!(!user.verify_password("notempty"));
+    }
+
+    #[test]
+    fn test_password_special_chars() {
+        let user = User::new("test", "p@ss!w0rd#$%^&*()");
+        assert!(user.verify_password("p@ss!w0rd#$%^&*()"));
+        assert!(!user.verify_password("p@ss!w0rd"));
+    }
+
+    #[test]
+    fn test_password_unicode() {
+        let user = User::new("test", "密码测试123");
+        assert!(user.verify_password("密码测试123"));
+        assert!(!user.verify_password("密码测试"));
+    }
+
+    #[test]
+    fn test_privilege_expand_all() {
+        let expanded = Privilege::expand_all();
+        assert!(expanded.contains(&Privilege::Select));
+        assert!(expanded.contains(&Privilege::Insert));
+        assert!(expanded.contains(&Privilege::Update));
+        assert!(expanded.contains(&Privilege::Delete));
+        assert!(expanded.contains(&Privilege::Truncate));
+        assert!(expanded.contains(&Privilege::References));
+        assert!(expanded.contains(&Privilege::Trigger));
+        assert!(!expanded.contains(&Privilege::SuperUser));
+        assert!(!expanded.contains(&Privilege::CreateDB));
+    }
+
+    #[test]
+    fn test_multiple_privileges_same_object() {
+        let mut user = User::new("test", "pass");
+        user.grant_privilege(Privilege::Select, PrivilegeObject::table("t1"), false);
+        user.grant_privilege(Privilege::Insert, PrivilegeObject::table("t1"), false);
+        user.grant_privilege(Privilege::Update, PrivilegeObject::table("t1"), false);
+        
+        assert_eq!(user.privileges.len(), 3);
+        assert!(user.has_privilege(&Privilege::Select, &PrivilegeObject::table("t1")));
+        assert!(user.has_privilege(&Privilege::Insert, &PrivilegeObject::table("t1")));
+        assert!(user.has_privilege(&Privilege::Update, &PrivilegeObject::table("t1")));
+        assert!(!user.has_privilege(&Privilege::Delete, &PrivilegeObject::table("t1")));
+    }
+
+    #[test]
+    fn test_role_member_of() {
+        let mut role = Role::new("admin");
+        assert!(role.member_of.is_empty());
+        
+        role.member_of.insert("superadmin".to_string());
+        assert!(role.member_of.contains("superadmin"));
+    }
+
+    #[test]
+    fn test_role_options() {
+        let mut role = Role::new("dba");
+        assert!(!role.is_superuser);
+        assert!(!role.can_create_db);
+        assert!(!role.can_create_role);
+        
+        role.is_superuser = true;
+        role.can_create_db = true;
+        role.can_create_role = true;
+        
+        assert!(role.is_superuser);
+        assert!(role.can_create_db);
+        assert!(role.can_create_role);
+    }
 }
