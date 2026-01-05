@@ -2,23 +2,39 @@ use super::encoding::*;
 use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
-use tikv_client::{BoundRange, Transaction, TransactionClient};
+use tikv_client::{BoundRange, Config, Transaction, TransactionClient};
 use tracing::{debug, info};
 
-/// TiKV-based storage engine
 pub struct TikvStore {
     client: Arc<TransactionClient>,
     namespace: String,
 }
 
 impl TikvStore {
-    /// Create a new TikvStore connected to PD endpoints
     pub async fn new(pd_endpoints: Vec<String>, namespace: Option<String>) -> Result<Self> {
+        Self::new_with_keyspace(pd_endpoints, namespace, None).await
+    }
+
+    pub async fn new_with_keyspace(
+        pd_endpoints: Vec<String>,
+        namespace: Option<String>,
+        keyspace: Option<String>,
+    ) -> Result<Self> {
         info!("Connecting to TiKV at {:?}", pd_endpoints);
-        let client = TransactionClient::new(pd_endpoints)
+        let config = match &keyspace {
+            Some(ks) => {
+                info!("Using TiKV Keyspace: {}", ks);
+                Config::default().with_keyspace(ks)
+            }
+            None => Config::default(),
+        };
+        let client = TransactionClient::new_with_config(pd_endpoints, config)
             .await
             .context("Failed to connect to TiKV")?;
-        info!("Connected to TiKV successfully. Namespace: {:?}", namespace);
+        info!(
+            "Connected to TiKV. Namespace: {:?}, Keyspace: {:?}",
+            namespace, keyspace
+        );
         Ok(Self {
             client: Arc::new(client),
             namespace: namespace.unwrap_or_default(),
