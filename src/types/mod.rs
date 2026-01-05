@@ -15,6 +15,11 @@ pub enum DataType {
     Timestamp,
     Interval,
     Uuid,
+    Array(Box<DataType>),
+    // NOTE: Json and Jsonb MUST remain at end of enum to preserve bincode compatibility
+    // with existing serialized schemas. Do not reorder!
+    Json,
+    Jsonb,
 }
 
 impl fmt::Display for DataType {
@@ -29,6 +34,9 @@ impl fmt::Display for DataType {
             DataType::Timestamp => write!(f, "TIMESTAMP"),
             DataType::Interval => write!(f, "INTERVAL"),
             DataType::Uuid => write!(f, "UUID"),
+            DataType::Array(elem_type) => write!(f, "{}[]", elem_type),
+            DataType::Json => write!(f, "JSON"),
+            DataType::Jsonb => write!(f, "JSONB"),
         }
     }
 }
@@ -46,6 +54,9 @@ pub enum Value {
     Timestamp(i64),
     Interval(i64),
     Uuid([u8; 16]),
+    Array(Vec<Value>),
+    Json(String),
+    Jsonb(String),
 }
 
 impl Value {
@@ -61,6 +72,14 @@ impl Value {
             Value::Timestamp(_) => Some(DataType::Timestamp),
             Value::Interval(_) => Some(DataType::Interval),
             Value::Uuid(_) => Some(DataType::Uuid),
+            Value::Array(elems) => {
+                let elem_type = elems.first().and_then(|v| v.data_type());
+                Some(DataType::Array(Box::new(
+                    elem_type.unwrap_or(DataType::Text),
+                )))
+            }
+            Value::Json(_) => Some(DataType::Json),
+            Value::Jsonb(_) => Some(DataType::Jsonb),
         }
     }
 }
@@ -100,6 +119,21 @@ impl fmt::Display for Value {
                     ])
                 )
             }
+            Value::Array(elems) => {
+                write!(f, "{{")?;
+                for (i, elem) in elems.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ",")?;
+                    }
+                    match elem {
+                        Value::Text(s) => write!(f, "\"{}\"", s.replace('"', "\\\""))?,
+                        v => write!(f, "{}", v)?,
+                    }
+                }
+                write!(f, "}}")
+            }
+            Value::Json(s) => write!(f, "{}", s),
+            Value::Jsonb(s) => write!(f, "{}", s),
         }
     }
 }

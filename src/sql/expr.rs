@@ -2,7 +2,7 @@
 
 use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
-use sqlparser::ast::{BinaryOperator, Expr, Value as SqlValue};
+use sqlparser::ast::{BinaryOperator, Expr, JsonOperator, Value as SqlValue};
 use std::collections::HashMap;
 
 pub struct JoinContext<'a> {
@@ -274,6 +274,22 @@ pub fn eval_expr_join(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
                 _ => return Err(anyhow!("Unsupported EXTRACT field")),
             };
             Ok(Value::Float64(result))
+        }
+        Expr::JsonAccess {
+            left,
+            operator,
+            right,
+        } => eval_json_access_expr_join(left, operator, right, ctx),
+        Expr::Array(array) => {
+            let mut values = Vec::new();
+            for elem in &array.elem {
+                values.push(eval_expr_join(elem, ctx)?);
+            }
+            Ok(Value::Array(values))
+        }
+        Expr::ArrayIndex { obj, indexes } => {
+            let arr_val = eval_expr_join(obj, ctx)?;
+            eval_array_index_join(arr_val, indexes, ctx)
         }
         _ => Err(anyhow!(
             "Unsupported expression in JOIN context: {:?}",
@@ -761,6 +777,22 @@ pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -
             sqlparser::ast::DataType::Timestamp(_, _) => parse_timestamp_string(value),
             _ => Ok(Value::Text(value.clone())),
         },
+        Expr::JsonAccess {
+            left,
+            operator,
+            right,
+        } => eval_json_access_expr(left, operator, right, row, schema),
+        Expr::Array(array) => {
+            let mut values = Vec::new();
+            for elem in &array.elem {
+                values.push(eval_expr(elem, row, schema)?);
+            }
+            Ok(Value::Array(values))
+        }
+        Expr::ArrayIndex { obj, indexes } => {
+            let arr_val = eval_expr(obj, row, schema)?;
+            eval_array_index(arr_val, indexes, row, schema)
+        }
         _ => Err(anyhow!("Unsupported expression: {:?}", expr)),
     }
 }
@@ -1316,6 +1348,134 @@ fn eval_function(
         }
         "OBJ_DESCRIPTION" | "COL_DESCRIPTION" | "SHOBJ_DESCRIPTION" => Ok(Value::Null),
         "PG_CATALOG.SET_CONFIG" => Ok(Value::Text(String::new())),
+        "ARRAY_LENGTH" => {
+            let mut iter = args.into_iter();
+            let arr = match iter.next() {
+                Some(Value::Array(a)) => a,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => return Ok(Value::Null),
+            };
+            let dim = match iter.next() {
+                Some(Value::Int32(d)) => d,
+                Some(Value::Int64(d)) => d as i32,
+                _ => 1,
+            };
+            if dim == 1 {
+                Ok(Value::Int32(arr.len() as i32))
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        "ARRAY_UPPER" => {
+            let mut iter = args.into_iter();
+            let arr = match iter.next() {
+                Some(Value::Array(a)) => a,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => return Ok(Value::Null),
+            };
+            let dim = match iter.next() {
+                Some(Value::Int32(d)) => d,
+                Some(Value::Int64(d)) => d as i32,
+                _ => 1,
+            };
+            if dim == 1 && !arr.is_empty() {
+                Ok(Value::Int32(arr.len() as i32))
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        "ARRAY_LOWER" => {
+            let mut iter = args.into_iter();
+            let arr = match iter.next() {
+                Some(Value::Array(a)) => a,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => return Ok(Value::Null),
+            };
+            let dim = match iter.next() {
+                Some(Value::Int32(d)) => d,
+                Some(Value::Int64(d)) => d as i32,
+                _ => 1,
+            };
+            if dim == 1 && !arr.is_empty() {
+                Ok(Value::Int32(1))
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        "CARDINALITY" => match args.into_iter().next() {
+            Some(Value::Array(a)) => Ok(Value::Int32(a.len() as i32)),
+            Some(Value::Null) => Ok(Value::Null),
+            _ => Ok(Value::Null),
+        },
+        "ARRAY_POSITION" => {
+            let mut iter = args.into_iter();
+            let arr = match iter.next() {
+                Some(Value::Array(a)) => a,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => return Ok(Value::Null),
+            };
+            let elem = match iter.next() {
+                Some(v) => v,
+                None => return Ok(Value::Null),
+            };
+            for (i, v) in arr.iter().enumerate() {
+                if compare_values(v, &elem).unwrap_or(1) == 0 {
+                    return Ok(Value::Int32((i + 1) as i32));
+                }
+            }
+            Ok(Value::Null)
+        }
+        "ARRAY_CAT" => {
+            let mut result = Vec::new();
+            for arg in args {
+                match arg {
+                    Value::Array(a) => result.extend(a),
+                    Value::Null => {}
+                    v => result.push(v),
+                }
+            }
+            Ok(Value::Array(result))
+        }
+        "ARRAY_APPEND" => {
+            let mut iter = args.into_iter();
+            let mut arr = match iter.next() {
+                Some(Value::Array(a)) => a,
+                Some(Value::Null) => Vec::new(),
+                _ => return Err(anyhow!("ARRAY_APPEND requires array as first argument")),
+            };
+            if let Some(elem) = iter.next() {
+                arr.push(elem);
+            }
+            Ok(Value::Array(arr))
+        }
+        "ARRAY_PREPEND" => {
+            let mut iter = args.into_iter();
+            let elem = iter.next().unwrap_or(Value::Null);
+            let mut arr = match iter.next() {
+                Some(Value::Array(a)) => a,
+                Some(Value::Null) => Vec::new(),
+                _ => return Err(anyhow!("ARRAY_PREPEND requires array as second argument")),
+            };
+            arr.insert(0, elem);
+            Ok(Value::Array(arr))
+        }
+        "ARRAY_REMOVE" => {
+            let mut iter = args.into_iter();
+            let arr = match iter.next() {
+                Some(Value::Array(a)) => a,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => return Ok(Value::Null),
+            };
+            let elem = match iter.next() {
+                Some(v) => v,
+                None => return Ok(Value::Array(arr)),
+            };
+            let result: Vec<Value> = arr
+                .into_iter()
+                .filter(|v| compare_values(v, &elem).unwrap_or(1) != 0)
+                .collect();
+            Ok(Value::Array(result))
+        }
         _ => Err(anyhow!("Unsupported function: {}", func_name)),
     }
 }
@@ -1379,7 +1539,38 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
             Ok(Value::Uuid(*uuid.as_bytes()))
         }
         (Value::Uuid(bytes), SqlType::Uuid) => Ok(Value::Uuid(bytes)),
-        (v, SqlType::Custom(_, _)) => Ok(v),
+        (v, SqlType::Custom(name, _)) => {
+            if let Some(ident) = name.0.last() {
+                let type_name = ident.value.to_uppercase();
+                match type_name.as_str() {
+                    "JSON" => {
+                        let s = match &v {
+                            Value::Text(s) => s.clone(),
+                            Value::Json(s) => s.clone(),
+                            Value::Jsonb(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        serde_json::from_str::<serde_json::Value>(&s)
+                            .map_err(|e| anyhow!("invalid input syntax for type json: {}", e))?;
+                        Ok(Value::Json(s))
+                    }
+                    "JSONB" => {
+                        let s = match &v {
+                            Value::Text(s) => s.clone(),
+                            Value::Json(s) => s.clone(),
+                            Value::Jsonb(s) => return Ok(Value::Jsonb(s.clone())),
+                            other => other.to_string(),
+                        };
+                        let parsed: serde_json::Value = serde_json::from_str(&s)
+                            .map_err(|e| anyhow!("invalid input syntax for type jsonb: {}", e))?;
+                        Ok(Value::Jsonb(parsed.to_string()))
+                    }
+                    _ => Ok(v),
+                }
+            } else {
+                Ok(v)
+            }
+        }
         (v, SqlType::Regclass) => Ok(v),
         (v, _) => Ok(v),
     }
@@ -1690,12 +1881,230 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
             Ok(f.partial_cmp(&(*i as f64))
                 .unwrap_or(std::cmp::Ordering::Equal) as i8)
         }
+        (Value::Json(_), _) | (_, Value::Json(_)) => Err(anyhow!(
+            "could not identify a comparison function for type json"
+        )),
+        (Value::Jsonb(_), _) | (_, Value::Jsonb(_)) => Err(anyhow!(
+            "could not identify an ordering operator for type jsonb"
+        )),
         _ => Err(anyhow!(
             "Cannot compare distinct types: {:?} vs {:?}",
             left,
             right
         )),
     }
+}
+
+fn eval_json_access_expr(
+    left: &Expr,
+    operator: &JsonOperator,
+    right: &Expr,
+    row: Option<&Row>,
+    schema: Option<&TableSchema>,
+) -> Result<Value> {
+    let mut ops: Vec<(&Expr, &JsonOperator)> = Vec::new();
+    collect_json_ops(operator, right, &mut ops);
+
+    let mut current = eval_expr(left, row, schema)?;
+    for (key_expr, op) in ops {
+        let key = eval_expr(key_expr, row, schema)?;
+        current = eval_json_access(current, op, key)?;
+    }
+    Ok(current)
+}
+
+fn eval_json_access_expr_join(
+    left: &Expr,
+    operator: &JsonOperator,
+    right: &Expr,
+    ctx: &JoinContext,
+) -> Result<Value> {
+    let mut ops: Vec<(&Expr, &JsonOperator)> = Vec::new();
+    collect_json_ops(operator, right, &mut ops);
+
+    let mut current = eval_expr_join(left, ctx)?;
+    for (key_expr, op) in ops {
+        let key = eval_expr_join(key_expr, ctx)?;
+        current = eval_json_access(current, op, key)?;
+    }
+    Ok(current)
+}
+
+fn collect_json_ops<'a>(
+    operator: &'a JsonOperator,
+    right: &'a Expr,
+    ops: &mut Vec<(&'a Expr, &'a JsonOperator)>,
+) {
+    if let Expr::JsonAccess {
+        left: inner_left,
+        operator: inner_op,
+        right: inner_right,
+    } = right
+    {
+        ops.push((inner_left, operator));
+        collect_json_ops(inner_op, inner_right, ops);
+    } else {
+        ops.push((right, operator));
+    }
+}
+
+fn eval_json_access(left: Value, operator: &JsonOperator, right: Value) -> Result<Value> {
+    let json_str = match &left {
+        Value::Text(s) => s.clone(),
+        Value::Json(s) => s.clone(),
+        Value::Jsonb(s) => s.clone(),
+        Value::Null => return Ok(Value::Null),
+        _ => return Err(anyhow!("JSON operators require json/jsonb operand")),
+    };
+
+    let json_val: serde_json::Value =
+        serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+
+    match operator {
+        JsonOperator::AtArrow => {
+            let right_str = match &right {
+                Value::Text(s) => s.clone(),
+                Value::Json(s) => s.clone(),
+                Value::Jsonb(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                _ => return Err(anyhow!("@> requires json/jsonb operand on right")),
+            };
+            let right_json: serde_json::Value = serde_json::from_str(&right_str)
+                .map_err(|e| anyhow!("Invalid JSON on right side of @>: {}", e))?;
+            Ok(Value::Boolean(json_contains(&json_val, &right_json)))
+        }
+        JsonOperator::ArrowAt => {
+            let right_str = match &right {
+                Value::Text(s) => s.clone(),
+                Value::Json(s) => s.clone(),
+                Value::Jsonb(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                _ => return Err(anyhow!("<@ requires json/jsonb operand on right")),
+            };
+            let right_json: serde_json::Value = serde_json::from_str(&right_str)
+                .map_err(|e| anyhow!("Invalid JSON on right side of <@: {}", e))?;
+            Ok(Value::Boolean(json_contains(&right_json, &json_val)))
+        }
+        _ => {
+            let accessed = match right {
+                Value::Text(key) => json_val.get(&key),
+                Value::Int32(idx) => {
+                    if let Some(arr) = json_val.as_array() {
+                        let idx = if idx < 0 {
+                            (arr.len() as i32 + idx) as usize
+                        } else {
+                            idx as usize
+                        };
+                        arr.get(idx)
+                    } else {
+                        None
+                    }
+                }
+                Value::Int64(idx) => {
+                    if let Some(arr) = json_val.as_array() {
+                        let idx = if idx < 0 {
+                            (arr.len() as i64 + idx) as usize
+                        } else {
+                            idx as usize
+                        };
+                        arr.get(idx)
+                    } else {
+                        None
+                    }
+                }
+                Value::Null => return Ok(Value::Null),
+                _ => return Err(anyhow!("JSON key must be text or integer")),
+            };
+
+            match accessed {
+                None => Ok(Value::Null),
+                Some(val) => match operator {
+                    JsonOperator::Arrow => Ok(Value::Text(val.to_string())),
+                    JsonOperator::LongArrow => match val {
+                        serde_json::Value::Null => Ok(Value::Null),
+                        serde_json::Value::Bool(b) => Ok(Value::Text(b.to_string())),
+                        serde_json::Value::Number(n) => Ok(Value::Text(n.to_string())),
+                        serde_json::Value::String(s) => Ok(Value::Text(s.clone())),
+                        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                            Ok(Value::Text(val.to_string()))
+                        }
+                    },
+                    JsonOperator::HashArrow => Ok(Value::Text(val.to_string())),
+                    JsonOperator::HashLongArrow => match val {
+                        serde_json::Value::Null => Ok(Value::Null),
+                        serde_json::Value::String(s) => Ok(Value::Text(s.clone())),
+                        other => Ok(Value::Text(other.to_string())),
+                    },
+                    _ => Err(anyhow!("Unsupported JSON operator: {:?}", operator)),
+                },
+            }
+        }
+    }
+}
+
+fn json_contains(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    match (a, b) {
+        (serde_json::Value::Object(obj_a), serde_json::Value::Object(obj_b)) => obj_b
+            .iter()
+            .all(|(k, v)| obj_a.get(k).map_or(false, |av| json_contains(av, v))),
+        (serde_json::Value::Array(arr_a), serde_json::Value::Array(arr_b)) => {
+            arr_b.iter().all(|bv| arr_a.iter().any(|av| av == bv))
+        }
+        _ => a == b,
+    }
+}
+
+fn eval_array_index(
+    arr_val: Value,
+    indexes: &[Expr],
+    row: Option<&Row>,
+    schema: Option<&TableSchema>,
+) -> Result<Value> {
+    let Value::Array(arr) = arr_val else {
+        return Err(anyhow!("Cannot index non-array value"));
+    };
+
+    let mut current = Value::Array(arr);
+    for idx_expr in indexes {
+        let idx_val = eval_expr(idx_expr, row, schema)?;
+        let idx = match idx_val {
+            Value::Int32(i) => i as i64,
+            Value::Int64(i) => i,
+            _ => return Err(anyhow!("Array index must be an integer")),
+        };
+
+        let Value::Array(arr) = current else {
+            return Err(anyhow!("Cannot index non-array value"));
+        };
+
+        let pg_idx = (idx - 1) as usize;
+        current = arr.get(pg_idx).cloned().unwrap_or(Value::Null);
+    }
+    Ok(current)
+}
+
+fn eval_array_index_join(arr_val: Value, indexes: &[Expr], ctx: &JoinContext) -> Result<Value> {
+    let Value::Array(arr) = arr_val else {
+        return Err(anyhow!("Cannot index non-array value"));
+    };
+
+    let mut current = Value::Array(arr);
+    for idx_expr in indexes {
+        let idx_val = eval_expr_join(idx_expr, ctx)?;
+        let idx = match idx_val {
+            Value::Int32(i) => i as i64,
+            Value::Int64(i) => i,
+            _ => return Err(anyhow!("Array index must be an integer")),
+        };
+
+        let Value::Array(arr) = current else {
+            return Err(anyhow!("Cannot index non-array value"));
+        };
+
+        let pg_idx = (idx - 1) as usize;
+        current = arr.get(pg_idx).cloned().unwrap_or(Value::Null);
+    }
+    Ok(current)
 }
 
 #[cfg(test)]
@@ -2306,5 +2715,267 @@ mod tests {
         } else {
             panic!("Expected UUID value");
         }
+    }
+
+    #[test]
+    fn test_json_arrow_object_key() {
+        assert_eq!(
+            eval_expr(
+                &parse_expr(r#"'{"name": "Alice", "age": 30}' -> 'name'"#),
+                None,
+                None
+            )
+            .unwrap(),
+            Value::Text("\"Alice\"".to_string())
+        );
+    }
+
+    #[test]
+    fn test_json_long_arrow_object_key() {
+        assert_eq!(
+            eval_expr(
+                &parse_expr(r#"'{"name": "Alice", "age": 30}' ->> 'name'"#),
+                None,
+                None
+            )
+            .unwrap(),
+            Value::Text("Alice".to_string())
+        );
+    }
+
+    #[test]
+    fn test_json_arrow_array_index() {
+        assert_eq!(
+            eval_expr(&parse_expr(r#"'[1, 2, 3]' -> 0"#), None, None).unwrap(),
+            Value::Text("1".to_string())
+        );
+        assert_eq!(
+            eval_expr(&parse_expr(r#"'["a", "b", "c"]' -> 1"#), None, None).unwrap(),
+            Value::Text("\"b\"".to_string())
+        );
+    }
+
+    #[test]
+    fn test_json_long_arrow_array_index() {
+        assert_eq!(
+            eval_expr(&parse_expr(r#"'["a", "b", "c"]' ->> 1"#), None, None).unwrap(),
+            Value::Text("b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_json_nested_access() {
+        let intermediate = eval_expr(
+            &parse_expr(r#"'{"user": {"name": "Bob"}}' -> 'user'"#),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(intermediate, Value::Text("{\"name\":\"Bob\"}".to_string()));
+
+        assert_eq!(
+            eval_expr(&parse_expr(r#"'{"name": "Bob"}' ->> 'name'"#), None, None).unwrap(),
+            Value::Text("Bob".to_string())
+        );
+
+        assert_eq!(
+            eval_expr(
+                &parse_expr(r#"'{"user": {"name": "Bob"}}' -> 'user' ->> 'name'"#),
+                None,
+                None
+            )
+            .unwrap(),
+            Value::Text("Bob".to_string())
+        );
+    }
+
+    #[test]
+    fn test_json_null_key() {
+        assert_eq!(
+            eval_expr(
+                &parse_expr(r#"'{"name": "Alice"}' -> 'missing'"#),
+                None,
+                None
+            )
+            .unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn test_json_number_extraction() {
+        assert_eq!(
+            eval_expr(&parse_expr(r#"'{"count": 42}' ->> 'count'"#), None, None).unwrap(),
+            Value::Text("42".to_string())
+        );
+    }
+
+    #[test]
+    fn test_array_literal() {
+        assert_eq!(
+            eval_expr(&parse_expr("ARRAY[1, 2, 3]"), None, None).unwrap(),
+            Value::Array(vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)])
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("ARRAY['a', 'b', 'c']"), None, None).unwrap(),
+            Value::Array(vec![
+                Value::Text("a".to_string()),
+                Value::Text("b".to_string()),
+                Value::Text("c".to_string())
+            ])
+        );
+    }
+
+    #[test]
+    fn test_array_indexing() {
+        assert_eq!(
+            eval_expr(&parse_expr("(ARRAY[10, 20, 30])[2]"), None, None).unwrap(),
+            Value::Int32(20)
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("(ARRAY['a', 'b', 'c'])[1]"), None, None).unwrap(),
+            Value::Text("a".to_string())
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("(ARRAY[1, 2, 3])[5]"), None, None).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn test_array_length() {
+        assert_eq!(
+            eval_expr(&parse_expr("array_length(ARRAY[1, 2, 3], 1)"), None, None).unwrap(),
+            Value::Int32(3)
+        );
+    }
+
+    #[test]
+    fn test_array_position() {
+        assert_eq!(
+            eval_expr(
+                &parse_expr("array_position(ARRAY['a', 'b', 'c'], 'b')"),
+                None,
+                None
+            )
+            .unwrap(),
+            Value::Int32(2)
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("array_position(ARRAY[1, 2, 3], 5)"), None, None).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn test_array_cat() {
+        assert_eq!(
+            eval_expr(
+                &parse_expr("array_cat(ARRAY[1, 2], ARRAY[3, 4])"),
+                None,
+                None
+            )
+            .unwrap(),
+            Value::Array(vec![
+                Value::Int32(1),
+                Value::Int32(2),
+                Value::Int32(3),
+                Value::Int32(4)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_array_append_prepend() {
+        assert_eq!(
+            eval_expr(&parse_expr("array_append(ARRAY[1, 2], 3)"), None, None).unwrap(),
+            Value::Array(vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)])
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("array_prepend(0, ARRAY[1, 2])"), None, None).unwrap(),
+            Value::Array(vec![Value::Int32(0), Value::Int32(1), Value::Int32(2)])
+        );
+    }
+
+    #[test]
+    fn test_cardinality() {
+        assert_eq!(
+            eval_expr(&parse_expr("cardinality(ARRAY[1, 2, 3, 4])"), None, None).unwrap(),
+            Value::Int32(4)
+        );
+    }
+
+    #[test]
+    fn test_json_cast() {
+        assert_eq!(
+            eval_expr(&parse_expr(r#"'{"a": 1}'::json ->> 'a'"#), None, None).unwrap(),
+            Value::Text("1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_jsonb_cast() {
+        assert_eq!(
+            eval_expr(&parse_expr(r#"'{"b": 2}'::jsonb ->> 'b'"#), None, None).unwrap(),
+            Value::Text("2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_json_comparison_blocked() {
+        let json_val = Value::Json(r#"{"a":1}"#.to_string());
+        let int_val = Value::Int32(1);
+        assert!(compare_values(&json_val, &int_val).is_err());
+    }
+
+    #[test]
+    fn test_jsonb_comparison_blocked() {
+        let jsonb_val = Value::Jsonb(r#"{"a":1}"#.to_string());
+        let int_val = Value::Int32(1);
+        assert!(compare_values(&jsonb_val, &int_val).is_err());
+    }
+
+    #[test]
+    fn test_json_contains_at_arrow() {
+        assert_eq!(
+            eval_expr(
+                &parse_expr(r#"'{"a":1,"b":2}'::jsonb @> '{"a":1}'::jsonb"#),
+                None,
+                None
+            )
+            .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            eval_expr(
+                &parse_expr(r#"'{"a":1}'::jsonb @> '{"a":1,"b":2}'::jsonb"#),
+                None,
+                None
+            )
+            .unwrap(),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn test_json_contained_by_arrow_at() {
+        assert_eq!(
+            eval_expr(
+                &parse_expr(r#"'{"a":1}'::jsonb <@ '{"a":1,"b":2}'::jsonb"#),
+                None,
+                None
+            )
+            .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            eval_expr(
+                &parse_expr(r#"'{"a":1,"b":2}'::jsonb <@ '{"a":1}'::jsonb"#),
+                None,
+                None
+            )
+            .unwrap(),
+            Value::Boolean(false)
+        );
     }
 }
