@@ -155,8 +155,8 @@ impl Executor {
             Statement::Delete { from, selection, returning, .. } => {
                 self.execute_delete(txn, from, selection, returning).await
             }
-            Statement::Update { table, assignments, selection, returning, .. } => {
-                self.execute_update(txn, table, assignments, selection, returning).await
+            Statement::Update { table, assignments, from, selection, returning, .. } => {
+                self.execute_update(txn, table, assignments, from, selection, returning).await
             }
             Statement::Query(query) => self.execute_query(txn, query).await,
             Statement::ShowTables { .. } => self.execute_show_tables(txn).await,
@@ -647,8 +647,12 @@ impl Executor {
         if returning.is_some() { Ok(ExecuteResult::Select { columns: ret_cols, rows: ret_rows }) } else { Ok(ExecuteResult::Delete { affected_rows: cnt }) }
     }
 
-    async fn execute_update(&self, txn: &mut Transaction, table: &sqlparser::ast::TableWithJoins, assignments: &[Assignment], selection: &Option<Expr>, returning: &Option<Vec<SelectItem>>) -> Result<ExecuteResult> {
+    async fn execute_update(&self, txn: &mut Transaction, table: &sqlparser::ast::TableWithJoins, assignments: &[Assignment], from: &Option<sqlparser::ast::TableWithJoins>, selection: &Option<Expr>, returning: &Option<Vec<SelectItem>>) -> Result<ExecuteResult> {
         let t = match &table.relation { sqlparser::ast::TableFactor::Table { name, .. } => name.0.last().unwrap().value.clone(), _ => return Err(anyhow!("Unsupported")) };
+        let table_alias = match &table.relation {
+            sqlparser::ast::TableFactor::Table { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()).unwrap_or_else(|| t.clone()),
+            _ => t.clone(),
+        };
         let schema = self.store.get_schema(txn, &t).await?.ok_or_else(|| anyhow!("Table not found"))?;
         if schema.pk_indices.is_empty() { return Err(anyhow!("No PK")); }
         let resolved_selection = if let Some(sel) = selection {
@@ -663,6 +667,23 @@ impl Executor {
             if schema.pk_indices.contains(&idx) { return Err(anyhow!("Cannot update PK")); }
             indices.push(idx);
         }
+        
+        let (from_schema, from_rows, from_alias) = if let Some(from_table) = from {
+            let from_name = match &from_table.relation {
+                sqlparser::ast::TableFactor::Table { name, .. } => name.0.last().unwrap().value.clone(),
+                _ => return Err(anyhow!("Unsupported FROM table")),
+            };
+            let from_alias_str = match &from_table.relation {
+                sqlparser::ast::TableFactor::Table { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()).unwrap_or_else(|| from_name.clone()),
+                _ => from_name.clone(),
+            };
+            let fs = self.store.get_schema(txn, &from_name).await?.ok_or_else(|| anyhow!("FROM table not found"))?;
+            let fr = self.scan_and_fill(txn, &from_name, &fs).await?;
+            (Some(fs), Some(fr), Some(from_alias_str))
+        } else {
+            (None, None, None)
+        };
+        
         let rows = self.scan_and_fill(txn, &t, &schema).await?;
         let mut cnt = 0;
         let mut ret_rows = Vec::new();
@@ -677,19 +698,97 @@ impl Executor {
                 }
             }
         }
-        for r in rows {
-            if let Some(ref e) = resolved_selection {
-                if !matches!(eval_expr(e, Some(&r), Some(&schema))?, Value::Boolean(true)) { continue; }
+        
+        for r in &rows {
+            let matching_from_rows: Vec<&Row> = if let (Some(ref fs), Some(ref fr), Some(ref fa)) = (&from_schema, &from_rows, &from_alias) {
+                let mut combined_col_defs: Vec<ColumnDef> = schema.columns.clone();
+                combined_col_defs.extend(fs.columns.clone());
+                let combined_schema = TableSchema {
+                    name: "joined".to_string(),
+                    table_id: 0,
+                    columns: combined_col_defs,
+                    version: 1,
+                    pk_indices: vec![],
+                    indexes: vec![],
+                };
+                
+                let mut column_offsets: HashMap<String, usize> = HashMap::new();
+                for (i, col) in schema.columns.iter().enumerate() {
+                    column_offsets.insert(format!("{}.{}", table_alias, col.name), i);
+                    column_offsets.insert(col.name.clone(), i);
+                }
+                let offset = schema.columns.len();
+                for (i, col) in fs.columns.iter().enumerate() {
+                    column_offsets.insert(format!("{}.{}", fa, col.name), offset + i);
+                    if !column_offsets.contains_key(&col.name) {
+                        column_offsets.insert(col.name.clone(), offset + i);
+                    }
+                }
+                
+                fr.iter().filter(|from_row| {
+                    if let Some(ref sel) = resolved_selection {
+                        let mut combined_values = r.values.clone();
+                        combined_values.extend(from_row.values.clone());
+                        let combined_row = Row::new(combined_values);
+                        let ctx = JoinContext {
+                            tables: HashMap::new(),
+                            column_offsets: column_offsets.clone(),
+                            combined_row: &combined_row,
+                            combined_schema: &combined_schema,
+                        };
+                        matches!(eval_expr_join(sel, &ctx), Ok(Value::Boolean(true)))
+                    } else {
+                        true
+                    }
+                }).collect()
+            } else {
+                if let Some(ref e) = resolved_selection {
+                    if !matches!(eval_expr(e, Some(r), Some(&schema)), Ok(Value::Boolean(true))) {
+                        continue;
+                    }
+                }
+                vec![r]
+            };
+            
+            if matching_from_rows.is_empty() && from.is_some() {
+                continue;
             }
+            
+            let eval_row = if let (Some(ref fs), Some(ref fa)) = (&from_schema, &from_alias) {
+                if let Some(first_from) = matching_from_rows.first() {
+                    let mut combined_col_defs: Vec<ColumnDef> = schema.columns.clone();
+                    combined_col_defs.extend(fs.columns.clone());
+                    let combined_schema = TableSchema {
+                        name: "joined".to_string(),
+                        table_id: 0,
+                        columns: combined_col_defs,
+                        version: 1,
+                        pk_indices: vec![],
+                        indexes: vec![],
+                    };
+                    let mut combined_values = r.values.clone();
+                    combined_values.extend(first_from.values.clone());
+                    Some((Row::new(combined_values), combined_schema, fa.clone()))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            
             let mut vals = r.values.clone();
             for (i, a) in assignments.iter().enumerate() {
-                let raw_val = eval_expr(&a.value, Some(&r), Some(&schema))?;
+                let raw_val = if let Some((ref combined_row, ref combined_schema, ref _fa)) = eval_row {
+                    eval_expr(&a.value, Some(combined_row), Some(combined_schema))?
+                } else {
+                    eval_expr(&a.value, Some(r), Some(&schema))?
+                };
                 vals[indices[i]] = coerce_value_for_column(raw_val, &schema.columns[indices[i]])?;
             }
             let new_row = Row::new(vals);
-            let pks = schema.get_pk_values(&r);
+            let pks = schema.get_pk_values(r);
             for index in &schema.indexes {
-                let old_idx = schema.get_index_values(index, &r);
+                let old_idx = schema.get_index_values(index, r);
                 self.store.delete_index_entry(txn, schema.table_id, index.id, &old_idx, &pks, index.unique).await?;
             }
             self.store.upsert(txn, &t, new_row.clone()).await?;
@@ -962,6 +1061,19 @@ impl Executor {
                  let n = match v { Value::Int64(n) => n as usize, Value::Int32(n) => n as usize, _ => usize::MAX };
                  final_rows = final_rows.into_iter().take(n).collect();
              }
+        }
+        
+        // FETCH FIRST N ROWS ONLY (SQL standard, equivalent to LIMIT)
+        if let Some(fetch) = &query.fetch {
+            if let Some(quantity) = &fetch.quantity {
+                if let Ok(v) = eval_expr(quantity, None, None) {
+                    let n = match v { Value::Int64(n) => n as usize, Value::Int32(n) => n as usize, _ => 1 };
+                    final_rows = final_rows.into_iter().take(n).collect();
+                }
+            } else {
+                // FETCH FIRST ROW ONLY (no quantity means 1 row)
+                final_rows = final_rows.into_iter().take(1).collect();
+            }
         }
 
         let has_window_funcs = !window_funcs.is_empty();
@@ -1245,14 +1357,52 @@ impl Executor {
 
             let (join_schema, join_rows) = self.get_table_data(txn, &join_table, ctes).await?;
 
-            let join_condition = match &join.join_operator {
-                JoinOperator::Inner(JoinConstraint::On(expr)) => Some(expr),
-                JoinOperator::LeftOuter(JoinConstraint::On(expr)) => Some(expr),
-                JoinOperator::RightOuter(JoinConstraint::On(expr)) => Some(expr),
-                JoinOperator::FullOuter(JoinConstraint::On(expr)) => Some(expr),
-                JoinOperator::CrossJoin => None,
+            let left_columns: Vec<String> = combined_schemas.iter()
+                .flat_map(|(_, s)| s.columns.iter().map(|c| c.name.clone()))
+                .collect();
+            let right_columns: Vec<String> = join_schema.columns.iter().map(|c| c.name.clone()).collect();
+            
+            let (join_condition, is_natural) = match &join.join_operator {
+                JoinOperator::Inner(JoinConstraint::On(expr)) => (Some(expr.clone()), false),
+                JoinOperator::LeftOuter(JoinConstraint::On(expr)) => (Some(expr.clone()), false),
+                JoinOperator::RightOuter(JoinConstraint::On(expr)) => (Some(expr.clone()), false),
+                JoinOperator::FullOuter(JoinConstraint::On(expr)) => (Some(expr.clone()), false),
+                JoinOperator::Inner(JoinConstraint::Natural) |
+                JoinOperator::LeftOuter(JoinConstraint::Natural) |
+                JoinOperator::RightOuter(JoinConstraint::Natural) |
+                JoinOperator::FullOuter(JoinConstraint::Natural) => {
+                    let common_cols: Vec<String> = left_columns.iter()
+                        .filter(|c| right_columns.contains(c))
+                        .cloned()
+                        .collect();
+                    if common_cols.is_empty() {
+                        (None, true)
+                    } else {
+                        let cond = common_cols.iter()
+                            .map(|col| Expr::BinaryOp {
+                                left: Box::new(Expr::CompoundIdentifier(vec![
+                                    Ident::new(base_alias.clone()),
+                                    Ident::new(col.clone()),
+                                ])),
+                                op: BinaryOperator::Eq,
+                                right: Box::new(Expr::CompoundIdentifier(vec![
+                                    Ident::new(join_alias.clone()),
+                                    Ident::new(col.clone()),
+                                ])),
+                            })
+                            .reduce(|a, b| Expr::BinaryOp {
+                                left: Box::new(a),
+                                op: BinaryOperator::And,
+                                right: Box::new(b),
+                            })
+                            .unwrap();
+                        (Some(cond), true)
+                    }
+                },
+                JoinOperator::CrossJoin => (None, false),
                 _ => return Err(anyhow!("Unsupported JOIN type")),
             };
+            let _ = is_natural;
 
             let is_left_join = matches!(&join.join_operator, JoinOperator::LeftOuter(_));
             let is_right_join = matches!(&join.join_operator, JoinOperator::RightOuter(_));
@@ -1304,7 +1454,7 @@ impl Executor {
                     combined_values.extend(right_row.values.clone());
                     let combined_row = Row::new(combined_values);
 
-                    let matches = if let Some(cond) = join_condition {
+                    let matches = if let Some(ref cond) = join_condition {
                         let ctx = JoinContext {
                             tables: HashMap::new(),
                             column_offsets: column_offsets.clone(),
