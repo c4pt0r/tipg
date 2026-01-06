@@ -120,8 +120,12 @@ impl Executor {
     /// Execute a parsed SQL statement on a given transaction
     async fn execute_statement_on_txn(&self, txn: &mut Transaction, stmt: &Statement) -> Result<ExecuteResult> {
         match stmt {
-            Statement::CreateTable { name, columns, constraints, if_not_exists, .. } => {
-                self.execute_create_table(txn, name, columns, constraints, *if_not_exists).await
+            Statement::CreateTable { name, columns, constraints, if_not_exists, query, temporary, .. } => {
+                if let Some(q) = query {
+                    self.execute_create_table_as(txn, name, q, columns, *if_not_exists, *temporary).await
+                } else {
+                    self.execute_create_table(txn, name, columns, constraints, *if_not_exists).await
+                }
             }
             Statement::CreateIndex { name, table_name, columns, unique, if_not_exists, .. } => {
                 let index_name = name.as_ref().ok_or_else(|| anyhow!("Index name required"))?;
@@ -242,6 +246,118 @@ impl Executor {
         let schema = TableSchema { name: table_name.clone(), table_id, columns: col_defs, version: 1, pk_indices, indexes: Vec::new() };
         self.store.create_table(txn, schema).await?;
         Ok(ExecuteResult::CreateTable { table_name })
+    }
+
+    async fn execute_create_table_as(&self, txn: &mut Transaction, name: &ObjectName, query: &Query, columns: &[SqlColumnDef], if_not_exists: bool, _temporary: bool) -> Result<ExecuteResult> {
+        let table_name = name.0.last().ok_or_else(|| anyhow!("Invalid table name"))?.value.clone();
+        if if_not_exists && self.store.table_exists(txn, &table_name).await? {
+            return Ok(ExecuteResult::CreateTable { table_name });
+        }
+        
+        let ctes = self.build_cte_context(txn, query).await?;
+        let result = self.execute_query_with_ctes(txn, query, &ctes).await?;
+        
+        let (result_cols, result_rows) = match result {
+            ExecuteResult::Select { columns: cols, rows } => (cols, rows),
+            _ => return Err(anyhow!("CREATE TABLE AS requires a SELECT query")),
+        };
+        
+        let col_defs: Vec<ColumnDef> = if columns.is_empty() {
+            result_cols.iter().enumerate().map(|(i, col_name)| {
+                let data_type = if !result_rows.is_empty() {
+                    infer_data_type(&result_rows[0].values[i])
+                } else {
+                    DataType::Text
+                };
+                ColumnDef {
+                    name: col_name.clone(),
+                    data_type,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                }
+            }).collect()
+        } else {
+            columns.iter().map(|col| {
+                let data_type = convert_data_type(&col.data_type).unwrap_or(DataType::Text);
+                ColumnDef {
+                    name: col.name.value.clone(),
+                    data_type,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                }
+            }).collect()
+        };
+        
+        let table_id = self.store.next_table_id(txn).await?;
+        let schema = TableSchema {
+            name: table_name.clone(),
+            table_id,
+            columns: col_defs,
+            version: 1,
+            pk_indices: vec![],
+            indexes: vec![],
+        };
+        self.store.create_table(txn, schema.clone()).await?;
+        
+        for row in result_rows {
+            self.store.upsert(txn, &table_name, row).await?;
+        }
+        
+        Ok(ExecuteResult::CreateTable { table_name })
+    }
+
+    async fn create_table_from_result(&self, txn: &mut Transaction, target_name: &ObjectName, result: ExecuteResult) -> Result<ExecuteResult> {
+        let table_name = target_name.0.last().ok_or_else(|| anyhow!("Invalid table name"))?.value.clone();
+        
+        if self.store.table_exists(txn, &table_name).await? {
+            return Err(anyhow!("relation \"{}\" already exists", table_name));
+        }
+        
+        let (result_cols, result_rows) = match result {
+            ExecuteResult::Select { columns: cols, rows } => (cols, rows),
+            _ => return Err(anyhow!("SELECT INTO requires a SELECT query")),
+        };
+        
+        let col_defs: Vec<ColumnDef> = result_cols.iter().enumerate().map(|(i, col_name)| {
+            let data_type = if !result_rows.is_empty() {
+                infer_data_type(&result_rows[0].values[i])
+            } else {
+                DataType::Text
+            };
+            ColumnDef {
+                name: col_name.clone(),
+                data_type,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }
+        }).collect();
+        
+        let table_id = self.store.next_table_id(txn).await?;
+        let schema = TableSchema {
+            name: table_name.clone(),
+            table_id,
+            columns: col_defs,
+            version: 1,
+            pk_indices: vec![],
+            indexes: vec![],
+        };
+        self.store.create_table(txn, schema).await?;
+        
+        let row_count = result_rows.len();
+        for row in result_rows {
+            self.store.upsert(txn, &table_name, row).await?;
+        }
+        
+        Ok(ExecuteResult::Insert { affected_rows: row_count as u64 })
     }
 
     async fn execute_create_index(&self, txn: &mut Transaction, idx_name: &str, table_name: &ObjectName, columns: &[OrderByExpr], unique: bool, if_not_exists: bool) -> Result<ExecuteResult> {
@@ -866,14 +982,24 @@ impl Executor {
         
         let select = match &*query.body { SetExpr::Select(s) => s, _ => return Err(anyhow!("Only SELECT supported")) };
         
+        let select_into_target = select.into.as_ref().map(|into| (into.name.clone(), into.temporary));
+        
         if select.from.is_empty() {
-            return self.execute_tableless_query(txn, select).await;
+            let result = self.execute_tableless_query(txn, select).await?;
+            if let Some((target_name, _temp)) = select_into_target {
+                return self.create_table_from_result(txn, &target_name, result).await;
+            }
+            return Ok(result);
         }
         
         let has_joins = !select.from[0].joins.is_empty();
         
         if has_joins {
-            return self.execute_join_query_with_ctes(txn, query, select, ctes).await;
+            let result = self.execute_join_query_with_ctes(txn, query, select, ctes).await?;
+            if let Some((target_name, _temp)) = select_into_target {
+                return self.create_table_from_result(txn, &target_name, result).await;
+            }
+            return Ok(result);
         }
         
         let t = match &select.from[0].relation { TableFactor::Table { name, .. } => name.0.last().unwrap().value.clone(), _ => return Err(anyhow!("Unsupported table")) };
@@ -1120,7 +1246,11 @@ impl Executor {
             result_rows = dedup_rows(result_rows);
         }
 
-        Ok(ExecuteResult::Select { columns: cols, rows: result_rows })
+        let result = ExecuteResult::Select { columns: cols, rows: result_rows };
+        if let Some((target_name, _temp)) = select_into_target {
+            return self.create_table_from_result(txn, &target_name, result).await;
+        }
+        Ok(result)
     }
 
     async fn execute_tableless_query(&self, txn: &mut Transaction, select: &sqlparser::ast::Select) -> Result<ExecuteResult> {
@@ -2881,6 +3011,24 @@ fn eval_having_expr_join(
         Expr::Nested(e) => eval_having_expr_join(e, ctx, agg_funcs, aggs),
         Expr::Value(v) => super::expr::eval_value_public(v),
         _ => eval_expr_join(expr, ctx),
+    }
+}
+
+fn infer_data_type(value: &Value) -> DataType {
+    match value {
+        Value::Int32(_) => DataType::Int32,
+        Value::Int64(_) => DataType::Int64,
+        Value::Float64(_) => DataType::Float64,
+        Value::Boolean(_) => DataType::Boolean,
+        Value::Text(_) => DataType::Text,
+        Value::Bytes(_) => DataType::Bytes,
+        Value::Timestamp(_) => DataType::Timestamp,
+        Value::Interval { .. } => DataType::Interval,
+        Value::Uuid(_) => DataType::Uuid,
+        Value::Json(_) => DataType::Json,
+        Value::Jsonb(_) => DataType::Jsonb,
+        Value::Array(_) => DataType::Text,
+        Value::Null => DataType::Text,
     }
 }
 

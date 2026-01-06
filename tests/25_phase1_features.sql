@@ -71,4 +71,34 @@ SELECT * FROM products_uf ORDER BY id;
 DROP TABLE products_uf;
 DROP TABLE price_updates;
 
-SELECT 'Phase 1 tests (FETCH, NATURAL JOIN, CROSS JOIN, UPDATE FROM) completed!' AS status;
+-- ============================================
+-- 5. CREATE TABLE AS
+-- ============================================
+DROP TABLE IF EXISTS source_data;
+DROP TABLE IF EXISTS derived_table;
+
+CREATE TABLE source_data (id INT PRIMARY KEY, name TEXT, score INT);
+INSERT INTO source_data VALUES (1, 'Alice', 90), (2, 'Bob', 85), (3, 'Charlie', 95);
+
+CREATE TABLE derived_table AS SELECT id, name FROM source_data WHERE score > 88;
+SELECT * FROM derived_table ORDER BY id;
+
+DROP TABLE derived_table;
+DROP TABLE source_data;
+
+-- ============================================
+-- 6. SELECT INTO
+-- ============================================
+DROP TABLE IF EXISTS employees_si;
+DROP TABLE IF EXISTS high_performers;
+
+CREATE TABLE employees_si (id INT PRIMARY KEY, name TEXT, salary INT);
+INSERT INTO employees_si VALUES (1, 'Alice', 60000), (2, 'Bob', 55000), (3, 'Charlie', 70000);
+
+SELECT id, name INTO high_performers FROM employees_si WHERE salary > 58000;
+SELECT * FROM high_performers ORDER BY id;
+
+DROP TABLE high_performers;
+DROP TABLE employees_si;
+
+SELECT 'Phase 1 tests completed!' AS status;
