@@ -1,0 +1,305 @@
+NOTICE:  table "employees" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+ id |  name   | row_num 
+----+---------+---------
+  1 | Alice   |       1
+  2 | Bob     |       2
+  3 | Charlie |       3
+  4 | Diana   |       4
+  5 | Eve     |       5
+  6 | Frank   |       6
+  7 | Grace   |       7
+  8 | Henry   |       8
+(8 rows)
+
+ id |  name   | department  | dept_rank 
+----+---------+-------------+-----------
+  3 | Charlie | Engineering |         1
+  1 | Alice   | Engineering |         2
+  2 | Bob     | Engineering |         3
+  7 | Grace   | HR          |         1
+  8 | Henry   | HR          |         2
+  6 | Frank   | Sales       |         1
+  5 | Eve     | Sales       |         2
+  4 | Diana   | Sales       |         3
+(8 rows)
+
+ id |  name   | salary | salary_rank 
+----+---------+--------+-------------
+  3 | Charlie |  90000 |           1
+  1 | Alice   |  80000 |           2
+  2 | Bob     |  75000 |           3
+  6 | Frank   |  70000 |           4
+  5 | Eve     |  65000 |           5
+  4 | Diana   |  60000 |           6
+  7 | Grace   |  55000 |           7
+  8 | Henry   |  50000 |           8
+(8 rows)
+
+ id |  name   | salary | dense_salary_rank 
+----+---------+--------+-------------------
+  3 | Charlie |  90000 |                 1
+  1 | Alice   |  80000 |                 2
+  2 | Bob     |  75000 |                 3
+  6 | Frank   |  70000 |                 4
+  5 | Eve     |  65000 |                 5
+  4 | Diana   |  60000 |                 6
+  7 | Grace   |  55000 |                 7
+  8 | Henry   |  50000 |                 8
+(8 rows)
+
+ id |  name   | department  | salary | dept_salary_rank 
+----+---------+-------------+--------+------------------
+  3 | Charlie | Engineering |  90000 |                1
+  1 | Alice   | Engineering |  80000 |                2
+  2 | Bob     | Engineering |  75000 |                3
+  7 | Grace   | HR          |  55000 |                1
+  8 | Henry   | HR          |  50000 |                2
+  6 | Frank   | Sales       |  70000 |                1
+  5 | Eve     | Sales       |  65000 |                2
+  4 | Diana   | Sales       |  60000 |                3
+(8 rows)
+
+ id |  name   | salary | prev_salary 
+----+---------+--------+-------------
+  1 | Alice   |  80000 |            
+  2 | Bob     |  75000 |       80000
+  3 | Charlie |  90000 |       75000
+  4 | Diana   |  60000 |       90000
+  5 | Eve     |  65000 |       60000
+  6 | Frank   |  70000 |       65000
+  7 | Grace   |  55000 |       70000
+  8 | Henry   |  50000 |       55000
+(8 rows)
+
+ id |  name   | salary | two_rows_back 
+----+---------+--------+---------------
+  1 | Alice   |  80000 |              
+  2 | Bob     |  75000 |              
+  3 | Charlie |  90000 |         80000
+  4 | Diana   |  60000 |         75000
+  5 | Eve     |  65000 |         90000
+  6 | Frank   |  70000 |         60000
+  7 | Grace   |  55000 |         65000
+  8 | Henry   |  50000 |         70000
+(8 rows)
+
+ id |  name   | salary | prev_salary_or_zero 
+----+---------+--------+---------------------
+  1 | Alice   |  80000 |                   0
+  2 | Bob     |  75000 |               80000
+  3 | Charlie |  90000 |               75000
+  4 | Diana   |  60000 |               90000
+  5 | Eve     |  65000 |               60000
+  6 | Frank   |  70000 |               65000
+  7 | Grace   |  55000 |               70000
+  8 | Henry   |  50000 |               55000
+(8 rows)
+
+ id |  name   | salary | next_salary 
+----+---------+--------+-------------
+  1 | Alice   |  80000 |       75000
+  2 | Bob     |  75000 |       90000
+  3 | Charlie |  90000 |       60000
+  4 | Diana   |  60000 |       65000
+  5 | Eve     |  65000 |       70000
+  6 | Frank   |  70000 |       55000
+  7 | Grace   |  55000 |       50000
+  8 | Henry   |  50000 |            
+(8 rows)
+
+ id |  name   | salary | next_salary_or_minus1 
+----+---------+--------+-----------------------
+  1 | Alice   |  80000 |                 75000
+  2 | Bob     |  75000 |                 90000
+  3 | Charlie |  90000 |                 60000
+  4 | Diana   |  60000 |                 65000
+  5 | Eve     |  65000 |                 70000
+  6 | Frank   |  70000 |                 55000
+  7 | Grace   |  55000 |                 50000
+  8 | Henry   |  50000 |                    -1
+(8 rows)
+
+ id |  name   | department  | salary | prev_in_dept | next_in_dept 
+----+---------+-------------+--------+--------------+--------------
+  2 | Bob     | Engineering |  75000 |              | Alice
+  1 | Alice   | Engineering |  80000 | Bob          | Charlie
+  3 | Charlie | Engineering |  90000 | Alice        | 
+  8 | Henry   | HR          |  50000 |              | Grace
+  7 | Grace   | HR          |  55000 | Henry        | 
+  4 | Diana   | Sales       |  60000 |              | Eve
+  5 | Eve     | Sales       |  65000 | Diana        | Frank
+  6 | Frank   | Sales       |  70000 | Eve          | 
+(8 rows)
+
+ id |  name   | salary | running_total 
+----+---------+--------+---------------
+  1 | Alice   |  80000 |         80000
+  2 | Bob     |  75000 |        155000
+  3 | Charlie |  90000 |        245000
+  4 | Diana   |  60000 |        305000
+  5 | Eve     |  65000 |        370000
+  6 | Frank   |  70000 |        440000
+  7 | Grace   |  55000 |        495000
+  8 | Henry   |  50000 |        545000
+(8 rows)
+
+ id |  name   | running_count 
+----+---------+---------------
+  1 | Alice   |             1
+  2 | Bob     |             2
+  3 | Charlie |             3
+  4 | Diana   |             4
+  5 | Eve     |             5
+  6 | Frank   |             6
+  7 | Grace   |             7
+  8 | Henry   |             8
+(8 rows)
+
+ id |  name   | salary |    running_avg     
+----+---------+--------+--------------------
+  1 | Alice   |  80000 | 80000.000000000000
+  2 | Bob     |  75000 | 77500.000000000000
+  3 | Charlie |  90000 | 81666.666666666667
+  4 | Diana   |  60000 | 76250.000000000000
+  5 | Eve     |  65000 | 74000.000000000000
+  6 | Frank   |  70000 | 73333.333333333333
+  7 | Grace   |  55000 | 70714.285714285714
+  8 | Henry   |  50000 | 68125.000000000000
+(8 rows)
+
+ id |  name   | salary | running_min | running_max 
+----+---------+--------+-------------+-------------
+  1 | Alice   |  80000 |       80000 |       80000
+  2 | Bob     |  75000 |       75000 |       80000
+  3 | Charlie |  90000 |       75000 |       90000
+  4 | Diana   |  60000 |       60000 |       90000
+  5 | Eve     |  65000 |       60000 |       90000
+  6 | Frank   |  70000 |       60000 |       90000
+  7 | Grace   |  55000 |       55000 |       90000
+  8 | Henry   |  50000 |       50000 |       90000
+(8 rows)
+
+ id |  name   | department  | salary | dept_running_total 
+----+---------+-------------+--------+--------------------
+  1 | Alice   | Engineering |  80000 |              80000
+  2 | Bob     | Engineering |  75000 |             155000
+  3 | Charlie | Engineering |  90000 |             245000
+  7 | Grace   | HR          |  55000 |              55000
+  8 | Henry   | HR          |  50000 |             105000
+  4 | Diana   | Sales       |  60000 |              60000
+  5 | Eve     | Sales       |  65000 |             125000
+  6 | Frank   | Sales       |  70000 |             195000
+(8 rows)
+
+ id |  name   | department  | salary | row_num | salary_rank | prev_salary | next_salary | running_total 
+----+---------+-------------+--------+---------+-------------+-------------+-------------+---------------
+  1 | Alice   | Engineering |  80000 |       1 |           2 |             |       75000 |         80000
+  2 | Bob     | Engineering |  75000 |       2 |           3 |       80000 |       90000 |        155000
+  3 | Charlie | Engineering |  90000 |       3 |           1 |       75000 |       60000 |        245000
+  4 | Diana   | Sales       |  60000 |       4 |           6 |       90000 |       65000 |        305000
+  5 | Eve     | Sales       |  65000 |       5 |           5 |       60000 |       70000 |        370000
+  6 | Frank   | Sales       |  70000 |       6 |           4 |       65000 |       55000 |        440000
+  7 | Grace   | HR          |  55000 |       7 |           7 |       70000 |       50000 |        495000
+  8 | Henry   | HR          |  50000 |       8 |           8 |       55000 |             |        545000
+(8 rows)
+
+ id |  name   | department  | salary | rank 
+----+---------+-------------+--------+------
+  3 | Charlie | Engineering |  90000 |    1
+  1 | Alice   | Engineering |  80000 |    2
+  2 | Bob     | Engineering |  75000 |    3
+(3 rows)
+
+ id |  name   | salary | rank 
+----+---------+--------+------
+  3 | Charlie |  90000 |    1
+  1 | Alice   |  80000 |    2
+  2 | Bob     |  75000 |    3
+  6 | Frank   |  70000 |    4
+  5 | Eve     |  65000 |    5
+  4 | Diana   |  60000 |    6
+  7 | Grace   |  55000 |    7
+  8 | Henry   |  50000 |    8
+(8 rows)
+
+ id |  name   | salary | rank 
+----+---------+--------+------
+  3 | Charlie |  90000 |    1
+  1 | Alice   |  80000 |    2
+  2 | Bob     |  75000 |    3
+(3 rows)
+
+ id |  name   | department  | salary | dept_total | dept_count |      dept_avg      | dept_min | dept_max 
+----+---------+-------------+--------+------------+------------+--------------------+----------+----------
+  1 | Alice   | Engineering |  80000 |     245000 |          3 | 81666.666666666667 |    75000 |    90000
+  2 | Bob     | Engineering |  75000 |     245000 |          3 | 81666.666666666667 |    75000 |    90000
+  3 | Charlie | Engineering |  90000 |     245000 |          3 | 81666.666666666667 |    75000 |    90000
+  4 | Diana   | Sales       |  60000 |     195000 |          3 | 65000.000000000000 |    60000 |    70000
+  5 | Eve     | Sales       |  65000 |     195000 |          3 | 65000.000000000000 |    60000 |    70000
+  6 | Frank   | Sales       |  70000 |     195000 |          3 | 65000.000000000000 |    60000 |    70000
+  7 | Grace   | HR          |  55000 |     105000 |          2 | 52500.000000000000 |    50000 |    55000
+  8 | Henry   | HR          |  50000 |     105000 |          2 | 52500.000000000000 |    50000 |    55000
+(8 rows)
+
+ id |  name   | department  | salary | running_sum | running_count |    running_avg     
+----+---------+-------------+--------+-------------+---------------+--------------------
+  1 | Alice   | Engineering |  80000 |       80000 |             1 | 80000.000000000000
+  2 | Bob     | Engineering |  75000 |      155000 |             2 | 77500.000000000000
+  3 | Charlie | Engineering |  90000 |      245000 |             3 | 81666.666666666667
+  4 | Diana   | Sales       |  60000 |       60000 |             1 | 60000.000000000000
+  5 | Eve     | Sales       |  65000 |      125000 |             2 | 62500.000000000000
+  6 | Frank   | Sales       |  70000 |      195000 |             3 | 65000.000000000000
+  7 | Grace   | HR          |  55000 |       55000 |             1 | 55000.000000000000
+  8 | Henry   | HR          |  50000 |      105000 |             2 | 52500.000000000000
+(8 rows)
+
+ id | department  | salary | total_no_order | running_with_order 
+----+-------------+--------+----------------+--------------------
+  1 | Engineering |  80000 |         245000 |              80000
+  2 | Engineering |  75000 |         245000 |             155000
+  3 | Engineering |  90000 |         245000 |             245000
+  4 | Sales       |  60000 |         195000 |              60000
+  5 | Sales       |  65000 |         195000 |             125000
+  6 | Sales       |  70000 |         195000 |             195000
+  7 | HR          |  55000 |         105000 |              55000
+  8 | HR          |  50000 |         105000 |             105000
+(8 rows)
+
+DROP TABLE
+NOTICE:  table "scores" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+ student | score | rank 
+---------+-------+------
+ A       |   100 |    1
+ B       |    95 |    2
+ C       |    95 |    2
+ D       |    90 |    4
+ E       |    85 |    5
+(5 rows)
+
+ student | score | dense_rank 
+---------+-------+------------
+ A       |   100 |          1
+ B       |    95 |          2
+ C       |    95 |          2
+ D       |    90 |          3
+ E       |    85 |          4
+(5 rows)
+
+DROP TABLE

@@ -1073,6 +1073,11 @@ impl Executor {
             }
         }
         
+        if let Some(having_expr) = &select.having {
+            let extra_start = select.projection.len();
+            collect_having_agg_funcs(having_expr, &mut agg_funcs, extra_start);
+        }
+        
         let is_agg = !group_keys_exprs.is_empty() || !agg_funcs.is_empty();
 
         if is_agg {
@@ -1474,6 +1479,8 @@ impl Executor {
 
         let mut combined_schemas: Vec<(String, TableSchema)> = vec![(base_alias.clone(), base_schema.clone())];
         let mut combined_rows: Vec<Row> = base_rows;
+        let mut has_natural_join = false;
+        let mut natural_join_common_cols: Vec<String> = Vec::new();
 
         for join in &select.from[0].joins {
             let (join_table, join_alias) = match &join.relation {
@@ -1505,6 +1512,8 @@ impl Executor {
                         .filter(|c| right_columns.contains(c))
                         .cloned()
                         .collect();
+                    has_natural_join = true;
+                    natural_join_common_cols = common_cols.clone();
                     if common_cols.is_empty() {
                         (None, true)
                     } else {
@@ -1688,6 +1697,11 @@ impl Executor {
             }
         }
         
+        if let Some(having_expr) = &select.having {
+            let extra_start = select.projection.len();
+            collect_having_agg_funcs(having_expr, &mut agg_funcs, extra_start);
+        }
+        
         let is_agg = !group_keys_exprs.is_empty() || !agg_funcs.is_empty();
 
         if is_agg {
@@ -1823,12 +1837,44 @@ impl Executor {
         
         let wildcard = select.projection.iter().any(|p| matches!(p, SelectItem::Wildcard(_)));
         if wildcard {
-            for (alias, schema) in &combined_schemas {
-                for col in &schema.columns {
-                    cols.push(format!("{}.{}", alias, col.name));
+            if has_natural_join && !natural_join_common_cols.is_empty() {
+                let mut col_indices_to_keep: Vec<usize> = Vec::new();
+                let mut seen_common_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
+                
+                for common_col in &natural_join_common_cols {
+                    cols.push(common_col.clone());
                 }
+                
+                let mut offset = 0;
+                for (_, schema) in &combined_schemas {
+                    for col in &schema.columns {
+                        if natural_join_common_cols.contains(&col.name) {
+                            if !seen_common_cols.contains(&col.name) {
+                                col_indices_to_keep.push(offset);
+                                seen_common_cols.insert(col.name.clone());
+                            }
+                        } else {
+                            cols.push(col.name.clone());
+                            col_indices_to_keep.push(offset);
+                        }
+                        offset += 1;
+                    }
+                }
+                
+                result_rows = final_rows.into_iter().map(|row| {
+                    let vals: Vec<Value> = col_indices_to_keep.iter()
+                        .map(|&idx| row.values.get(idx).cloned().unwrap_or(Value::Null))
+                        .collect();
+                    Row::new(vals)
+                }).collect();
+            } else {
+                for (alias, schema) in &combined_schemas {
+                    for col in &schema.columns {
+                        cols.push(format!("{}.{}", alias, col.name));
+                    }
+                }
+                result_rows = final_rows;
             }
-            result_rows = final_rows;
         } else {
             for item in &select.projection {
                 match item {
@@ -2549,46 +2595,92 @@ fn compute_window_functions(
                     }
                 }
                 "sum" => {
-                    let mut running_sum = 0.0f64;
-                    for &row_idx in &row_indices {
-                        if let Some(ref arg) = wf.arg_expr {
-                            let val = eval_expr(arg, Some(&rows[row_idx]), Some(schema))?;
-                            match val {
-                                Value::Int32(n) => running_sum += n as f64,
-                                Value::Int64(n) => running_sum += n as f64,
-                                Value::Float64(n) => running_sum += n,
-                                _ => {}
+                    if wf.order_by.is_empty() {
+                        let mut total = 0.0f64;
+                        for &row_idx in &row_indices {
+                            if let Some(ref arg) = wf.arg_expr {
+                                let val = eval_expr(arg, Some(&rows[row_idx]), Some(schema))?;
+                                match val {
+                                    Value::Int32(n) => total += n as f64,
+                                    Value::Int64(n) => total += n as f64,
+                                    Value::Float64(n) => total += n,
+                                    _ => {}
+                                }
                             }
                         }
-                        results[row_idx][wf_idx] = Value::Float64(running_sum);
+                        for &row_idx in &row_indices {
+                            results[row_idx][wf_idx] = Value::Float64(total);
+                        }
+                    } else {
+                        let mut running_sum = 0.0f64;
+                        for &row_idx in &row_indices {
+                            if let Some(ref arg) = wf.arg_expr {
+                                let val = eval_expr(arg, Some(&rows[row_idx]), Some(schema))?;
+                                match val {
+                                    Value::Int32(n) => running_sum += n as f64,
+                                    Value::Int64(n) => running_sum += n as f64,
+                                    Value::Float64(n) => running_sum += n,
+                                    _ => {}
+                                }
+                            }
+                            results[row_idx][wf_idx] = Value::Float64(running_sum);
+                        }
                     }
                 }
                 "count" => {
-                    let mut running_count = 0i64;
-                    for &row_idx in &row_indices {
-                        running_count += 1;
-                        results[row_idx][wf_idx] = Value::Int64(running_count);
+                    if wf.order_by.is_empty() {
+                        let total = row_indices.len() as i64;
+                        for &row_idx in &row_indices {
+                            results[row_idx][wf_idx] = Value::Int64(total);
+                        }
+                    } else {
+                        let mut running_count = 0i64;
+                        for &row_idx in &row_indices {
+                            running_count += 1;
+                            results[row_idx][wf_idx] = Value::Int64(running_count);
+                        }
                     }
                 }
                 "avg" => {
-                    let mut running_sum = 0.0f64;
-                    let mut running_count = 0i64;
-                    for &row_idx in &row_indices {
-                        if let Some(ref arg) = wf.arg_expr {
-                            let val = eval_expr(arg, Some(&rows[row_idx]), Some(schema))?;
-                            match val {
-                                Value::Int32(n) => { running_sum += n as f64; running_count += 1; }
-                                Value::Int64(n) => { running_sum += n as f64; running_count += 1; }
-                                Value::Float64(n) => { running_sum += n; running_count += 1; }
-                                Value::Null => {}
-                                _ => { running_count += 1; }
+                    if wf.order_by.is_empty() {
+                        let mut total_sum = 0.0f64;
+                        let mut total_count = 0i64;
+                        for &row_idx in &row_indices {
+                            if let Some(ref arg) = wf.arg_expr {
+                                let val = eval_expr(arg, Some(&rows[row_idx]), Some(schema))?;
+                                match val {
+                                    Value::Int32(n) => { total_sum += n as f64; total_count += 1; }
+                                    Value::Int64(n) => { total_sum += n as f64; total_count += 1; }
+                                    Value::Float64(n) => { total_sum += n; total_count += 1; }
+                                    Value::Null => {}
+                                    _ => { total_count += 1; }
+                                }
                             }
                         }
-                        results[row_idx][wf_idx] = if running_count > 0 {
-                            Value::Float64(running_sum / running_count as f64)
-                        } else {
-                            Value::Null
-                        };
+                        let avg_val = if total_count > 0 { Value::Float64(total_sum / total_count as f64) } else { Value::Null };
+                        for &row_idx in &row_indices {
+                            results[row_idx][wf_idx] = avg_val.clone();
+                        }
+                    } else {
+                        let mut running_sum = 0.0f64;
+                        let mut running_count = 0i64;
+                        for &row_idx in &row_indices {
+                            if let Some(ref arg) = wf.arg_expr {
+                                let val = eval_expr(arg, Some(&rows[row_idx]), Some(schema))?;
+                                match val {
+                                    Value::Int32(n) => { running_sum += n as f64; running_count += 1; }
+                                    Value::Int64(n) => { running_sum += n as f64; running_count += 1; }
+                                    Value::Float64(n) => { running_sum += n; running_count += 1; }
+                                    Value::Null => {}
+                                    _ => { running_count += 1; }
+                                }
+                            }
+                            results[row_idx][wf_idx] = if running_count > 0 {
+                                Value::Float64(running_sum / running_count as f64)
+                            } else {
+                                Value::Null
+                            };
+                        }
                     }
                 }
                 "min" => {
@@ -2603,7 +2695,15 @@ fn compute_window_functions(
                                 });
                             }
                         }
-                        results[row_idx][wf_idx] = min_val.clone().unwrap_or(Value::Null);
+                        if !wf.order_by.is_empty() {
+                            results[row_idx][wf_idx] = min_val.clone().unwrap_or(Value::Null);
+                        }
+                    }
+                    if wf.order_by.is_empty() {
+                        let final_min = min_val.unwrap_or(Value::Null);
+                        for &row_idx in &row_indices {
+                            results[row_idx][wf_idx] = final_min.clone();
+                        }
                     }
                 }
                 "max" => {
@@ -2618,7 +2718,15 @@ fn compute_window_functions(
                                 });
                             }
                         }
-                        results[row_idx][wf_idx] = max_val.clone().unwrap_or(Value::Null);
+                        if !wf.order_by.is_empty() {
+                            results[row_idx][wf_idx] = max_val.clone().unwrap_or(Value::Null);
+                        }
+                    }
+                    if wf.order_by.is_empty() {
+                        let final_max = max_val.unwrap_or(Value::Null);
+                        for &row_idx in &row_indices {
+                            results[row_idx][wf_idx] = final_max.clone();
+                        }
                     }
                 }
                 "lag" => {
@@ -2910,6 +3018,36 @@ fn extract_conditions_recursive(expr: &Expr, index_cols: &[String], values: &mut
         }
         Expr::Nested(e) => extract_conditions_recursive(e, index_cols, values),
         _ => {}
+    }
+}
+
+fn collect_having_agg_funcs(expr: &Expr, agg_funcs: &mut Vec<(usize, sqlparser::ast::Function)>, extra_start: usize) {
+    debug!("collect_having_agg_funcs called with expr: {:?}", expr);
+    match expr {
+        Expr::Function(f) if f.over.is_none() => {
+            let func_name = f.name.0.last().map(|i| i.value.to_uppercase()).unwrap_or_default();
+            debug!("Found function in HAVING: {}", func_name);
+            if matches!(func_name.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
+                let already_exists = agg_funcs.iter().any(|(_, existing)| {
+                    let existing_name = existing.name.0.last().map(|n| n.value.to_uppercase()).unwrap_or_default();
+                    existing_name == func_name && args_match(f, existing)
+                });
+                debug!("Already exists: {}, agg_funcs len: {}", already_exists, agg_funcs.len());
+                if !already_exists {
+                    let new_idx = extra_start + (agg_funcs.len() - agg_funcs.iter().filter(|(idx, _)| *idx < extra_start).count());
+                    debug!("Adding new agg func at index {}", new_idx);
+                    agg_funcs.push((new_idx, f.clone()));
+                }
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_having_agg_funcs(left, agg_funcs, extra_start);
+            collect_having_agg_funcs(right, agg_funcs, extra_start);
+        }
+        Expr::Nested(e) => collect_having_agg_funcs(e, agg_funcs, extra_start),
+        _ => {
+            debug!("Other expr type in HAVING: {:?}", expr);
+        }
     }
 }
 

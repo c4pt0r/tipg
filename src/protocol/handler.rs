@@ -1203,7 +1203,7 @@ fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> 
         }
 
         ExecuteResult::Insert { affected_rows } => {
-            Ok(Response::Execution(Tag::new("INSERT").with_rows(affected_rows as usize)))
+            Ok(Response::Execution(Tag::new("INSERT").with_oid(0).with_rows(affected_rows as usize)))
         }
 
         ExecuteResult::Delete { affected_rows } => {

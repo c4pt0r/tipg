@@ -100,6 +100,36 @@ SELECT id, name, salary, ROW_NUMBER() OVER (ORDER BY salary DESC) as rank
 FROM employees
 LIMIT 3;
 
+-- ============================================
+-- CRITICAL: Partition Total vs Running Aggregate
+-- PostgreSQL behavior differs based on ORDER BY presence!
+-- ============================================
+
+-- 21. Partition total (NO ORDER BY) - same value for ALL rows in partition
+SELECT id, name, department, salary,
+       SUM(salary) OVER (PARTITION BY department) as dept_total,
+       COUNT(*) OVER (PARTITION BY department) as dept_count,
+       AVG(salary) OVER (PARTITION BY department) as dept_avg,
+       MIN(salary) OVER (PARTITION BY department) as dept_min,
+       MAX(salary) OVER (PARTITION BY department) as dept_max
+FROM employees
+ORDER BY id;
+
+-- 22. Running aggregate (WITH ORDER BY) - cumulative up to current row
+SELECT id, name, department, salary,
+       SUM(salary) OVER (PARTITION BY department ORDER BY id) as running_sum,
+       COUNT(*) OVER (PARTITION BY department ORDER BY id) as running_count,
+       AVG(salary) OVER (PARTITION BY department ORDER BY id) as running_avg
+FROM employees
+ORDER BY id;
+
+-- 23. Compare: Same query with and without ORDER BY
+SELECT id, department, salary,
+       SUM(salary) OVER (PARTITION BY department) as total_no_order,
+       SUM(salary) OVER (PARTITION BY department ORDER BY id) as running_with_order
+FROM employees
+ORDER BY id;
+
 DROP TABLE employees;
 
 -- Test with duplicate values for RANK vs DENSE_RANK
