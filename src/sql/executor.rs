@@ -3,7 +3,7 @@
 use super::{parse_sql, ExecuteResult, expr::{eval_expr, eval_expr_join, JoinContext}, Session, Aggregator};
 use super::helpers::{
     dedup_rows, value_to_sql_expr, parse_value_for_copy,
-    extract_eq_conditions, collect_having_agg_funcs, eval_having_expr, eval_having_expr_join,
+    collect_having_agg_funcs, eval_having_expr, eval_having_expr_join,
     get_skip_reason, get_unsupported_reason,
     get_select_item_name, fill_row_defaults, eval_default_expr,
 };
@@ -12,6 +12,7 @@ use super::ddl;
 use super::rbac;
 use super::dml;
 use super::query;
+use super::planner::{self, ScanType};
 use crate::auth::AuthManager;
 use crate::storage::TikvStore;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
@@ -554,20 +555,42 @@ impl Executor {
         } else {
             let mut index_scan_rows = None;
             if let Some(ref sel) = resolved_selection {
-                for index in &schema.indexes {
-                    if let Some(values) = extract_eq_conditions(sel, &index.columns) {
-                        debug!("Using Index Scan on {}", index.name);
-                        let pks = self.store.scan_index(txn, schema.table_id, index.id, &values, index.unique).await?;
-                        if !pks.is_empty() {
-                            let mut rows = self.store.batch_get_rows(txn, schema.table_id, pks.clone(), &schema).await?;
-                            if rows.is_empty() {
-                                debug!("Index scan returned {} PKs but no rows found, falling back to full scan", pks.len());
-                            } else {
-                                for r in &mut rows { fill_row_defaults(r, &schema)?; }
-                                index_scan_rows = Some(rows);
+                let predicates = planner::analyze_predicates(sel);
+                let estimated_rows = all_rows_base.len().max(100);
+                let access_path = planner::choose_best_access_path(&schema, &predicates, estimated_rows);
+                
+                match access_path.scan_type {
+                    ScanType::IndexScan { index_id, ref index_name, ref values, .. } => {
+                        let index = schema.indexes.iter().find(|i| i.id == index_id);
+                        if let Some(idx) = index {
+                            debug!("Using Index Scan on {} (cost: {:.2})", index_name, access_path.cost);
+                            let pks = self.store.scan_index(txn, schema.table_id, idx.id, values, idx.unique).await?;
+                            if !pks.is_empty() {
+                                let mut rows = self.store.batch_get_rows(txn, schema.table_id, pks.clone(), &schema).await?;
+                                if !rows.is_empty() {
+                                    for r in &mut rows { fill_row_defaults(r, &schema)?; }
+                                    index_scan_rows = Some(rows);
+                                }
                             }
                         }
-                        break; 
+                    }
+                    ScanType::IndexRangeScan { index_id, ref index_name, ref prefix_values, .. } => {
+                        let index = schema.indexes.iter().find(|i| i.id == index_id);
+                        if let Some(idx) = index {
+                            debug!("Using Index Range Scan on {} with {} prefix columns (cost: {:.2})", 
+                                   index_name, prefix_values.len(), access_path.cost);
+                            let pks = self.store.scan_index(txn, schema.table_id, idx.id, prefix_values, idx.unique).await?;
+                            if !pks.is_empty() {
+                                let mut rows = self.store.batch_get_rows(txn, schema.table_id, pks.clone(), &schema).await?;
+                                if !rows.is_empty() {
+                                    for r in &mut rows { fill_row_defaults(r, &schema)?; }
+                                    index_scan_rows = Some(rows);
+                                }
+                            }
+                        }
+                    }
+                    ScanType::FullTableScan => {
+                        debug!("Using Full Table Scan (cost: {:.2})", access_path.cost);
                     }
                 }
             }

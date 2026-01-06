@@ -10,6 +10,7 @@ mod ddl;
 mod rbac;
 mod dml;
 mod query;
+mod planner;
 
 pub use executor::*;
 pub use parser::*;
