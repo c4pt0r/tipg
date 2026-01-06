@@ -47,6 +47,7 @@ impl Executor {
     }
 
     /// Execute a SQL statement string using the provided session
+    /// Supports multiple statements separated by semicolons (e.g., "BEGIN; UPDATE...; COMMIT;")
     pub async fn execute(&self, session: &mut Session, sql: &str) -> Result<ExecuteResult> {
         let sql_upper = sql.trim().to_uppercase();
         if let Some(reason) = get_skip_reason(&sql_upper) {
@@ -67,47 +68,53 @@ impl Executor {
             return Ok(ExecuteResult::Empty);
         }
 
-        let stmt = &statements[0];
-        debug!("Executing statement: {:?}", stmt);
+        // Execute all statements in order, returning the result of the last one
+        let mut last_result = ExecuteResult::Empty;
+        
+        for stmt in &statements {
+            debug!("Executing statement: {:?}", stmt);
 
-        match stmt {
-            // Transaction Control
-            Statement::StartTransaction { .. } => {
-                session.begin().await?;
-                Ok(ExecuteResult::Empty)
-            },
-            Statement::Commit { .. } => {
-                session.commit().await?;
-                Ok(ExecuteResult::Empty)
-            },
-            Statement::Rollback { .. } => {
-                session.rollback().await?;
-                Ok(ExecuteResult::Empty)
-            },
-            // DDL/DML - delegated to session transaction management
-            _ => {
-                let is_autocommit = !session.is_in_transaction();
-                
-                if is_autocommit {
+            last_result = match stmt {
+                // Transaction Control
+                Statement::StartTransaction { .. } => {
                     session.begin().await?;
-                }
-
-                let res = async {
-                    let txn = session.get_mut_txn().expect("Transaction must be active");
-                    self.execute_statement_on_txn(txn, stmt).await
-                }.await;
-
-                if is_autocommit {
-                    if res.is_ok() {
-                        session.commit().await?;
-                    } else {
-                        session.rollback().await?;
+                    ExecuteResult::Empty
+                },
+                Statement::Commit { .. } => {
+                    session.commit().await?;
+                    ExecuteResult::Empty
+                },
+                Statement::Rollback { .. } => {
+                    session.rollback().await?;
+                    ExecuteResult::Empty
+                },
+                // DDL/DML - delegated to session transaction management
+                _ => {
+                    let is_autocommit = !session.is_in_transaction();
+                    
+                    if is_autocommit {
+                        session.begin().await?;
                     }
+
+                    let res = async {
+                        let txn = session.get_mut_txn().expect("Transaction must be active");
+                        self.execute_statement_on_txn(txn, stmt).await
+                    }.await;
+
+                    if is_autocommit {
+                        if res.is_ok() {
+                            session.commit().await?;
+                        } else {
+                            session.rollback().await?;
+                        }
+                    }
+                    
+                    res?
                 }
-                
-                res
-            }
+            };
         }
+        
+        Ok(last_result)
     }
 
     /// Execute a parsed SQL statement on a given transaction
