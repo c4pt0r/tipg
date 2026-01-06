@@ -1,178 +1,109 @@
-# Agent Instructions for pg-tikv
+# pg-tikv Agent Instructions
 
-## Project Overview
-pg-tikv is a PostgreSQL-compatible SQL layer on TiKV. Written in Rust with async/await.
+PostgreSQL-compatible SQL layer on TiKV. Rust + async/await + pgwire + sqlparser.
 
-## Build Commands
-
-```bash
-cargo build              # Debug build
-cargo build --release    # Release build
-cargo check              # Check compilation (faster, no codegen)
-cargo run                # Run server (debug)
-```
-
-## Test Commands
+## Quick Reference
 
 ```bash
-# Run ALL unit tests
-cargo test
-
-# Run a SINGLE test by name (partial match)
-cargo test test_parse_select
-cargo test test_json
-
-# Run tests in a specific module
-cargo test sql::expr::tests
-cargo test storage::encoding::tests
-cargo test protocol::handler::tests
-
-# Run tests with output visible
-cargo test -- --nocapture
-
-# Run integration tests (requires TiKV running)
-python3 scripts/integration_test.py
-
-# Run a specific SQL test file manually
-PGPASSWORD=admin psql -h 127.0.0.1 -p 5433 -U admin -d postgres -f tests/05_transaction.sql
+cargo build                    # Debug build
+cargo test                     # Unit tests (146 tests)
+cargo clippy -- -D warnings    # Lint
+python3 scripts/integration_test.py  # Integration tests (requires TiKV)
 ```
 
-## Lint Commands
+## Structure
 
-```bash
-cargo clippy -- -D warnings   # Check for warnings (treated as errors in CI)
-cargo fmt                     # Format code
-cargo fmt -- --check          # Check formatting without modifying
+```
+src/
+├── main.rs              # TCP server, startup, TLS setup
+├── pool.rs              # TiKV client pool (per-keyspace)
+├── tls.rs               # TLS/SSL config
+├── auth/                # RBAC: users, roles, privileges
+├── protocol/            # pgwire handlers, multi-tenant auth
+├── sql/                 # SQL parsing & execution (see src/sql/AGENTS.md)
+├── storage/             # TiKV client wrapper, key encoding
+└── types/               # Value, Row, TableSchema, DataType
 ```
 
-## Code Style Guidelines
+## Where to Look
 
-### Imports
-Order imports in groups separated by blank lines:
-1. Standard library (`std::`)
-2. External crates (`anyhow::`, `tokio::`, etc.)
-3. Internal modules (`crate::`, `super::`)
+| Task | Location |
+|------|----------|
+| Add SQL function | `src/sql/expr.rs` → `eval_function()` |
+| Add statement type | `src/sql/executor.rs` → `execute_statement_on_txn()` |
+| Change wire protocol | `src/protocol/handler.rs` |
+| Modify key encoding | `src/storage/encoding.rs` |
+| Add auth feature | `src/auth/rbac.rs` |
 
+## Environment Variables
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `PD_ENDPOINTS` | `127.0.0.1:2379` | TiKV PD addresses |
+| `PG_PORT` | `5433` | Listen port |
+| `PG_KEYSPACE` | `default` | TiKV keyspace (API v2) |
+| `PG_PASSWORD` | - | Fallback password |
+| `PG_TLS_CERT`/`PG_TLS_KEY` | - | TLS cert/key paths |
+
+## Conventions
+
+### Imports (3 groups, blank line separated)
 ```rust
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use tokio::sync::Mutex;
 
 use crate::storage::TikvStore;
-use crate::types::{Row, Value};
 ```
 
 ### Error Handling
-- Use `anyhow::Result` for functions that can fail
-- Use `?` operator for error propagation
-- Create descriptive error messages with context
+- `anyhow::Result` everywhere
+- Context with `.ok_or_else(|| anyhow!("..."))?`
+- Never panic in production paths
 
-```rust
-let schema = self.store.get_schema(txn, &table_name).await?
-    .ok_or_else(|| anyhow!("Table '{}' not found", table_name))?;
-```
-
-### Naming Conventions
-- Types: `PascalCase` (`TableSchema`, `ExecuteResult`)
-- Functions/methods: `snake_case` (`execute_query`, `get_schema`)
-- Constants: `SCREAMING_SNAKE_CASE` (`DEFAULT_PG_PORT`)
-- Module files: `snake_case.rs`
-
-### Async Functions
-All I/O operations are async. TiKV operations require `&mut Transaction`.
-
-```rust
-pub async fn execute(&self, session: &mut Session, sql: &str) -> Result<ExecuteResult> {
-    let txn = session.get_mut_txn().expect("Transaction must be active");
-    self.store.scan(txn, &table_name).await?
-}
-```
-
-### Type Definitions
-Use `#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]` for data types.
-
-### Module Structure
-```
-src/
-├── main.rs           # Entry point, TCP server
-├── auth/             # Authentication & RBAC
-├── pool.rs           # TiKV connection pooling
-├── protocol/         # PostgreSQL wire protocol (pgwire handlers)
-├── sql/              # SQL parsing & execution
-│   ├── executor.rs   # Query execution
-│   ├── expr.rs       # Expression evaluation
-│   ├── parser.rs     # SQL parsing wrapper
-│   ├── session.rs    # Transaction state management
-│   └── aggregate.rs  # Aggregation functions
-├── storage/          # TiKV storage layer
-│   ├── encoding.rs   # Key-value encoding
-│   └── tikv_store.rs # TiKV client wrapper
-├── tls.rs            # TLS/SSL setup
-└── types/            # Data types (Value, Row, Schema)
-```
-
-### Testing Patterns
-Unit tests go in the same file with `#[cfg(test)]` module. Use descriptive names: `test_<feature>_<scenario>`.
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_tenant_username_dot() {
-        let (ks, user) = parse_tenant_username("tenant_a.admin");
-        assert_eq!(ks, Some("tenant_a".to_string()));
-        assert_eq!(user, "admin");
-    }
-}
-```
-
-### Transaction Patterns
+### Transaction Pattern
 ```rust
 let is_autocommit = !session.is_in_transaction();
 if is_autocommit { session.begin().await?; }
-// ... execute statement ...
+// ... work ...
 if is_autocommit {
     if result.is_ok() { session.commit().await?; }
     else { session.rollback().await?; }
 }
 ```
 
-## Environment Variables
+### Testing
+- Unit tests: `#[cfg(test)] mod tests` in same file
+- Integration: `tests/*.sql` files
+- Name: `test_<feature>_<scenario>`
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PD_ENDPOINTS` | `127.0.0.1:2379` | TiKV PD addresses |
-| `PG_PORT` | `5433` | PostgreSQL listen port |
-| `PG_NAMESPACE` | (none) | Multi-tenant namespace prefix |
-| `PG_KEYSPACE` | `default` | TiKV keyspace name |
-| `PG_PASSWORD` | (none) | Fallback password |
-| `PG_TLS_CERT` | (none) | TLS certificate path |
-| `PG_TLS_KEY` | (none) | TLS private key path |
-| `RUST_LOG` | `info` | Log level |
+## Anti-Patterns
 
-## Common Patterns
+- **Never** use `unwrap()` on user input
+- **Never** suppress type errors (`as any` equivalent)
+- **Never** commit without explicit request
+- **Avoid** adding to executor.rs (already 2700+ lines)
 
-### Adding a New SQL Function
-1. Add evaluation logic in `src/sql/expr.rs` in `eval_function()`
-2. Add unit tests in the same file
-3. Add integration test in `tests/` directory
+## Key Encoding
 
-### Adding a New Statement Type
-1. Handle parsing in `execute()` method of `src/sql/executor.rs`
-2. Match on `Statement::YourType` enum variant from sqlparser
-3. Implement execution logic, use existing helpers
+| Entity | Key Pattern |
+|--------|-------------|
+| Schema | `_sys_schema_{table}` |
+| Row | `t_{table_id}_{pk}` |
+| Index | `i_{table_id}_{idx_id}_{val}` |
+| User | `_sys_user_{name}` |
 
-### Key Encoding
-Data is stored in TiKV with prefixed keys:
-- Schema: `_sys_schema_{table_name}`
-- Row data: `t_{table_id}_{pk_value}`
-- Index: `i_{table_id}_{index_id}_{idx_val}`
+## Tech Debt
 
-## Known Issues / Tech Debt
-- `executor.rs` is 2000+ lines - needs splitting into ddl.rs, dml.rs, query.rs
-- Duplicate expression evaluation: `eval_expr` vs `eval_expr_join`
-- No query planner layer (optimizer selects index scan directly)
+- `executor.rs` 2762 lines → split into ddl.rs, dml.rs, query.rs
+- Duplicate: `eval_expr` vs `eval_expr_join` → unify
+- No query planner → optimizer picks index directly
+
+## Multi-Tenant
+
+Username format: `tenant.user` or `tenant:user`
+- `tenant_a.admin` → keyspace=tenant_a, user=admin
+- `admin` → keyspace=default, user=admin
+
+Default admin password: `admin` (bootstrapped per keyspace)
