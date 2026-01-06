@@ -457,4 +457,355 @@ mod tests {
         assert_eq!(result.table_predicates.get("t2").unwrap().len(), 1);
         assert!(result.remaining_predicates.is_empty());
     }
+
+    #[test]
+    fn test_analyze_predicates_comparison_ops() {
+        let lt_expr = Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new("x"))),
+            op: BinaryOperator::Lt,
+            right: Box::new(Expr::Value(sqlparser::ast::Value::Number(
+                "10".to_string(),
+                false,
+            ))),
+        };
+        let predicates = analyze_predicates(&lt_expr);
+        assert_eq!(predicates.len(), 1);
+        assert_eq!(predicates[0].op, PredicateOp::Lt);
+
+        let gt_expr = Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new("y"))),
+            op: BinaryOperator::Gt,
+            right: Box::new(Expr::Value(sqlparser::ast::Value::Number(
+                "5".to_string(),
+                false,
+            ))),
+        };
+        let predicates = analyze_predicates(&gt_expr);
+        assert_eq!(predicates.len(), 1);
+        assert_eq!(predicates[0].op, PredicateOp::Gt);
+    }
+
+    #[test]
+    fn test_analyze_predicates_nested() {
+        let nested = Expr::Nested(Box::new(make_eq_expr("id", 1)));
+        let predicates = analyze_predicates(&nested);
+        assert_eq!(predicates.len(), 1);
+        assert_eq!(predicates[0].column, "id");
+    }
+
+    #[test]
+    fn test_analyze_predicates_is_null() {
+        let is_null = Expr::IsNull(Box::new(Expr::Identifier(Ident::new("col"))));
+        let predicates = analyze_predicates(&is_null);
+        assert_eq!(predicates.len(), 1);
+        assert_eq!(predicates[0].op, PredicateOp::IsNull);
+    }
+
+    #[test]
+    fn test_analyze_predicates_is_not_null() {
+        let is_not_null = Expr::IsNotNull(Box::new(Expr::Identifier(Ident::new("col"))));
+        let predicates = analyze_predicates(&is_not_null);
+        assert_eq!(predicates.len(), 1);
+        assert_eq!(predicates[0].op, PredicateOp::IsNotNull);
+    }
+
+    #[test]
+    fn test_choose_unique_index_over_non_unique() {
+        let schema = TableSchema {
+            name: "test".to_string(),
+            table_id: 1,
+            columns: vec![],
+            version: 1,
+            pk_indices: vec![],
+            indexes: vec![
+                IndexDef {
+                    id: 1,
+                    name: "idx_a".to_string(),
+                    columns: vec!["a".to_string()],
+                    unique: false,
+                },
+                IndexDef {
+                    id: 2,
+                    name: "idx_a_unique".to_string(),
+                    columns: vec!["a".to_string()],
+                    unique: true,
+                },
+            ],
+        };
+        let predicates = vec![PredicateInfo {
+            column: "a".to_string(),
+            op: PredicateOp::Eq,
+            value: Value::Int32(1),
+        }];
+        let path = choose_best_access_path(&schema, &predicates, 10000);
+        if let ScanType::IndexScan { index_name, .. } = path.scan_type {
+            assert_eq!(index_name, "idx_a_unique");
+        } else {
+            panic!("Expected IndexScan");
+        }
+    }
+
+    #[test]
+    fn test_choose_composite_index() {
+        let schema = TableSchema {
+            name: "test".to_string(),
+            table_id: 1,
+            columns: vec![],
+            version: 1,
+            pk_indices: vec![],
+            indexes: vec![
+                IndexDef {
+                    id: 1,
+                    name: "idx_a".to_string(),
+                    columns: vec!["a".to_string()],
+                    unique: false,
+                },
+                IndexDef {
+                    id: 2,
+                    name: "idx_ab".to_string(),
+                    columns: vec!["a".to_string(), "b".to_string()],
+                    unique: false,
+                },
+            ],
+        };
+        let predicates = vec![
+            PredicateInfo {
+                column: "a".to_string(),
+                op: PredicateOp::Eq,
+                value: Value::Int32(1),
+            },
+            PredicateInfo {
+                column: "b".to_string(),
+                op: PredicateOp::Eq,
+                value: Value::Int32(2),
+            },
+        ];
+        let path = choose_best_access_path(&schema, &predicates, 10000);
+        if let ScanType::IndexScan {
+            index_name, values, ..
+        } = path.scan_type
+        {
+            assert_eq!(index_name, "idx_ab");
+            assert_eq!(values.len(), 2);
+        } else {
+            panic!("Expected IndexScan on composite index");
+        }
+    }
+
+    #[test]
+    fn test_index_range_scan_partial_match() {
+        let schema = TableSchema {
+            name: "test".to_string(),
+            table_id: 1,
+            columns: vec![],
+            version: 1,
+            pk_indices: vec![],
+            indexes: vec![IndexDef {
+                id: 1,
+                name: "idx_abc".to_string(),
+                columns: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                unique: false,
+            }],
+        };
+        let predicates = vec![PredicateInfo {
+            column: "a".to_string(),
+            op: PredicateOp::Eq,
+            value: Value::Int32(1),
+        }];
+        let path = choose_best_access_path(&schema, &predicates, 10000);
+        match path.scan_type {
+            ScanType::IndexRangeScan { prefix_values, .. } => {
+                assert_eq!(prefix_values.len(), 1);
+            }
+            _ => panic!("Expected IndexRangeScan for partial match"),
+        }
+    }
+
+    #[test]
+    fn test_optimize_join_order_three_tables() {
+        let tables = vec![
+            JoinTableInfo {
+                name: "medium".to_string(),
+                alias: "m".to_string(),
+                estimated_rows: 1000,
+            },
+            JoinTableInfo {
+                name: "large".to_string(),
+                alias: "l".to_string(),
+                estimated_rows: 100000,
+            },
+            JoinTableInfo {
+                name: "small".to_string(),
+                alias: "s".to_string(),
+                estimated_rows: 10,
+            },
+        ];
+        let order = optimize_join_order(&tables);
+        assert_eq!(order, vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn test_optimize_join_order_single_table() {
+        let tables = vec![JoinTableInfo {
+            name: "only".to_string(),
+            alias: "o".to_string(),
+            estimated_rows: 500,
+        }];
+        let order = optimize_join_order(&tables);
+        assert_eq!(order, vec![0]);
+    }
+
+    #[test]
+    fn test_optimize_join_order_empty() {
+        let tables: Vec<JoinTableInfo> = vec![];
+        let order = optimize_join_order(&tables);
+        assert!(order.is_empty());
+    }
+
+    #[test]
+    fn test_estimate_join_cost() {
+        let cost = estimate_join_cost(100, 1000, 0.01);
+        assert!(cost > 0.0);
+
+        let cost_small = estimate_join_cost(10, 10, 0.1);
+        let cost_large = estimate_join_cost(1000, 1000, 0.1);
+        assert!(cost_large > cost_small);
+    }
+
+    #[test]
+    fn test_pushdown_predicates_with_remaining() {
+        let predicates = vec![
+            PredicateInfo {
+                column: "a".to_string(),
+                op: PredicateOp::Eq,
+                value: Value::Int32(1),
+            },
+            PredicateInfo {
+                column: "unknown".to_string(),
+                op: PredicateOp::Eq,
+                value: Value::Int32(99),
+            },
+        ];
+        let mut table_columns = HashMap::new();
+        table_columns.insert("t1".to_string(), vec!["a".to_string()]);
+
+        let result = pushdown_predicates(&predicates, &table_columns);
+        assert_eq!(result.table_predicates.get("t1").unwrap().len(), 1);
+        assert_eq!(result.remaining_predicates.len(), 1);
+        assert_eq!(result.remaining_predicates[0].column, "unknown");
+    }
+
+    #[test]
+    fn test_pushdown_predicates_empty() {
+        let predicates: Vec<PredicateInfo> = vec![];
+        let table_columns: HashMap<String, Vec<String>> = HashMap::new();
+
+        let result = pushdown_predicates(&predicates, &table_columns);
+        assert!(result.table_predicates.is_empty());
+        assert!(result.remaining_predicates.is_empty());
+    }
+
+    #[test]
+    fn test_extract_table_predicates_with_alias() {
+        let predicates = vec![
+            PredicateInfo {
+                column: "t.col1".to_string(),
+                op: PredicateOp::Eq,
+                value: Value::Int32(1),
+            },
+            PredicateInfo {
+                column: "other.col2".to_string(),
+                op: PredicateOp::Eq,
+                value: Value::Int32(2),
+            },
+            PredicateInfo {
+                column: "col3".to_string(),
+                op: PredicateOp::Eq,
+                value: Value::Int32(3),
+            },
+        ];
+        let table_columns = vec!["col1".to_string(), "col3".to_string()];
+
+        let extracted = extract_table_predicates(&predicates, "t", &table_columns);
+        assert_eq!(extracted.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_index_values_success() {
+        let predicates = vec![
+            PredicateInfo {
+                column: "a".to_string(),
+                op: PredicateOp::Eq,
+                value: Value::Int32(1),
+            },
+            PredicateInfo {
+                column: "b".to_string(),
+                op: PredicateOp::Eq,
+                value: Value::Int32(2),
+            },
+        ];
+        let index_columns = vec!["a".to_string(), "b".to_string()];
+        let values = extract_index_values(&predicates, &index_columns);
+        assert!(values.is_some());
+        assert_eq!(values.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_extract_index_values_missing_column() {
+        let predicates = vec![PredicateInfo {
+            column: "a".to_string(),
+            op: PredicateOp::Eq,
+            value: Value::Int32(1),
+        }];
+        let index_columns = vec!["a".to_string(), "b".to_string()];
+        let values = extract_index_values(&predicates, &index_columns);
+        assert!(values.is_none());
+    }
+
+    #[test]
+    fn test_extract_index_values_non_eq_predicate() {
+        let predicates = vec![PredicateInfo {
+            column: "a".to_string(),
+            op: PredicateOp::Lt,
+            value: Value::Int32(1),
+        }];
+        let index_columns = vec!["a".to_string()];
+        let values = extract_index_values(&predicates, &index_columns);
+        assert!(values.is_none());
+    }
+
+    #[test]
+    fn test_predicate_op_reversed() {
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Value(sqlparser::ast::Value::Number(
+                "10".to_string(),
+                false,
+            ))),
+            op: BinaryOperator::Lt,
+            right: Box::new(Expr::Identifier(Ident::new("x"))),
+        };
+        let predicates = analyze_predicates(&expr);
+        assert_eq!(predicates.len(), 1);
+        assert_eq!(predicates[0].column, "x");
+        assert_eq!(predicates[0].op, PredicateOp::Gt);
+    }
+
+    #[test]
+    fn test_full_table_scan_better_for_high_selectivity() {
+        let schema = TableSchema {
+            name: "test".to_string(),
+            table_id: 1,
+            columns: vec![],
+            version: 1,
+            pk_indices: vec![],
+            indexes: vec![IndexDef {
+                id: 1,
+                name: "idx_a".to_string(),
+                columns: vec!["a".to_string()],
+                unique: false,
+            }],
+        };
+        let path_no_pred = choose_best_access_path(&schema, &[], 10);
+        assert!(matches!(path_no_pred.scan_type, ScanType::FullTableScan));
+    }
 }

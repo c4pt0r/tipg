@@ -13,6 +13,7 @@ use super::rbac;
 use super::dml;
 use super::query;
 use super::planner::{self, ScanType};
+use super::explain;
 use crate::auth::AuthManager;
 use crate::storage::TikvStore;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
@@ -208,6 +209,9 @@ impl Executor {
             }
             Statement::Copy { .. } => {
                 Ok(ExecuteResult::Empty)
+            }
+            Statement::Explain { statement, analyze, verbose, .. } => {
+                self.execute_explain(txn, statement, *analyze, *verbose).await
             }
             _ => Err(anyhow!("Unsupported statement: {:?}", stmt)),
         }
@@ -1412,6 +1416,41 @@ impl Executor {
     async fn execute_show_tables(&self, txn: &mut Transaction) -> Result<ExecuteResult> {
         let tables = self.store.list_tables(txn).await?;
         Ok(ExecuteResult::ShowTables { tables })
+    }
+
+    async fn execute_explain(
+        &self,
+        txn: &mut Transaction,
+        statement: &Statement,
+        _analyze: bool,
+        _verbose: bool,
+    ) -> Result<ExecuteResult> {
+        let tables = self.store.list_tables(txn).await?;
+        let mut schemas: HashMap<String, TableSchema> = HashMap::new();
+        for table_name in &tables {
+            if let Ok(Some(schema)) = self.store.get_schema(txn, table_name).await {
+                schemas.insert(table_name.clone(), schema);
+            }
+        }
+
+        let schema_lookup = |table_name: &str| -> Option<TableSchema> {
+            schemas.get(table_name).cloned()
+        };
+
+        let row_count_lookup = |_table_name: &str| -> usize { 1000 };
+
+        let plan = explain::generate_plan(statement, schema_lookup, row_count_lookup);
+        let plan_text = explain::format_plan_text(&plan, 0);
+
+        let lines: Vec<Row> = plan_text
+            .lines()
+            .map(|line| Row::new(vec![Value::Text(line.to_string())]))
+            .collect();
+
+        Ok(ExecuteResult::Select {
+            columns: vec!["QUERY PLAN".to_string()],
+            rows: lines,
+        })
     }
 
     fn resolve_subqueries<'a>(&'a self, txn: &'a mut Transaction, expr: &'a Expr) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Expr>> + Send + 'a>> {

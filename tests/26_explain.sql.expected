@@ -1,0 +1,53 @@
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+INSERT 0 3
+                QUERY PLAN                
+------------------------------------------
+ Result  (cost=0.00..0.01 rows=1 width=4)
+(1 row)
+
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Seq Scan on explain_test  (cost=0.00..25.00 rows=6 width=40)
+   Filter: (b = 'one'::text)
+(2 rows)
+
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Index Scan using explain_test_pkey on explain_test  (cost=0.15..8.17 rows=1 width=40)
+   Index Cond: (id = 1)
+(2 rows)
+
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Bitmap Heap Scan on explain_test  (cost=4.20..13.67 rows=6 width=40)
+   Recheck Cond: (a = 10)
+   ->  Bitmap Index Scan on idx_a  (cost=0.00..4.20 rows=6 width=0)
+         Index Cond: (a = 10)
+(4 rows)
+
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Seq Scan on explain_test  (cost=0.00..22.00 rows=1200 width=40)
+(1 row)
+
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
+ Index Scan using idx_a on explain_test  (cost=0.15..66.15 rows=1200 width=40)
+(1 row)
+
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Limit  (cost=0.00..0.02 rows=1 width=40)
+   ->  Seq Scan on explain_test  (cost=0.00..22.00 rows=1200 width=40)
+(2 rows)
+
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ HashAggregate  (cost=28.00..30.00 rows=200 width=12)
+   Group Key: a
+   ->  Seq Scan on explain_test  (cost=0.00..22.00 rows=1200 width=40)
+(3 rows)
+
+DROP TABLE

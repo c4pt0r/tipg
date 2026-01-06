@@ -22,6 +22,25 @@ pub enum DataType {
     Jsonb,
 }
 
+impl DataType {
+    pub fn estimated_size(&self) -> usize {
+        match self {
+            DataType::Boolean => 1,
+            DataType::Int32 => 4,
+            DataType::Int64 => 8,
+            DataType::Float64 => 8,
+            DataType::Text => 32,
+            DataType::Bytes => 32,
+            DataType::Timestamp => 8,
+            DataType::Interval => 8,
+            DataType::Uuid => 16,
+            DataType::Array(_) => 64,
+            DataType::Json => 64,
+            DataType::Jsonb => 64,
+        }
+    }
+}
+
 impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
