@@ -274,7 +274,11 @@ pub async fn fill_missing_columns(
 
 pub fn coerce_row_values(schema: &TableSchema, row_vals: &mut Vec<Value>) -> Result<()> {
     for (i, c) in schema.columns.iter().enumerate() {
-        row_vals[i] = coerce_value_for_column(row_vals[i].clone(), c)?;
+        let coerced = coerce_value_for_column(row_vals[i].clone(), c)?;
+        if coerced == Value::Null && !c.nullable {
+            return Err(anyhow!("Column '{}' cannot be null", c.name));
+        }
+        row_vals[i] = coerced;
     }
     Ok(())
 }
@@ -311,7 +315,12 @@ pub fn compute_update_values(
         } else {
             eval_expr(&a.value, Some(old_row), Some(schema))?
         };
-        vals[indices[i]] = coerce_value_for_column(raw_val, &schema.columns[indices[i]])?;
+        let col = &schema.columns[indices[i]];
+        let coerced = coerce_value_for_column(raw_val, col)?;
+        if coerced == Value::Null && !col.nullable {
+            return Err(anyhow!("Column '{}' cannot be null", col.name));
+        }
+        vals[indices[i]] = coerced;
     }
     Ok(vals)
 }

@@ -1,0 +1,18 @@
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+ERROR:  null value in column "required_col" of relation "not_null_test" violates not-null constraint
+DETAIL:  Failing row contains (3, null, null).
+ERROR:  null value in column "required_col" of relation "not_null_test" violates not-null constraint
+DETAIL:  Failing row contains (4, null, missing required).
+ERROR:  null value in column "required_col" of relation "not_null_test" violates not-null constraint
+DETAIL:  Failing row contains (1, null, null).
+UPDATE 1
+ id | required_col | optional_col 
+----+--------------+--------------
+  1 | valid        | 
+  2 | also valid   | 
+(2 rows)
+
+DROP TABLE
