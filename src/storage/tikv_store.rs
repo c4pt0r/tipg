@@ -2,7 +2,7 @@ use super::encoding::*;
 use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
-use tikv_client::{BoundRange, Config, Transaction, TransactionClient};
+use tikv_client::{BoundRange, CheckLevel, Config, Transaction, TransactionClient, TransactionOptions};
 use tracing::{debug, info};
 
 pub struct TikvStore {
@@ -47,11 +47,13 @@ impl TikvStore {
     }
 
     pub async fn begin(&self) -> Result<Transaction> {
-        self.client.begin_pessimistic().await.map_err(|e| anyhow!(e))
+        let options = TransactionOptions::new_pessimistic().drop_check(CheckLevel::Warn);
+        self.client.begin_with_options(options).await.map_err(|e| anyhow!(e))
     }
 
     pub async fn begin_optimistic(&self) -> Result<Transaction> {
-        self.client.begin_optimistic().await.map_err(|e| anyhow!(e))
+        let options = TransactionOptions::new_optimistic().drop_check(CheckLevel::Warn);
+        self.client.begin_with_options(options).await.map_err(|e| anyhow!(e))
     }
 
     pub async fn lock_rows(&self, txn: &mut Transaction, table_name: &str, rows: &[Row]) -> Result<()> {
