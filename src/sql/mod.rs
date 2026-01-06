@@ -4,6 +4,12 @@ mod executor;
 mod parser;
 mod result;
 mod expr;
+mod helpers;
+mod window;
+mod ddl;
+mod rbac;
+mod dml;
+mod query;
 
 pub use executor::*;
 pub use parser::*;

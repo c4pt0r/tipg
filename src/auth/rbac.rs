@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use tikv_client::Transaction;
 
 const USER_KEY_PREFIX: &[u8] = b"_sys_user_";

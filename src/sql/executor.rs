@@ -1,16 +1,27 @@
 //! SQL executor
 
 use super::{parse_sql, ExecuteResult, expr::{eval_expr, eval_expr_join, JoinContext}, Session, Aggregator};
-use crate::auth::{AuthManager, User, Role, Privilege, PrivilegeObject};
+use super::helpers::{
+    dedup_rows, value_to_sql_expr, parse_value_for_copy,
+    extract_eq_conditions, collect_having_agg_funcs, eval_having_expr, eval_having_expr_join,
+    get_skip_reason, get_unsupported_reason,
+    get_select_item_name, fill_row_defaults, eval_default_expr,
+};
+use super::window::{extract_window_functions, compute_window_functions};
+use super::ddl;
+use super::rbac;
+use super::dml;
+use super::query;
+use crate::auth::AuthManager;
 use crate::storage::TikvStore;
-use crate::types::{ColumnDef, DataType, Row, TableSchema, Value, IndexDef};
+use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
-    AlterTableOperation, AlterRoleOperation, Assignment, ColumnDef as SqlColumnDef, ColumnOption, 
-    DataType as SqlDataType, Expr, Ident, ObjectName, Query, SelectItem, SetExpr, Statement, 
+    AlterTableOperation, AlterRoleOperation, Assignment, ColumnDef as SqlColumnDef,
+    Expr, Ident, ObjectName, Query, SelectItem, SetExpr, Statement, 
     TableConstraint, Values, FunctionArg, FunctionArgExpr, OrderByExpr, BinaryOperator, GroupByExpr, 
     JoinOperator, JoinConstraint, TableFactor, LockType, Password as SqlPassword,
-    Value as SqlValue, Cte, WindowType, SetOperator, SetQuantifier, OnInsert, OnConflictAction,
+    Value as SqlValue, SetOperator, SetQuantifier, OnInsert,
     GrantObjects, Privileges,
 };
 use std::sync::Arc;
@@ -201,58 +212,14 @@ impl Executor {
         }
     }
 
-    // --- All DDL/DML methods ---
+    // --- DDL methods (delegated to ddl module) ---
 
     async fn execute_create_table(&self, txn: &mut Transaction, name: &ObjectName, columns: &[SqlColumnDef], constraints: &[TableConstraint], if_not_exists: bool) -> Result<ExecuteResult> {
-        let table_name = name.0.last().ok_or_else(|| anyhow!("Invalid table name"))?.value.clone();
-        if if_not_exists {
-            if self.store.table_exists(txn, &table_name).await? { return Ok(ExecuteResult::CreateTable { table_name }); }
-        }
-        let pk_columns: Vec<String> = constraints.iter().filter_map(|c| {
-            match c {
-                TableConstraint::Unique { columns, is_primary, .. } if *is_primary => Some(columns.iter().map(|c| c.value.clone()).collect::<Vec<String>>()),
-                _ => None
-            }
-        }).flatten().collect();
-        let mut col_defs = Vec::new();
-        for col in columns {
-            let col_name = col.name.value.clone();
-            let (data_type, is_serial) = if is_serial_type(&col.data_type) { (DataType::Int32, true) } else { (convert_data_type(&col.data_type)?, false) };
-            let mut is_pk = pk_columns.contains(&col_name);
-            let mut nullable = true;
-            let mut unique = false;
-            let mut default_expr = None;
-            for opt in &col.options {
-                match &opt.option {
-                    ColumnOption::Unique { is_primary, .. } => { if *is_primary { is_pk = true; } else { unique = true; } }
-                    ColumnOption::NotNull => nullable = false,
-                    ColumnOption::Default(expr) => default_expr = Some(expr.to_string()),
-                    _ => {}
-                }
-            }
-            if is_serial { nullable = false; }
-            if is_pk { nullable = false; }
-            col_defs.push(ColumnDef { name: col_name, data_type, nullable, primary_key: is_pk, unique, is_serial, default_expr });
-        }
-        let mut pk_indices = Vec::new();
-        if !pk_columns.is_empty() {
-            for pk_name in &pk_columns {
-                 if let Some(idx) = col_defs.iter().position(|c| c.name == *pk_name) { pk_indices.push(idx); }
-            }
-        } else {
-            for (i, col) in col_defs.iter().enumerate() { if col.primary_key { pk_indices.push(i); } }
-        }
-        let table_id = self.store.next_table_id(txn).await?;
-        let schema = TableSchema { name: table_name.clone(), table_id, columns: col_defs, version: 1, pk_indices, indexes: Vec::new() };
-        self.store.create_table(txn, schema).await?;
-        Ok(ExecuteResult::CreateTable { table_name })
+        ddl::execute_create_table(&self.store, txn, name, columns, constraints, if_not_exists).await
     }
 
     async fn execute_create_table_as(&self, txn: &mut Transaction, name: &ObjectName, query: &Query, columns: &[SqlColumnDef], if_not_exists: bool, _temporary: bool) -> Result<ExecuteResult> {
         let table_name = name.0.last().ok_or_else(|| anyhow!("Invalid table name"))?.value.clone();
-        if if_not_exists && self.store.table_exists(txn, &table_name).await? {
-            return Ok(ExecuteResult::CreateTable { table_name });
-        }
         
         let ctes = self.build_cte_context(txn, query).await?;
         let result = self.execute_query_with_ctes(txn, query, &ctes).await?;
@@ -262,160 +229,33 @@ impl Executor {
             _ => return Err(anyhow!("CREATE TABLE AS requires a SELECT query")),
         };
         
-        let col_defs: Vec<ColumnDef> = if columns.is_empty() {
-            result_cols.iter().enumerate().map(|(i, col_name)| {
-                let data_type = if !result_rows.is_empty() {
-                    infer_data_type(&result_rows[0].values[i])
-                } else {
-                    DataType::Text
-                };
-                ColumnDef {
-                    name: col_name.clone(),
-                    data_type,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                }
-            }).collect()
-        } else {
-            columns.iter().map(|col| {
-                let data_type = convert_data_type(&col.data_type).unwrap_or(DataType::Text);
-                ColumnDef {
-                    name: col.name.value.clone(),
-                    data_type,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                }
-            }).collect()
-        };
-        
-        let table_id = self.store.next_table_id(txn).await?;
-        let schema = TableSchema {
-            name: table_name.clone(),
-            table_id,
-            columns: col_defs,
-            version: 1,
-            pk_indices: vec![],
-            indexes: vec![],
-        };
-        self.store.create_table(txn, schema.clone()).await?;
-        
-        for row in result_rows {
-            self.store.upsert(txn, &table_name, row).await?;
-        }
-        
-        Ok(ExecuteResult::CreateTable { table_name })
+        ddl::create_table_from_query_result(&self.store, txn, &table_name, if_not_exists, result_cols, result_rows, columns).await
     }
 
     async fn create_table_from_result(&self, txn: &mut Transaction, target_name: &ObjectName, result: ExecuteResult) -> Result<ExecuteResult> {
         let table_name = target_name.0.last().ok_or_else(|| anyhow!("Invalid table name"))?.value.clone();
-        
-        if self.store.table_exists(txn, &table_name).await? {
-            return Err(anyhow!("relation \"{}\" already exists", table_name));
-        }
         
         let (result_cols, result_rows) = match result {
             ExecuteResult::Select { columns: cols, rows } => (cols, rows),
             _ => return Err(anyhow!("SELECT INTO requires a SELECT query")),
         };
         
-        let col_defs: Vec<ColumnDef> = result_cols.iter().enumerate().map(|(i, col_name)| {
-            let data_type = if !result_rows.is_empty() {
-                infer_data_type(&result_rows[0].values[i])
-            } else {
-                DataType::Text
-            };
-            ColumnDef {
-                name: col_name.clone(),
-                data_type,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-            }
-        }).collect();
-        
-        let table_id = self.store.next_table_id(txn).await?;
-        let schema = TableSchema {
-            name: table_name.clone(),
-            table_id,
-            columns: col_defs,
-            version: 1,
-            pk_indices: vec![],
-            indexes: vec![],
-        };
-        self.store.create_table(txn, schema).await?;
-        
-        let row_count = result_rows.len();
-        for row in result_rows {
-            self.store.upsert(txn, &table_name, row).await?;
-        }
-        
-        Ok(ExecuteResult::Insert { affected_rows: row_count as u64 })
+        ddl::create_table_from_select_into(&self.store, txn, &table_name, result_cols, result_rows).await
     }
 
     async fn execute_create_index(&self, txn: &mut Transaction, idx_name: &str, table_name: &ObjectName, columns: &[OrderByExpr], unique: bool, if_not_exists: bool) -> Result<ExecuteResult> {
-        let idx_name_str = idx_name.to_string();
         let tbl_name = table_name.0.last().unwrap().value.clone();
-        let mut schema = self.store.get_schema(txn, &tbl_name).await?.ok_or_else(|| anyhow!("Table not found"))?;
-        if schema.indexes.iter().any(|i| i.name == idx_name_str) {
-            if if_not_exists { return Ok(ExecuteResult::CreateIndex { index_name: idx_name_str }); }
-            return Err(anyhow!("Index exists"));
-        }
-        let mut idx_cols = Vec::new();
-        for col_expr in columns {
-            if let Expr::Identifier(ident) = &col_expr.expr {
-                let col_name = ident.value.clone();
-                if schema.column_index(&col_name).is_none() { return Err(anyhow!("Column not found")); }
-                idx_cols.push(col_name);
-            } else { return Err(anyhow!("Index column must be identifier")); }
-        }
-        let index_id = self.store.next_table_id(txn).await?;
-        let new_index = IndexDef { name: idx_name_str.clone(), id: index_id, columns: idx_cols, unique };
+        let schema = self.store.get_schema(txn, &tbl_name).await?.ok_or_else(|| anyhow!("Table not found"))?;
         let rows = self.scan_and_fill(txn, &tbl_name, &schema).await?;
-        for row in rows {
-            let idx_values = schema.get_index_values(&new_index, &row);
-            let pk_values = schema.get_pk_values(&row);
-            self.store.create_index_entry(txn, schema.table_id, index_id, &idx_values, &pk_values, unique).await?;
-        }
-        schema.indexes.push(new_index);
-        self.store.update_schema(txn, schema).await?;
-        Ok(ExecuteResult::CreateIndex { index_name: idx_name_str })
+        ddl::execute_create_index(&self.store, txn, idx_name, table_name, columns, unique, if_not_exists, rows).await
     }
 
     async fn execute_create_view(&self, txn: &mut Transaction, name: &ObjectName, query: &Query, or_replace: bool) -> Result<ExecuteResult> {
-        let view_name = name.0.last().ok_or_else(|| anyhow!("Invalid view name"))?.value.clone();
-        let view_name_lower = view_name.to_lowercase();
-        
-        if self.store.get_view(txn, &view_name_lower).await?.is_some() {
-            if or_replace {
-                self.store.drop_view(txn, &view_name_lower).await?;
-            } else {
-                return Err(anyhow!("View '{}' already exists", view_name));
-            }
-        }
-        
-        let query_str = query.to_string();
-        self.store.create_view(txn, &view_name_lower, &query_str).await?;
-        Ok(ExecuteResult::CreateView { view_name })
+        ddl::execute_create_view(&self.store, txn, name, query, or_replace).await
     }
 
     async fn execute_drop_view(&self, txn: &mut Transaction, names: &[ObjectName], if_exists: bool) -> Result<ExecuteResult> {
-        let mut last = String::new();
-        for name in names {
-            let v = name.0.last().unwrap().value.to_lowercase();
-            if !self.store.drop_view(txn, &v).await? && !if_exists {
-                return Err(anyhow!("View '{}' does not exist", v));
-            }
-            last = v;
-        }
-        Ok(ExecuteResult::DropView { view_name: last })
+        ddl::execute_drop_view(&self.store, txn, names, if_exists).await
     }
 
     async fn execute_drop_index(&self, txn: &mut Transaction, names: &[ObjectName], if_exists: bool) -> Result<ExecuteResult> {
@@ -431,17 +271,10 @@ impl Executor {
                     None => continue,
                 };
                 
-                if let Some(pos) = schema.indexes.iter().position(|i| i.name == idx_name) {
-                    let index = schema.indexes.remove(pos);
-                    let rows = self.scan_and_fill(txn, &table_name, &schema).await?;
-                    for row in rows {
-                        let idx_values = schema.get_index_values(&index, &row);
-                        let pk_values = schema.get_pk_values(&row);
-                        self.store.delete_index_entry(txn, schema.table_id, index.id, &idx_values, &pk_values, index.unique).await?;
-                    }
-                    self.store.update_schema(txn, schema).await?;
+                let rows = self.scan_and_fill(txn, &table_name, &schema).await?;
+                if let Some(dropped) = ddl::execute_drop_index(&self.store, txn, &idx_name, &mut schema, &table_name, rows).await? {
                     found = true;
-                    last_index = idx_name.clone();
+                    last_index = dropped;
                     break;
                 }
             }
@@ -454,130 +287,18 @@ impl Executor {
     }
 
     async fn execute_drop_table(&self, txn: &mut Transaction, names: &[ObjectName], if_exists: bool) -> Result<ExecuteResult> {
-        let mut last = String::new();
-        for name in names {
-            let t = name.0.last().unwrap().value.clone();
-            if !self.store.drop_table(txn, &t).await? && !if_exists { return Err(anyhow!("Table '{}' does not exist", t)); }
-            last = t;
-        }
-        Ok(ExecuteResult::DropTable { table_name: last })
+        ddl::execute_drop_table(&self.store, txn, names, if_exists).await
     }
 
     async fn execute_truncate(&self, txn: &mut Transaction, table_name: &ObjectName) -> Result<ExecuteResult> {
-        let t = table_name.0.last().unwrap().value.clone();
-        if !self.store.truncate_table(txn, &t).await? { return Err(anyhow!("Table '{}' does not exist", t)); }
-        Ok(ExecuteResult::TruncateTable { table_name: t })
+        ddl::execute_truncate(&self.store, txn, table_name).await
     }
 
     async fn execute_alter_table(&self, txn: &mut Transaction, name: &ObjectName, operation: &AlterTableOperation) -> Result<ExecuteResult> {
         let t = name.0.last().unwrap().value.clone();
-        let mut schema = self.store.get_schema(txn, &t).await?.ok_or_else(|| anyhow!("Table '{}' does not exist", t))?;
-        match operation {
-            AlterTableOperation::AddColumn { column_def, .. } => {
-                let col_name = column_def.name.value.clone();
-                if schema.column_index(&col_name).is_some() { return Err(anyhow!("Column exists")); }
-                let data_type = convert_data_type(&column_def.data_type)?;
-                let mut nullable = true;
-                let mut default_expr = None;
-                for opt in &column_def.options {
-                    match &opt.option {
-                        ColumnOption::NotNull => nullable = false,
-                        ColumnOption::Default(expr) => default_expr = Some(expr.to_string()),
-                        _ => {}
-                    }
-                }
-                if !nullable && default_expr.is_none() { return Err(anyhow!("Cannot add NOT NULL column without DEFAULT")); }
-                schema.columns.push(ColumnDef { name: col_name, data_type, nullable, primary_key: false, unique: false, is_serial: false, default_expr });
-                schema.version += 1;
-                self.store.update_schema(txn, schema).await?;
-            },
-            AlterTableOperation::AddConstraint(constraint) => {
-                match constraint {
-                    TableConstraint::Unique { columns, is_primary, .. } if *is_primary => {
-                        let pk_names: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
-                        let mut pk_indices = Vec::new();
-                        for pk_name in &pk_names {
-                            if let Some(idx) = schema.columns.iter().position(|c| c.name == *pk_name) {
-                                schema.columns[idx].primary_key = true;
-                                schema.columns[idx].nullable = false;
-                                pk_indices.push(idx);
-                            } else {
-                                return Err(anyhow!("Column '{}' does not exist", pk_name));
-                            }
-                        }
-                        schema.pk_indices = pk_indices;
-                        schema.version += 1;
-                        self.store.update_schema(txn, schema).await?;
-                    }
-                    TableConstraint::Unique { columns, .. } => {
-                        for col in columns {
-                            if let Some(idx) = schema.columns.iter().position(|c| c.name == col.value) {
-                                schema.columns[idx].unique = true;
-                            }
-                        }
-                        schema.version += 1;
-                        self.store.update_schema(txn, schema).await?;
-                    }
-                    TableConstraint::ForeignKey { .. } | TableConstraint::Check { .. } => {}
-                    _ => {}
-                }
-            },
-            AlterTableOperation::DropConstraint { .. } => {},
-            AlterTableOperation::DropColumn { column_name, if_exists, .. } => {
-                let col_name = column_name.value.clone();
-                let col_idx = schema.column_index(&col_name);
-                match col_idx {
-                    Some(idx) => {
-                        if schema.pk_indices.contains(&idx) {
-                            return Err(anyhow!("Cannot drop primary key column '{}'", col_name));
-                        }
-                        for index in &schema.indexes {
-                            if index.columns.contains(&col_name) {
-                                return Err(anyhow!("Cannot drop column '{}' used in index '{}'", col_name, index.name));
-                            }
-                        }
-                        let rows = self.scan_and_fill(txn, &t, &schema).await?;
-                        for row in rows {
-                            let pk_values = schema.get_pk_values(&row);
-                            let mut new_values = row.values.clone();
-                            new_values.remove(idx);
-                            let new_row = Row::new(new_values);
-                            self.store.upsert(txn, &t, new_row).await?;
-                        }
-                        schema.columns.remove(idx);
-                        for pk_idx in &mut schema.pk_indices {
-                            if *pk_idx > idx { *pk_idx -= 1; }
-                        }
-                        schema.version += 1;
-                        self.store.update_schema(txn, schema).await?;
-                    }
-                    None => {
-                        if !if_exists {
-                            return Err(anyhow!("Column '{}' does not exist", col_name));
-                        }
-                    }
-                }
-            },
-            AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
-                let old_name = old_column_name.value.clone();
-                let new_name = new_column_name.value.clone();
-                let col_idx = schema.column_index(&old_name).ok_or_else(|| anyhow!("Column '{}' does not exist", old_name))?;
-                if schema.column_index(&new_name).is_some() {
-                    return Err(anyhow!("Column '{}' already exists", new_name));
-                }
-                schema.columns[col_idx].name = new_name.clone();
-                for index in &mut schema.indexes {
-                    for col in &mut index.columns {
-                        if *col == old_name { *col = new_name.clone(); }
-                    }
-                }
-                schema.version += 1;
-                self.store.update_schema(txn, schema).await?;
-            },
-            AlterTableOperation::RenameTable { .. } => {},
-            _ => return Err(anyhow!("Unsupported ALTER")),
-        }
-        Ok(ExecuteResult::AlterTable { table_name: t })
+        let schema = self.store.get_schema(txn, &t).await?.ok_or_else(|| anyhow!("Table '{}' does not exist", t))?;
+        let rows = self.scan_and_fill(txn, &t, &schema).await?;
+        ddl::execute_alter_table(&self.store, txn, name, operation, rows).await
     }
 
     async fn execute_insert(&self, txn: &mut Transaction, table_name: &ObjectName, columns: &[Ident], source: &Option<Box<Query>>, returning: &Option<Vec<SelectItem>>, on_conflict: &Option<OnInsert>) -> Result<ExecuteResult> {
@@ -585,133 +306,31 @@ impl Executor {
         let schema = self.store.get_schema(txn, &t).await?.ok_or_else(|| anyhow!("Table '{}' does not exist", t))?;
         let source = source.as_ref().ok_or_else(|| anyhow!("INSERT requires VALUES"))?;
         let values = match &*source.body { SetExpr::Values(Values { rows, .. }) => rows, _ => return Err(anyhow!("Only VALUES supported")) };
+        
         let mut affected = 0;
         let mut ret_rows = Vec::new();
-        let mut ret_cols = Vec::new();
-        if let Some(items) = returning {
-            for item in items {
-                match item {
-                    SelectItem::UnnamedExpr(Expr::Identifier(id)) => ret_cols.push(id.value.clone()),
-                    SelectItem::ExprWithAlias { alias, .. } => ret_cols.push(alias.value.clone()),
-                    SelectItem::Wildcard(_) => for c in &schema.columns { ret_cols.push(c.name.clone()); },
-                    _ => return Err(anyhow!("Unsupported RETURNING")),
-                }
-            }
-        }
+        let ret_cols = dml::build_returning_columns(returning, &schema)?;
+        
         for exprs in values {
-            let mut row_vals = vec![Value::Null; schema.columns.len()];
-            let mut indices = Vec::new();
-            if columns.is_empty() {
-                if exprs.len() != schema.columns.len() { return Err(anyhow!("Column count mismatch")); }
-                for (i, e) in exprs.iter().enumerate() { row_vals[i] = eval_expr(e, None, None)?; indices.push(i); }
-            } else {
-                if columns.len() != exprs.len() { return Err(anyhow!("Count mismatch")); }
-                for (i, c) in columns.iter().enumerate() {
-                    let idx = schema.column_index(&c.value).ok_or_else(|| anyhow!("Unknown col"))?;
-                    row_vals[idx] = eval_expr(&exprs[i], None, None)?;
-                    indices.push(idx);
-                }
-            }
-            for (i, c) in schema.columns.iter().enumerate() {
-                if !indices.contains(&i) {
-                    if c.is_serial {
-                        row_vals[i] = Value::Int32(self.store.next_sequence_value(txn, schema.table_id).await?);
-                    } else if let Some(def) = &c.default_expr {
-                        row_vals[i] = eval_default_expr(def)?;
-                    } else if !c.nullable { return Err(anyhow!("Column '{}' cannot be null", c.name)); }
-                }
-            }
-            for (i, c) in schema.columns.iter().enumerate() {
-                row_vals[i] = coerce_value_for_column(row_vals[i].clone(), c)?;
-            }
+            let (mut row_vals, indices) = dml::prepare_insert_row(&schema, columns, exprs)?;
+            dml::fill_missing_columns(&self.store, txn, &schema, &mut row_vals, &indices).await?;
+            dml::coerce_row_values(&schema, &mut row_vals)?;
             let row = Row::new(row_vals);
-            let pk_values = schema.get_pk_values(&row);
             
-            let insert_result = self.store.insert(txn, &t, row.clone()).await;
-            let final_row = match insert_result {
-                Ok(()) => {
-                    for index in &schema.indexes {
-                        let idx_values = schema.get_index_values(index, &row);
-                        self.store.create_index_entry(txn, schema.table_id, index.id, &idx_values, &pk_values, index.unique).await?;
-                    }
-                    row
+            let result = dml::execute_insert_row(&self.store, txn, &t, &schema, row, on_conflict).await?;
+            if let Some(final_row) = result {
+                affected += 1;
+                if let Some(ret_row) = dml::eval_returning_row(returning, &final_row, &schema)? {
+                    ret_rows.push(ret_row);
                 }
-                Err(e) if e.to_string().contains("Duplicate primary key") => {
-                    match on_conflict {
-                        Some(OnInsert::OnConflict(oc)) => {
-                            match &oc.action {
-                                OnConflictAction::DoNothing => continue,
-                                OnConflictAction::DoUpdate(do_update) => {
-                                    let existing_rows = self.store.batch_get_rows(txn, schema.table_id, vec![pk_values.clone()], &schema).await?;
-                                    if existing_rows.is_empty() {
-                                        return Err(anyhow!("Failed to fetch existing row for upsert"));
-                                    }
-                                    let existing_row = &existing_rows[0];
-                                    let mut updated_vals = existing_row.values.clone();
-                                    for assignment in &do_update.assignments {
-                                        let col_name = assignment.id.last().unwrap().value.clone();
-                                        let col_idx = schema.column_index(&col_name).ok_or_else(|| anyhow!("Unknown column in DO UPDATE: {}", col_name))?;
-                                        updated_vals[col_idx] = eval_expr(&assignment.value, Some(existing_row), Some(&schema))?;
-                                    }
-                                    let updated_row = Row::new(updated_vals);
-                                    for index in &schema.indexes {
-                                        let old_idx = schema.get_index_values(index, existing_row);
-                                        self.store.delete_index_entry(txn, schema.table_id, index.id, &old_idx, &pk_values, index.unique).await?;
-                                    }
-                                    self.store.upsert(txn, &t, updated_row.clone()).await?;
-                                    for index in &schema.indexes {
-                                        let new_idx = schema.get_index_values(index, &updated_row);
-                                        self.store.create_index_entry(txn, schema.table_id, index.id, &new_idx, &pk_values, index.unique).await?;
-                                    }
-                                    updated_row
-                                }
-                            }
-                        }
-                        Some(OnInsert::DuplicateKeyUpdate(assignments)) => {
-                            let existing_rows = self.store.batch_get_rows(txn, schema.table_id, vec![pk_values.clone()], &schema).await?;
-                            if existing_rows.is_empty() {
-                                return Err(anyhow!("Failed to fetch existing row for upsert"));
-                            }
-                            let existing_row = &existing_rows[0];
-                            let mut updated_vals = existing_row.values.clone();
-                            for assignment in assignments {
-                                let col_name = assignment.id.last().unwrap().value.clone();
-                                let col_idx = schema.column_index(&col_name).ok_or_else(|| anyhow!("Unknown column: {}", col_name))?;
-                                updated_vals[col_idx] = eval_expr(&assignment.value, Some(existing_row), Some(&schema))?;
-                            }
-                            let updated_row = Row::new(updated_vals);
-                            for index in &schema.indexes {
-                                let old_idx = schema.get_index_values(index, existing_row);
-                                self.store.delete_index_entry(txn, schema.table_id, index.id, &old_idx, &pk_values, index.unique).await?;
-                            }
-                            self.store.upsert(txn, &t, updated_row.clone()).await?;
-                            for index in &schema.indexes {
-                                let new_idx = schema.get_index_values(index, &updated_row);
-                                self.store.create_index_entry(txn, schema.table_id, index.id, &new_idx, &pk_values, index.unique).await?;
-                            }
-                            updated_row
-                        }
-                        None => return Err(e),
-                        _ => return Err(e),
-                    }
-                }
-                Err(e) => return Err(e),
-            };
-            
-            affected += 1;
-            if let Some(items) = returning {
-                let mut vals = Vec::new();
-                for item in items {
-                    match item {
-                        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => vals.push(eval_expr(e, Some(&final_row), Some(&schema))?),
-                        SelectItem::Wildcard(_) => vals.extend(final_row.values.clone()),
-                        _ => {}
-                    }
-                }
-                ret_rows.push(Row::new(vals));
             }
         }
-        if returning.is_some() { Ok(ExecuteResult::Select { columns: ret_cols, rows: ret_rows }) } else { Ok(ExecuteResult::Insert { affected_rows: affected }) }
+        
+        if returning.is_some() { 
+            Ok(ExecuteResult::Select { columns: ret_cols, rows: ret_rows }) 
+        } else { 
+            Ok(ExecuteResult::Insert { affected_rows: affected }) 
+        }
     }
 
     async fn execute_delete(&self, txn: &mut Transaction, from: &[sqlparser::ast::TableWithJoins], selection: &Option<Expr>, returning: &Option<Vec<SelectItem>>) -> Result<ExecuteResult> {
@@ -726,41 +345,24 @@ impl Executor {
         let rows = self.scan_and_fill(txn, &t, &schema).await?;
         let mut cnt = 0;
         let mut ret_rows = Vec::new();
-        let mut ret_cols = Vec::new();
-        if let Some(items) = returning {
-            for item in items {
-                match item {
-                    SelectItem::UnnamedExpr(Expr::Identifier(id)) => ret_cols.push(id.value.clone()),
-                    SelectItem::ExprWithAlias { alias, .. } => ret_cols.push(alias.value.clone()),
-                    SelectItem::Wildcard(_) => for c in &schema.columns { ret_cols.push(c.name.clone()); },
-                    _ => return Err(anyhow!("Unsupported RETURNING")),
-                }
-            }
-        }
+        let ret_cols = dml::build_returning_columns(returning, &schema)?;
+        
         for r in rows {
             if let Some(ref e) = resolved_selection {
                 if !matches!(eval_expr(e, Some(&r), Some(&schema))?, Value::Boolean(true)) { continue; }
             }
-            if let Some(items) = returning {
-                let mut vals = Vec::new();
-                for item in items {
-                    match item {
-                        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => vals.push(eval_expr(e, Some(&r), Some(&schema))?),
-                        SelectItem::Wildcard(_) => vals.extend(r.values.clone()),
-                        _ => {}
-                    }
-                }
-                ret_rows.push(Row::new(vals));
+            if let Some(ret_row) = dml::eval_returning_row(returning, &r, &schema)? {
+                ret_rows.push(ret_row);
             }
-            let pks = schema.get_pk_values(&r);
-            self.store.delete_by_pk(txn, &t, &pks).await?;
-            for index in &schema.indexes {
-                let idx_values = schema.get_index_values(index, &r);
-                self.store.delete_index_entry(txn, schema.table_id, index.id, &idx_values, &pks, index.unique).await?;
-            }
+            dml::execute_delete_row(&self.store, txn, &t, &schema, &r).await?;
             cnt += 1;
         }
-        if returning.is_some() { Ok(ExecuteResult::Select { columns: ret_cols, rows: ret_rows }) } else { Ok(ExecuteResult::Delete { affected_rows: cnt }) }
+        
+        if returning.is_some() { 
+            Ok(ExecuteResult::Select { columns: ret_cols, rows: ret_rows }) 
+        } else { 
+            Ok(ExecuteResult::Delete { affected_rows: cnt }) 
+        }
     }
 
     async fn execute_update(&self, txn: &mut Transaction, table: &sqlparser::ast::TableWithJoins, assignments: &[Assignment], from: &Option<sqlparser::ast::TableWithJoins>, selection: &Option<Expr>, returning: &Option<Vec<SelectItem>>) -> Result<ExecuteResult> {
@@ -776,13 +378,7 @@ impl Executor {
         } else {
             None
         };
-        let mut indices = Vec::new();
-        for a in assignments {
-            let c = a.id.last().unwrap().value.clone();
-            let idx = schema.column_index(&c).ok_or_else(|| anyhow!("Col not found"))?;
-            if schema.pk_indices.contains(&idx) { return Err(anyhow!("Cannot update PK")); }
-            indices.push(idx);
-        }
+        let indices = dml::validate_update_columns(&schema, assignments)?;
         
         let (from_schema, from_rows, from_alias) = if let Some(from_table) = from {
             let from_name = match &from_table.relation {
@@ -803,43 +399,11 @@ impl Executor {
         let rows = self.scan_and_fill(txn, &t, &schema).await?;
         let mut cnt = 0;
         let mut ret_rows = Vec::new();
-        let mut ret_cols = Vec::new();
-        if let Some(items) = returning {
-            for item in items {
-                match item {
-                    SelectItem::UnnamedExpr(Expr::Identifier(id)) => ret_cols.push(id.value.clone()),
-                    SelectItem::ExprWithAlias { alias, .. } => ret_cols.push(alias.value.clone()),
-                    SelectItem::Wildcard(_) => for c in &schema.columns { ret_cols.push(c.name.clone()); },
-                    _ => return Err(anyhow!("Unsupported RETURNING")),
-                }
-            }
-        }
+        let ret_cols = dml::build_returning_columns(returning, &schema)?;
         
         for r in &rows {
             let matching_from_rows: Vec<&Row> = if let (Some(ref fs), Some(ref fr), Some(ref fa)) = (&from_schema, &from_rows, &from_alias) {
-                let mut combined_col_defs: Vec<ColumnDef> = schema.columns.clone();
-                combined_col_defs.extend(fs.columns.clone());
-                let combined_schema = TableSchema {
-                    name: "joined".to_string(),
-                    table_id: 0,
-                    columns: combined_col_defs,
-                    version: 1,
-                    pk_indices: vec![],
-                    indexes: vec![],
-                };
-                
-                let mut column_offsets: HashMap<String, usize> = HashMap::new();
-                for (i, col) in schema.columns.iter().enumerate() {
-                    column_offsets.insert(format!("{}.{}", table_alias, col.name), i);
-                    column_offsets.insert(col.name.clone(), i);
-                }
-                let offset = schema.columns.len();
-                for (i, col) in fs.columns.iter().enumerate() {
-                    column_offsets.insert(format!("{}.{}", fa, col.name), offset + i);
-                    if !column_offsets.contains_key(&col.name) {
-                        column_offsets.insert(col.name.clone(), offset + i);
-                    }
-                }
+                let (combined_schema, _, column_offsets) = dml::build_update_join_context(&schema, &table_alias, fs, fa, r, &fr[0]);
                 
                 fr.iter().filter(|from_row| {
                     if let Some(ref sel) = resolved_selection {
@@ -870,62 +434,31 @@ impl Executor {
                 continue;
             }
             
-            let eval_row = if let (Some(ref fs), Some(ref fa)) = (&from_schema, &from_alias) {
+            let new_vals = if let (Some(ref fs), Some(ref fa)) = (&from_schema, &from_alias) {
                 if let Some(first_from) = matching_from_rows.first() {
-                    let mut combined_col_defs: Vec<ColumnDef> = schema.columns.clone();
-                    combined_col_defs.extend(fs.columns.clone());
-                    let combined_schema = TableSchema {
-                        name: "joined".to_string(),
-                        table_id: 0,
-                        columns: combined_col_defs,
-                        version: 1,
-                        pk_indices: vec![],
-                        indexes: vec![],
-                    };
-                    let mut combined_values = r.values.clone();
-                    combined_values.extend(first_from.values.clone());
-                    Some((Row::new(combined_values), combined_schema, fa.clone()))
+                    let (combined_schema, combined_row, _) = dml::build_update_join_context(&schema, &table_alias, fs, fa, r, first_from);
+                    dml::compute_update_values(&schema, r, assignments, &indices, Some((&combined_row, &combined_schema)))?
                 } else {
-                    None
+                    dml::compute_update_values(&schema, r, assignments, &indices, None)?
                 }
             } else {
-                None
+                dml::compute_update_values(&schema, r, assignments, &indices, None)?
             };
             
-            let mut vals = r.values.clone();
-            for (i, a) in assignments.iter().enumerate() {
-                let raw_val = if let Some((ref combined_row, ref combined_schema, ref _fa)) = eval_row {
-                    eval_expr(&a.value, Some(combined_row), Some(combined_schema))?
-                } else {
-                    eval_expr(&a.value, Some(r), Some(&schema))?
-                };
-                vals[indices[i]] = coerce_value_for_column(raw_val, &schema.columns[indices[i]])?;
-            }
-            let new_row = Row::new(vals);
-            let pks = schema.get_pk_values(r);
-            for index in &schema.indexes {
-                let old_idx = schema.get_index_values(index, r);
-                self.store.delete_index_entry(txn, schema.table_id, index.id, &old_idx, &pks, index.unique).await?;
-            }
-            self.store.upsert(txn, &t, new_row.clone()).await?;
-            for index in &schema.indexes {
-                let new_idx = schema.get_index_values(index, &new_row);
-                self.store.create_index_entry(txn, schema.table_id, index.id, &new_idx, &pks, index.unique).await?;
-            }
-            if let Some(items) = returning {
-                let mut ret_vals = Vec::new();
-                for item in items {
-                    match item {
-                        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => ret_vals.push(eval_expr(e, Some(&new_row), Some(&schema))?),
-                        SelectItem::Wildcard(_) => ret_vals.extend(new_row.values.clone()),
-                        _ => {}
-                    }
-                }
-                ret_rows.push(Row::new(ret_vals));
+            let new_row = Row::new(new_vals);
+            let updated_row = dml::execute_update_row(&self.store, txn, &t, &schema, r, new_row).await?;
+            
+            if let Some(ret_row) = dml::eval_returning_row(returning, &updated_row, &schema)? {
+                ret_rows.push(ret_row);
             }
             cnt += 1;
         }
-        if returning.is_some() { Ok(ExecuteResult::Select { columns: ret_cols, rows: ret_rows }) } else { Ok(ExecuteResult::Update { affected_rows: cnt }) }
+        
+        if returning.is_some() { 
+            Ok(ExecuteResult::Select { columns: ret_cols, rows: ret_rows }) 
+        } else { 
+            Ok(ExecuteResult::Update { affected_rows: cnt }) 
+        }
     }
 
     async fn execute_query(&self, txn: &mut Transaction, query: &Query) -> Result<ExecuteResult> {
@@ -1041,7 +574,7 @@ impl Executor {
             index_scan_rows.unwrap_or(all_rows_base)
         };
         
-        let mut filtered_rows = if let Some(ref sel) = resolved_selection {
+        let filtered_rows = if let Some(ref sel) = resolved_selection {
             let mut v = Vec::new();
             for r in all_rows {
                 if matches!(eval_expr(sel, Some(&r), Some(&schema))?, Value::Boolean(true)) { v.push(r); }
@@ -1294,91 +827,27 @@ impl Executor {
             let left_result = self.execute_set_expr(txn, left, ctes).await?;
             let right_result = self.execute_set_expr(txn, right, ctes).await?;
 
-        let (left_cols, left_rows) = match left_result {
-            ExecuteResult::Select { columns, rows } => (columns, rows),
-            _ => return Err(anyhow!("Left side of set operation must be SELECT")),
-        };
-        let (right_cols, right_rows) = match right_result {
-            ExecuteResult::Select { columns, rows } => (columns, rows),
-            _ => return Err(anyhow!("Right side of set operation must be SELECT")),
-        };
+            let (left_cols, left_rows) = match left_result {
+                ExecuteResult::Select { columns, rows } => (columns, rows),
+                _ => return Err(anyhow!("Left side of set operation must be SELECT")),
+            };
+            let (right_cols, right_rows) = match right_result {
+                ExecuteResult::Select { columns, rows } => (columns, rows),
+                _ => return Err(anyhow!("Right side of set operation must be SELECT")),
+            };
 
-        if left_cols.len() != right_cols.len() {
-            return Err(anyhow!("Column count mismatch in set operation"));
-        }
-
-        let columns = left_cols;
-        let is_all = matches!(quantifier, SetQuantifier::All);
-
-        let rows = match op {
-            SetOperator::Union => {
-                let mut result = left_rows;
-                if is_all {
-                    result.extend(right_rows);
-                } else {
-                    let existing: std::collections::HashSet<Vec<u8>> = result
-                        .iter()
-                        .map(|r| bincode::serialize(&r.values).unwrap_or_default())
-                        .collect();
-                    for row in right_rows {
-                        let key = bincode::serialize(&row.values).unwrap_or_default();
-                        if !existing.contains(&key) {
-                            result.push(row);
-                        }
-                    }
-                    let mut seen = std::collections::HashSet::new();
-                    result.retain(|r| {
-                        let key = bincode::serialize(&r.values).unwrap_or_default();
-                        seen.insert(key)
-                    });
-                }
-                result
+            if left_cols.len() != right_cols.len() {
+                return Err(anyhow!("Column count mismatch in set operation"));
             }
-            SetOperator::Intersect => {
-                let right_set: std::collections::HashSet<Vec<u8>> = right_rows
-                    .iter()
-                    .map(|r| bincode::serialize(&r.values).unwrap_or_default())
-                    .collect();
-                let mut result: Vec<Row> = left_rows
-                    .into_iter()
-                    .filter(|r| {
-                        let key = bincode::serialize(&r.values).unwrap_or_default();
-                        right_set.contains(&key)
-                    })
-                    .collect();
-                if !is_all {
-                    let mut seen = std::collections::HashSet::new();
-                    result.retain(|r| {
-                        let key = bincode::serialize(&r.values).unwrap_or_default();
-                        seen.insert(key)
-                    });
-                }
-                result
-            }
-            SetOperator::Except => {
-                let right_set: std::collections::HashSet<Vec<u8>> = right_rows
-                    .iter()
-                    .map(|r| bincode::serialize(&r.values).unwrap_or_default())
-                    .collect();
-                let mut result: Vec<Row> = left_rows
-                    .into_iter()
-                    .filter(|r| {
-                        let key = bincode::serialize(&r.values).unwrap_or_default();
-                        !right_set.contains(&key)
-                    })
-                    .collect();
-                if !is_all {
-                    let mut seen = std::collections::HashSet::new();
-                    result.retain(|r| {
-                        let key = bincode::serialize(&r.values).unwrap_or_default();
-                        seen.insert(key)
-                    });
-                }
-                result
-            }
-        };
 
-            Ok(ExecuteResult::Select { columns, rows })
+            let is_all = query::is_set_quantifier_all(quantifier);
+            let rows = match op {
+                SetOperator::Union => query::apply_union(left_rows, right_rows, is_all),
+                SetOperator::Intersect => query::apply_intersect(left_rows, right_rows, is_all),
+                SetOperator::Except => query::apply_except(left_rows, right_rows, is_all),
+            };
+
+            Ok(ExecuteResult::Select { columns: left_cols, rows })
         })
     }
 
@@ -2021,77 +1490,7 @@ impl Executor {
     }
 
     pub fn parse_value_for_copy(&self, val: &str, data_type: &DataType) -> Value {
-        let unescaped = val
-            .replace("\\t", "\t")
-            .replace("\\n", "\n")
-            .replace("\\r", "\r")
-            .replace("\\\\", "\\");
-
-        match data_type {
-            DataType::Boolean => {
-                match unescaped.to_lowercase().as_str() {
-                    "t" | "true" | "1" | "yes" | "on" => Value::Boolean(true),
-                    "f" | "false" | "0" | "no" | "off" => Value::Boolean(false),
-                    _ => Value::Text(unescaped),
-                }
-            }
-            DataType::Int32 => {
-                unescaped.parse::<i32>().map(Value::Int32).unwrap_or(Value::Text(unescaped))
-            }
-            DataType::Int64 => {
-                unescaped.parse::<i64>().map(Value::Int64).unwrap_or(Value::Text(unescaped))
-            }
-            DataType::Float64 => {
-                unescaped.parse::<f64>().map(Value::Float64).unwrap_or(Value::Text(unescaped))
-            }
-            DataType::Timestamp => {
-                if let Ok(ts) = chrono::NaiveDateTime::parse_from_str(&unescaped, "%Y-%m-%d %H:%M:%S%.f") {
-                    Value::Timestamp(ts.and_utc().timestamp_millis())
-                } else if let Ok(ts) = chrono::NaiveDateTime::parse_from_str(&unescaped, "%Y-%m-%d %H:%M:%S") {
-                    Value::Timestamp(ts.and_utc().timestamp_millis())
-                } else if let Ok(d) = chrono::NaiveDate::parse_from_str(&unescaped, "%Y-%m-%d") {
-                    Value::Timestamp(d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis())
-                } else {
-                    Value::Text(unescaped)
-                }
-            }
-            DataType::Uuid => {
-                if let Ok(u) = uuid::Uuid::parse_str(&unescaped) {
-                    Value::Uuid(*u.as_bytes())
-                } else {
-                    Value::Text(unescaped)
-                }
-            }
-            DataType::Bytes => {
-                if unescaped.starts_with("\\x") {
-                    hex::decode(&unescaped[2..]).map(Value::Bytes).unwrap_or(Value::Bytes(unescaped.into_bytes()))
-                } else {
-                    Value::Bytes(unescaped.into_bytes())
-                }
-            }
-            DataType::Text | DataType::Interval => Value::Text(unescaped),
-            DataType::Array(_) => {
-                if let Ok(arr) = parse_pg_array(&unescaped) {
-                    Value::Array(arr)
-                } else {
-                    Value::Text(unescaped)
-                }
-            }
-            DataType::Json => {
-                if serde_json::from_str::<serde_json::Value>(&unescaped).is_ok() {
-                    Value::Json(unescaped)
-                } else {
-                    Value::Text(unescaped)
-                }
-            }
-            DataType::Jsonb => {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&unescaped) {
-                    Value::Jsonb(parsed.to_string())
-                } else {
-                    Value::Text(unescaped)
-                }
-            }
-        }
+        parse_value_for_copy(val, data_type)
     }
 
     pub async fn execute_copy_insert(&self, session: &mut Session, table_name: &str, col_values: Vec<(String, Value)>) -> Result<()> {
@@ -2164,44 +1563,7 @@ impl Executor {
         _connection_limit: &Option<Expr>,
         _valid_until: &Option<Expr>,
     ) -> Result<ExecuteResult> {
-        for name in names {
-            let role_name = name.0.last().ok_or_else(|| anyhow!("Invalid role name"))?.value.clone();
-            
-            if if_not_exists {
-                if self.auth_manager.get_user(txn, &role_name).await?.is_some() {
-                    continue;
-                }
-            }
-
-            let pwd = match password {
-                Some(SqlPassword::Password(expr)) => {
-                    if let Expr::Value(SqlValue::SingleQuotedString(s)) = expr {
-                        s.clone()
-                    } else {
-                        "".to_string()
-                    }
-                }
-                Some(SqlPassword::NullPassword) => "".to_string(),
-                None => "".to_string(),
-            };
-
-            let is_superuser = superuser.unwrap_or(false);
-            let can_login = login.unwrap_or(false);
-
-            let mut user = if is_superuser {
-                User::new_superuser(&role_name, &pwd)
-            } else {
-                User::new(&role_name, &pwd)
-            };
-
-            user.can_login = can_login;
-            user.can_create_db = create_db.unwrap_or(false);
-            user.can_create_role = create_role.unwrap_or(false);
-
-            self.auth_manager.create_user(txn, user).await?;
-        }
-
-        Ok(ExecuteResult::CreateRole)
+        rbac::execute_create_role(&self.auth_manager, txn, names, if_not_exists, login, password, superuser, create_db, create_role).await
     }
 
     async fn execute_alter_role(
@@ -2210,50 +1572,7 @@ impl Executor {
         name: &Ident,
         operation: &AlterRoleOperation,
     ) -> Result<ExecuteResult> {
-        let role_name = name.value.clone();
-        let mut user = self.auth_manager.get_user(txn, &role_name).await?
-            .ok_or_else(|| anyhow!("Role '{}' does not exist", role_name))?;
-
-        match operation {
-            AlterRoleOperation::RenameRole { role_name: new_name } => {
-                self.auth_manager.drop_user(txn, &role_name).await?;
-                user.name = new_name.value.clone();
-                self.auth_manager.create_user(txn, user).await?;
-            }
-            AlterRoleOperation::WithOptions { options } => {
-                for opt in options {
-                    match opt {
-                        sqlparser::ast::RoleOption::SuperUser(v) => user.is_superuser = *v,
-                        sqlparser::ast::RoleOption::CreateDB(v) => user.can_create_db = *v,
-                        sqlparser::ast::RoleOption::CreateRole(v) => user.can_create_role = *v,
-                        sqlparser::ast::RoleOption::Login(v) => user.can_login = *v,
-                        sqlparser::ast::RoleOption::Password(p) => {
-                            if let SqlPassword::Password(expr) = p {
-                                if let Expr::Value(SqlValue::SingleQuotedString(s)) = expr {
-                                    user.set_password(s);
-                                }
-                            }
-                        }
-                        sqlparser::ast::RoleOption::ConnectionLimit(expr) => {
-                            if let Expr::Value(SqlValue::Number(n, _)) = expr {
-                                user.connection_limit = n.parse().unwrap_or(-1);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                self.auth_manager.update_user(txn, user).await?;
-            }
-            AlterRoleOperation::AddMember { member_name } => {
-                self.auth_manager.grant_role_to_user(txn, &member_name.value, &role_name).await?;
-            }
-            AlterRoleOperation::DropMember { member_name } => {
-                self.auth_manager.revoke_role_from_user(txn, &member_name.value, &role_name).await?;
-            }
-            _ => {}
-        }
-
-        Ok(ExecuteResult::AlterRole)
+        rbac::execute_alter_role(&self.auth_manager, txn, name, operation).await
     }
 
     async fn execute_drop_role(
@@ -2262,23 +1581,7 @@ impl Executor {
         names: &[ObjectName],
         if_exists: bool,
     ) -> Result<ExecuteResult> {
-        for name in names {
-            let role_name = name.0.last().ok_or_else(|| anyhow!("Invalid role name"))?.value.clone();
-            
-            let dropped = self.auth_manager.drop_user(txn, &role_name).await?;
-            if !dropped && !if_exists {
-                return Err(anyhow!("Role '{}' does not exist", role_name));
-            }
-            
-            if !dropped {
-                let role_dropped = self.auth_manager.drop_role(txn, &role_name).await?;
-                if !role_dropped && !if_exists {
-                    return Err(anyhow!("Role '{}' does not exist", role_name));
-                }
-            }
-        }
-        
-        Ok(ExecuteResult::DropRole)
+        rbac::execute_drop_role(&self.auth_manager, txn, names, if_exists).await
     }
 
     async fn execute_grant(
@@ -2289,76 +1592,7 @@ impl Executor {
         grantees: &[Ident],
         with_grant_option: bool,
     ) -> Result<ExecuteResult> {
-        let privs = match privileges {
-            Privileges::All { .. } => vec![Privilege::All],
-            Privileges::Actions(actions) => {
-                actions.iter().filter_map(|a| {
-                    match a {
-                        sqlparser::ast::Action::Select { .. } => Some(Privilege::Select),
-                        sqlparser::ast::Action::Insert { .. } => Some(Privilege::Insert),
-                        sqlparser::ast::Action::Update { .. } => Some(Privilege::Update),
-                        sqlparser::ast::Action::Delete { .. } => Some(Privilege::Delete),
-                        sqlparser::ast::Action::Truncate => Some(Privilege::Truncate),
-                        sqlparser::ast::Action::References { .. } => Some(Privilege::References),
-                        sqlparser::ast::Action::Trigger => Some(Privilege::Trigger),
-                        sqlparser::ast::Action::Connect => Some(Privilege::Connect),
-                        sqlparser::ast::Action::Create => Some(Privilege::CreateTable),
-                        sqlparser::ast::Action::Execute => Some(Privilege::Execute),
-                        sqlparser::ast::Action::Usage => Some(Privilege::Usage),
-                        _ => None,
-                    }
-                }).collect()
-            }
-        };
-
-        let obj = match objects {
-            Some(GrantObjects::Tables(tables)) => {
-                if tables.is_empty() {
-                    PrivilegeObject::Global
-                } else {
-                    let table_name = tables[0].0.last()
-                        .map(|i| i.value.clone())
-                        .unwrap_or_default();
-                    PrivilegeObject::table(&table_name)
-                }
-            }
-            Some(GrantObjects::AllTablesInSchema { schemas }) => {
-                let schema = schemas.first()
-                    .map(|s| s.0.last().map(|i| i.value.clone()).unwrap_or("public".to_string()))
-                    .unwrap_or("public".to_string());
-                PrivilegeObject::AllTablesInSchema(schema)
-            }
-            Some(GrantObjects::Schemas(schemas)) => {
-                let schema = schemas.first()
-                    .map(|s| s.0.last().map(|i| i.value.clone()).unwrap_or("public".to_string()))
-                    .unwrap_or("public".to_string());
-                PrivilegeObject::Schema(schema)
-            }
-            _ => PrivilegeObject::Global,
-        };
-
-        for grantee in grantees {
-            let username = grantee.value.clone();
-            if let Some(mut user) = self.auth_manager.get_user(txn, &username).await? {
-                for priv_type in &privs {
-                    user.grant_privilege(priv_type.clone(), obj.clone(), with_grant_option);
-                }
-                self.auth_manager.update_user(txn, user).await?;
-            } else if let Some(mut role) = self.auth_manager.get_role(txn, &username).await? {
-                for priv_type in &privs {
-                    role.privileges.push(crate::auth::GrantedPrivilege {
-                        privilege: priv_type.clone(),
-                        object: obj.clone(),
-                        with_grant_option,
-                    });
-                }
-                self.auth_manager.update_role(txn, role).await?;
-            } else {
-                return Err(anyhow!("Role or user '{}' does not exist", username));
-            }
-        }
-
-        Ok(ExecuteResult::Grant)
+        rbac::execute_grant(&self.auth_manager, txn, privileges, objects, grantees, with_grant_option).await
     }
 
     async fn execute_revoke(
@@ -2368,831 +1602,6 @@ impl Executor {
         objects: &Option<GrantObjects>,
         grantees: &[Ident],
     ) -> Result<ExecuteResult> {
-        let privs: Vec<Privilege> = match privileges {
-            Privileges::All { .. } => vec![Privilege::All],
-            Privileges::Actions(actions) => {
-                actions.iter().filter_map(|a| {
-                    match a {
-                        sqlparser::ast::Action::Select { .. } => Some(Privilege::Select),
-                        sqlparser::ast::Action::Insert { .. } => Some(Privilege::Insert),
-                        sqlparser::ast::Action::Update { .. } => Some(Privilege::Update),
-                        sqlparser::ast::Action::Delete { .. } => Some(Privilege::Delete),
-                        sqlparser::ast::Action::Truncate => Some(Privilege::Truncate),
-                        sqlparser::ast::Action::References { .. } => Some(Privilege::References),
-                        sqlparser::ast::Action::Trigger => Some(Privilege::Trigger),
-                        sqlparser::ast::Action::Connect => Some(Privilege::Connect),
-                        sqlparser::ast::Action::Create => Some(Privilege::CreateTable),
-                        sqlparser::ast::Action::Execute => Some(Privilege::Execute),
-                        sqlparser::ast::Action::Usage => Some(Privilege::Usage),
-                        _ => None,
-                    }
-                }).collect()
-            }
-        };
-
-        let obj = match objects {
-            Some(GrantObjects::Tables(tables)) => {
-                if tables.is_empty() {
-                    PrivilegeObject::Global
-                } else {
-                    let table_name = tables[0].0.last()
-                        .map(|i| i.value.clone())
-                        .unwrap_or_default();
-                    PrivilegeObject::table(&table_name)
-                }
-            }
-            Some(GrantObjects::AllTablesInSchema { schemas }) => {
-                let schema = schemas.first()
-                    .map(|s| s.0.last().map(|i| i.value.clone()).unwrap_or("public".to_string()))
-                    .unwrap_or("public".to_string());
-                PrivilegeObject::AllTablesInSchema(schema)
-            }
-            Some(GrantObjects::Schemas(schemas)) => {
-                let schema = schemas.first()
-                    .map(|s| s.0.last().map(|i| i.value.clone()).unwrap_or("public".to_string()))
-                    .unwrap_or("public".to_string());
-                PrivilegeObject::Schema(schema)
-            }
-            _ => PrivilegeObject::Global,
-        };
-
-        for grantee in grantees {
-            let username = grantee.value.clone();
-            if let Some(mut user) = self.auth_manager.get_user(txn, &username).await? {
-                for priv_type in &privs {
-                    user.revoke_privilege(priv_type, &obj);
-                }
-                self.auth_manager.update_user(txn, user).await?;
-            } else if let Some(mut role) = self.auth_manager.get_role(txn, &username).await? {
-                role.privileges.retain(|p| !privs.contains(&p.privilege) || p.object != obj);
-                self.auth_manager.update_role(txn, role).await?;
-            } else {
-                return Err(anyhow!("Role or user '{}' does not exist", username));
-            }
-        }
-
-        Ok(ExecuteResult::Revoke)
+        rbac::execute_revoke(&self.auth_manager, txn, privileges, objects, grantees).await
     }
-}
-
-fn dedup_rows(rows: Vec<Row>) -> Vec<Row> {
-    use std::collections::HashSet;
-    let mut seen: HashSet<Vec<u8>> = HashSet::new();
-    let mut result = Vec::new();
-    for row in rows {
-        let key = bincode::serialize(&row.values).unwrap_or_default();
-        if seen.insert(key) {
-            result.push(row);
-        }
-    }
-    result
-}
-
-fn coerce_value_for_column(val: Value, col: &crate::types::ColumnDef) -> Result<Value> {
-    match (&val, &col.data_type) {
-        (Value::Null, _) => Ok(Value::Null),
-        (Value::Text(s), DataType::Json) => {
-            serde_json::from_str::<serde_json::Value>(s)
-                .map_err(|e| anyhow!("invalid input syntax for type json: {}", e))?;
-            Ok(Value::Json(s.clone()))
-        }
-        (Value::Text(s), DataType::Jsonb) => {
-            let parsed: serde_json::Value = serde_json::from_str(s)
-                .map_err(|e| anyhow!("invalid input syntax for type jsonb: {}", e))?;
-            Ok(Value::Jsonb(parsed.to_string()))
-        }
-        (Value::Json(s), DataType::Json) => Ok(Value::Json(s.clone())),
-        (Value::Json(s), DataType::Jsonb) => {
-            let parsed: serde_json::Value = serde_json::from_str(s)
-                .map_err(|e| anyhow!("invalid input syntax for type jsonb: {}", e))?;
-            Ok(Value::Jsonb(parsed.to_string()))
-        }
-        (Value::Jsonb(s), DataType::Json) => Ok(Value::Json(s.clone())),
-        (Value::Jsonb(s), DataType::Jsonb) => Ok(Value::Jsonb(s.clone())),
-        _ => Ok(val),
-    }
-}
-
-struct WindowFuncInfo {
-    proj_idx: usize,
-    func_name: String,
-    arg_expr: Option<Expr>,
-    partition_by: Vec<Expr>,
-    order_by: Vec<OrderByExpr>,
-    offset_expr: Option<Expr>,
-    default_value_expr: Option<Expr>,
-}
-
-fn extract_window_functions(projection: &[SelectItem]) -> Vec<WindowFuncInfo> {
-    let mut result = Vec::new();
-    for (idx, item) in projection.iter().enumerate() {
-        let func = match item {
-            SelectItem::UnnamedExpr(Expr::Function(f)) => Some(f),
-            SelectItem::ExprWithAlias { expr: Expr::Function(f), .. } => Some(f),
-            _ => None,
-        };
-        if let Some(f) = func {
-            if let Some(WindowType::WindowSpec(spec)) = &f.over {
-                let func_name = f.name.0.last().map(|i| i.value.to_lowercase()).unwrap_or_default();
-                let extract_arg = |index: usize| -> Option<Expr> {
-                    f.args.get(index).and_then(|a| match a {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e.clone()),
-                        _ => None,
-                    })
-                };
-                let arg_expr = extract_arg(0);
-                let offset_expr = extract_arg(1);
-                let default_value_expr = extract_arg(2);
-                result.push(WindowFuncInfo {
-                    proj_idx: idx,
-                    func_name,
-                    arg_expr,
-                    partition_by: spec.partition_by.clone(),
-                    order_by: spec.order_by.clone(),
-                    offset_expr,
-                    default_value_expr,
-                });
-            }
-        }
-    }
-    result
-}
-
-fn compute_window_functions(
-    rows: &[Row],
-    schema: &TableSchema,
-    window_funcs: &[WindowFuncInfo],
-) -> Result<Vec<Vec<Value>>> {
-    let mut results: Vec<Vec<Value>> = vec![vec![Value::Null; window_funcs.len()]; rows.len()];
-    
-    for (wf_idx, wf) in window_funcs.iter().enumerate() {
-        let mut partitions: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
-        for (row_idx, row) in rows.iter().enumerate() {
-            let mut key = Vec::new();
-            for expr in &wf.partition_by {
-                key.push(eval_expr(expr, Some(row), Some(schema))?);
-            }
-            let key_bytes = bincode::serialize(&key).unwrap_or_default();
-            partitions.entry(key_bytes).or_default().push(row_idx);
-        }
-        
-        for (_partition_key, mut row_indices) in partitions {
-            if !wf.order_by.is_empty() {
-                row_indices.sort_by(|&a, &b| {
-                    for order_expr in &wf.order_by {
-                        let val_a = eval_expr(&order_expr.expr, Some(&rows[a]), Some(schema)).unwrap_or(Value::Null);
-                        let val_b = eval_expr(&order_expr.expr, Some(&rows[b]), Some(schema)).unwrap_or(Value::Null);
-                        let cmp = super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
-                        if cmp != 0 {
-                            let asc = order_expr.asc.unwrap_or(true);
-                            return if asc { 
-                                if cmp > 0 { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less } 
-                            } else { 
-                                if cmp > 0 { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater } 
-                            };
-                        }
-                    }
-                    std::cmp::Ordering::Equal
-                });
-            }
-            
-            match wf.func_name.as_str() {
-                "row_number" => {
-                    for (pos, &row_idx) in row_indices.iter().enumerate() {
-                        results[row_idx][wf_idx] = Value::Int64((pos + 1) as i64);
-                    }
-                }
-                "rank" => {
-                    let mut current_rank = 1i64;
-                    let mut prev_values: Option<Vec<Value>> = None;
-                    for (pos, &row_idx) in row_indices.iter().enumerate() {
-                        let current_values: Vec<Value> = wf.order_by.iter()
-                            .map(|o| eval_expr(&o.expr, Some(&rows[row_idx]), Some(schema)).unwrap_or(Value::Null))
-                            .collect();
-                        if let Some(prev) = &prev_values {
-                            if prev != &current_values {
-                                current_rank = (pos + 1) as i64;
-                            }
-                        }
-                        results[row_idx][wf_idx] = Value::Int64(current_rank);
-                        prev_values = Some(current_values);
-                    }
-                }
-                "dense_rank" => {
-                    let mut current_rank = 1i64;
-                    let mut prev_values: Option<Vec<Value>> = None;
-                    for &row_idx in &row_indices {
-                        let current_values: Vec<Value> = wf.order_by.iter()
-                            .map(|o| eval_expr(&o.expr, Some(&rows[row_idx]), Some(schema)).unwrap_or(Value::Null))
-                            .collect();
-                        if let Some(prev) = &prev_values {
-                            if prev != &current_values {
-                                current_rank += 1;
-                            }
-                        }
-                        results[row_idx][wf_idx] = Value::Int64(current_rank);
-                        prev_values = Some(current_values);
-                    }
-                }
-                "sum" => {
-                    if wf.order_by.is_empty() {
-                        let mut total = 0.0f64;
-                        for &row_idx in &row_indices {
-                            if let Some(ref arg) = wf.arg_expr {
-                                let val = eval_expr(arg, Some(&rows[row_idx]), Some(schema))?;
-                                match val {
-                                    Value::Int32(n) => total += n as f64,
-                                    Value::Int64(n) => total += n as f64,
-                                    Value::Float64(n) => total += n,
-                                    _ => {}
-                                }
-                            }
-                        }
-                        for &row_idx in &row_indices {
-                            results[row_idx][wf_idx] = Value::Float64(total);
-                        }
-                    } else {
-                        let mut running_sum = 0.0f64;
-                        for &row_idx in &row_indices {
-                            if let Some(ref arg) = wf.arg_expr {
-                                let val = eval_expr(arg, Some(&rows[row_idx]), Some(schema))?;
-                                match val {
-                                    Value::Int32(n) => running_sum += n as f64,
-                                    Value::Int64(n) => running_sum += n as f64,
-                                    Value::Float64(n) => running_sum += n,
-                                    _ => {}
-                                }
-                            }
-                            results[row_idx][wf_idx] = Value::Float64(running_sum);
-                        }
-                    }
-                }
-                "count" => {
-                    if wf.order_by.is_empty() {
-                        let total = row_indices.len() as i64;
-                        for &row_idx in &row_indices {
-                            results[row_idx][wf_idx] = Value::Int64(total);
-                        }
-                    } else {
-                        let mut running_count = 0i64;
-                        for &row_idx in &row_indices {
-                            running_count += 1;
-                            results[row_idx][wf_idx] = Value::Int64(running_count);
-                        }
-                    }
-                }
-                "avg" => {
-                    if wf.order_by.is_empty() {
-                        let mut total_sum = 0.0f64;
-                        let mut total_count = 0i64;
-                        for &row_idx in &row_indices {
-                            if let Some(ref arg) = wf.arg_expr {
-                                let val = eval_expr(arg, Some(&rows[row_idx]), Some(schema))?;
-                                match val {
-                                    Value::Int32(n) => { total_sum += n as f64; total_count += 1; }
-                                    Value::Int64(n) => { total_sum += n as f64; total_count += 1; }
-                                    Value::Float64(n) => { total_sum += n; total_count += 1; }
-                                    Value::Null => {}
-                                    _ => { total_count += 1; }
-                                }
-                            }
-                        }
-                        let avg_val = if total_count > 0 { Value::Float64(total_sum / total_count as f64) } else { Value::Null };
-                        for &row_idx in &row_indices {
-                            results[row_idx][wf_idx] = avg_val.clone();
-                        }
-                    } else {
-                        let mut running_sum = 0.0f64;
-                        let mut running_count = 0i64;
-                        for &row_idx in &row_indices {
-                            if let Some(ref arg) = wf.arg_expr {
-                                let val = eval_expr(arg, Some(&rows[row_idx]), Some(schema))?;
-                                match val {
-                                    Value::Int32(n) => { running_sum += n as f64; running_count += 1; }
-                                    Value::Int64(n) => { running_sum += n as f64; running_count += 1; }
-                                    Value::Float64(n) => { running_sum += n; running_count += 1; }
-                                    Value::Null => {}
-                                    _ => { running_count += 1; }
-                                }
-                            }
-                            results[row_idx][wf_idx] = if running_count > 0 {
-                                Value::Float64(running_sum / running_count as f64)
-                            } else {
-                                Value::Null
-                            };
-                        }
-                    }
-                }
-                "min" => {
-                    let mut min_val: Option<Value> = None;
-                    for &row_idx in &row_indices {
-                        if let Some(ref arg) = wf.arg_expr {
-                            let val = eval_expr(arg, Some(&rows[row_idx]), Some(schema))?;
-                            if !matches!(val, Value::Null) {
-                                min_val = Some(match &min_val {
-                                    None => val.clone(),
-                                    Some(m) => if super::expr::compare_values(&val, m).unwrap_or(0) < 0 { val.clone() } else { m.clone() },
-                                });
-                            }
-                        }
-                        if !wf.order_by.is_empty() {
-                            results[row_idx][wf_idx] = min_val.clone().unwrap_or(Value::Null);
-                        }
-                    }
-                    if wf.order_by.is_empty() {
-                        let final_min = min_val.unwrap_or(Value::Null);
-                        for &row_idx in &row_indices {
-                            results[row_idx][wf_idx] = final_min.clone();
-                        }
-                    }
-                }
-                "max" => {
-                    let mut max_val: Option<Value> = None;
-                    for &row_idx in &row_indices {
-                        if let Some(ref arg) = wf.arg_expr {
-                            let val = eval_expr(arg, Some(&rows[row_idx]), Some(schema))?;
-                            if !matches!(val, Value::Null) {
-                                max_val = Some(match &max_val {
-                                    None => val.clone(),
-                                    Some(m) => if super::expr::compare_values(&val, m).unwrap_or(0) > 0 { val.clone() } else { m.clone() },
-                                });
-                            }
-                        }
-                        if !wf.order_by.is_empty() {
-                            results[row_idx][wf_idx] = max_val.clone().unwrap_or(Value::Null);
-                        }
-                    }
-                    if wf.order_by.is_empty() {
-                        let final_max = max_val.unwrap_or(Value::Null);
-                        for &row_idx in &row_indices {
-                            results[row_idx][wf_idx] = final_max.clone();
-                        }
-                    }
-                }
-                "lag" => {
-                    let offset = wf.offset_expr.as_ref()
-                        .and_then(|e| match e {
-                            Expr::Value(SqlValue::Number(n, _)) => n.parse::<usize>().ok(),
-                            _ => None,
-                        })
-                        .unwrap_or(1);
-                    let default_val = wf.default_value_expr.as_ref()
-                        .map(|e| eval_expr(e, None, None).unwrap_or(Value::Null))
-                        .unwrap_or(Value::Null);
-                    
-                    for (pos, &row_idx) in row_indices.iter().enumerate() {
-                        let val = if pos >= offset {
-                            let lag_row_idx = row_indices[pos - offset];
-                            if let Some(ref arg) = wf.arg_expr {
-                                eval_expr(arg, Some(&rows[lag_row_idx]), Some(schema))?
-                            } else {
-                                Value::Null
-                            }
-                        } else {
-                            default_val.clone()
-                        };
-                        results[row_idx][wf_idx] = val;
-                    }
-                }
-                "lead" => {
-                    let offset = wf.offset_expr.as_ref()
-                        .and_then(|e| match e {
-                            Expr::Value(SqlValue::Number(n, _)) => n.parse::<usize>().ok(),
-                            _ => None,
-                        })
-                        .unwrap_or(1);
-                    let default_val = wf.default_value_expr.as_ref()
-                        .map(|e| eval_expr(e, None, None).unwrap_or(Value::Null))
-                        .unwrap_or(Value::Null);
-                    
-                    for (pos, &row_idx) in row_indices.iter().enumerate() {
-                        let val = if pos + offset < row_indices.len() {
-                            let lead_row_idx = row_indices[pos + offset];
-                            if let Some(ref arg) = wf.arg_expr {
-                                eval_expr(arg, Some(&rows[lead_row_idx]), Some(schema))?
-                            } else {
-                                Value::Null
-                            }
-                        } else {
-                            default_val.clone()
-                        };
-                        results[row_idx][wf_idx] = val;
-                    }
-                }
-                _ => {
-                    return Err(anyhow!("Unsupported window function: {}", wf.func_name));
-                }
-            }
-        }
-    }
-    
-    Ok(results)
-}
-
-fn value_to_sql_expr(v: &Value) -> Expr {
-    match v {
-        Value::Null => Expr::Value(SqlValue::Null),
-        Value::Boolean(b) => Expr::Value(SqlValue::Boolean(*b)),
-        Value::Int32(i) => Expr::Value(SqlValue::Number(i.to_string(), false)),
-        Value::Int64(i) => Expr::Value(SqlValue::Number(i.to_string(), false)),
-        Value::Float64(f) => Expr::Value(SqlValue::Number(f.to_string(), false)),
-        Value::Text(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
-        Value::Bytes(b) => Expr::Value(SqlValue::SingleQuotedString(format!("\\x{}", hex::encode(b)))),
-        Value::Timestamp(ts) => Expr::Value(SqlValue::Number(ts.to_string(), false)),
-        Value::Interval(ms) => Expr::Value(SqlValue::Number(ms.to_string(), false)),
-        Value::Uuid(bytes) => {
-            let uuid = uuid::Uuid::from_bytes(*bytes);
-            Expr::Value(SqlValue::SingleQuotedString(uuid.to_string()))
-        }
-        Value::Array(elems) => {
-            let elem_exprs: Vec<Expr> = elems.iter().map(value_to_sql_expr).collect();
-            Expr::Array(sqlparser::ast::Array {
-                elem: elem_exprs,
-                named: true,
-            })
-        }
-        Value::Json(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
-        Value::Jsonb(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
-    }
-}
-
-fn parse_pg_array(s: &str) -> Result<Vec<Value>> {
-    let s = s.trim();
-    if !s.starts_with('{') || !s.ends_with('}') {
-        return Err(anyhow!("Invalid array format"));
-    }
-
-    let inner = &s[1..s.len() - 1];
-    if inner.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut result = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    let mut escape_next = false;
-
-    for c in inner.chars() {
-        if escape_next {
-            current.push(c);
-            escape_next = false;
-            continue;
-        }
-
-        match c {
-            '\\' => escape_next = true,
-            '"' => in_quotes = !in_quotes,
-            ',' if !in_quotes => {
-                let val = parse_array_element(&current);
-                result.push(val);
-                current.clear();
-            }
-            _ => current.push(c),
-        }
-    }
-
-    if !current.is_empty() || inner.ends_with(',') {
-        let val = parse_array_element(&current);
-        result.push(val);
-    }
-
-    Ok(result)
-}
-
-fn parse_array_element(s: &str) -> Value {
-    let s = s.trim();
-    if s.eq_ignore_ascii_case("NULL") {
-        return Value::Null;
-    }
-
-    if let Ok(i) = s.parse::<i32>() {
-        return Value::Int32(i);
-    }
-    if let Ok(i) = s.parse::<i64>() {
-        return Value::Int64(i);
-    }
-    if let Ok(f) = s.parse::<f64>() {
-        return Value::Float64(f);
-    }
-    if s.eq_ignore_ascii_case("true") {
-        return Value::Boolean(true);
-    }
-    if s.eq_ignore_ascii_case("false") {
-        return Value::Boolean(false);
-    }
-
-    Value::Text(s.to_string())
-}
-
-fn get_select_item_name(item: &SelectItem) -> String {
-    match item {
-        SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
-        SelectItem::UnnamedExpr(expr) => get_expr_name(expr),
-        SelectItem::Wildcard(_) => "*".to_string(),
-        _ => "?column?".to_string(),
-    }
-}
-
-fn get_expr_name(expr: &Expr) -> String {
-    match expr {
-        Expr::Identifier(id) => id.value.clone(),
-        Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()).unwrap_or_else(|| "?column?".to_string()),
-        Expr::Function(f) => f.name.to_string().to_lowercase(),
-        _ => "?column?".to_string(),
-    }
-}
-
-fn fill_row_defaults(row: &mut Row, schema: &TableSchema) -> Result<()> {
-    if row.values.len() < schema.columns.len() {
-        for i in row.values.len()..schema.columns.len() {
-            let col = &schema.columns[i];
-            let val = if let Some(expr_str) = &col.default_expr {
-                eval_default_expr(expr_str)?
-            } else { Value::Null };
-            row.values.push(val);
-        }
-    }
-    Ok(())
-}
-
-fn eval_default_expr(expr_str: &str) -> Result<Value> {
-    use sqlparser::dialect::PostgreSqlDialect;
-    use sqlparser::parser::Parser;
-    
-    let sql = format!("SELECT {}", expr_str);
-    let dialect = PostgreSqlDialect {};
-    let ast = Parser::parse_sql(&dialect, &sql)
-        .map_err(|e| anyhow!("Failed to parse default expr: {}", e))?;
-    
-    if let Some(sqlparser::ast::Statement::Query(q)) = ast.into_iter().next() {
-        if let sqlparser::ast::SetExpr::Select(s) = *q.body {
-            if let Some(sqlparser::ast::SelectItem::UnnamedExpr(e)) = s.projection.into_iter().next() {
-                return eval_expr(&e, None, None);
-            }
-        }
-    }
-    Ok(Value::Text(expr_str.to_string()))
-}
-
-fn is_serial_type(sql_type: &SqlDataType) -> bool {
-    match sql_type {
-        SqlDataType::Custom(name, _) => {
-             if let Some(ident) = name.0.last() { ident.value.eq_ignore_ascii_case("SERIAL") } else { false }
-        }
-        _ => false,
-    }
-}
-
-fn convert_data_type(sql_type: &SqlDataType) -> Result<DataType> {
-    match sql_type {
-        SqlDataType::Boolean => Ok(DataType::Boolean),
-        SqlDataType::SmallInt(_) | SqlDataType::Int(_) | SqlDataType::Integer(_) => Ok(DataType::Int32),
-        SqlDataType::BigInt(_) => Ok(DataType::Int64),
-        SqlDataType::Float(_) | SqlDataType::Double | SqlDataType::Real | SqlDataType::Numeric(_) | SqlDataType::Decimal(_) => Ok(DataType::Float64),
-        SqlDataType::Varchar(_) | SqlDataType::Text | SqlDataType::String(_) | SqlDataType::Char(_) | SqlDataType::Character(_) | SqlDataType::CharacterVarying(_) => Ok(DataType::Text),
-        SqlDataType::Bytea => Ok(DataType::Bytes),
-        SqlDataType::Timestamp(_, _) => Ok(DataType::Timestamp),
-        SqlDataType::Date => Ok(DataType::Timestamp),
-        SqlDataType::Uuid => Ok(DataType::Uuid),
-        SqlDataType::Custom(name, _) => {
-            if let Some(ident) = name.0.last() {
-                let type_name = ident.value.to_uppercase();
-                match type_name.as_str() {
-                    "SERIAL" => Ok(DataType::Int32),
-                    "BIGSERIAL" => Ok(DataType::Int64),
-                    "JSON" => Ok(DataType::Json),
-                    "JSONB" => Ok(DataType::Jsonb),
-                    _ => Ok(DataType::Text)
-                }
-            } else {
-                Ok(DataType::Text)
-            }
-        }
-        SqlDataType::Array(inner) => {
-            match inner {
-                sqlparser::ast::ArrayElemTypeDef::AngleBracket(inner_type) => convert_data_type(inner_type),
-                sqlparser::ast::ArrayElemTypeDef::SquareBracket(inner_type) => convert_data_type(inner_type),
-                _ => Ok(DataType::Text),
-            }
-        }
-        _ => Err(anyhow!("Unsupported data type: {:?}", sql_type)),
-    }
-}
-
-fn extract_eq_conditions(expr: &Expr, index_cols: &[String]) -> Option<Vec<Value>> {
-    let mut values = vec![None; index_cols.len()];
-    extract_conditions_recursive(expr, index_cols, &mut values);
-
-    if values.iter().all(|v| v.is_some()) {
-        Some(values.into_iter().map(|v| v.unwrap()).collect())
-    } else {
-        None
-    }
-}
-
-fn extract_conditions_recursive(expr: &Expr, index_cols: &[String], values: &mut Vec<Option<Value>>) {
-    match expr {
-        Expr::BinaryOp { left, op, right } => {
-            match op {
-                BinaryOperator::And => {
-                    extract_conditions_recursive(left, index_cols, values);
-                    extract_conditions_recursive(right, index_cols, values);
-                }
-                BinaryOperator::Eq => {
-                    if let Expr::Identifier(ident) = &**left {
-                        if let Some(idx) = index_cols.iter().position(|c| c == &ident.value) {
-                            if let Ok(val) = eval_expr(right, None, None) {
-                                values[idx] = Some(val);
-                            }
-                        }
-                    } else if let Expr::Identifier(ident) = &**right {
-                        if let Some(idx) = index_cols.iter().position(|c| c == &ident.value) {
-                            if let Ok(val) = eval_expr(left, None, None) {
-                                values[idx] = Some(val);
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        Expr::Nested(e) => extract_conditions_recursive(e, index_cols, values),
-        _ => {}
-    }
-}
-
-fn collect_having_agg_funcs(expr: &Expr, agg_funcs: &mut Vec<(usize, sqlparser::ast::Function)>, extra_start: usize) {
-    debug!("collect_having_agg_funcs called with expr: {:?}", expr);
-    match expr {
-        Expr::Function(f) if f.over.is_none() => {
-            let func_name = f.name.0.last().map(|i| i.value.to_uppercase()).unwrap_or_default();
-            debug!("Found function in HAVING: {}", func_name);
-            if matches!(func_name.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
-                let already_exists = agg_funcs.iter().any(|(_, existing)| {
-                    let existing_name = existing.name.0.last().map(|n| n.value.to_uppercase()).unwrap_or_default();
-                    existing_name == func_name && args_match(f, existing)
-                });
-                debug!("Already exists: {}, agg_funcs len: {}", already_exists, agg_funcs.len());
-                if !already_exists {
-                    let new_idx = extra_start + (agg_funcs.len() - agg_funcs.iter().filter(|(idx, _)| *idx < extra_start).count());
-                    debug!("Adding new agg func at index {}", new_idx);
-                    agg_funcs.push((new_idx, f.clone()));
-                }
-            }
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            collect_having_agg_funcs(left, agg_funcs, extra_start);
-            collect_having_agg_funcs(right, agg_funcs, extra_start);
-        }
-        Expr::Nested(e) => collect_having_agg_funcs(e, agg_funcs, extra_start),
-        _ => {
-            debug!("Other expr type in HAVING: {:?}", expr);
-        }
-    }
-}
-
-fn eval_having_expr(
-    expr: &Expr,
-    row: &Row,
-    schema: &TableSchema,
-    agg_funcs: &[(usize, sqlparser::ast::Function)],
-    aggs: &[Aggregator],
-) -> Result<Value> {
-    match expr {
-        Expr::BinaryOp { left, op, right } => {
-            let left_val = eval_having_expr(left, row, schema, agg_funcs, aggs)?;
-            let right_val = eval_having_expr(right, row, schema, agg_funcs, aggs)?;
-            super::expr::eval_binary_op_public(left_val, op, right_val)
-        }
-        Expr::Function(f) => {
-            let func_name = f.name.0.last().map(|i| i.value.to_uppercase()).unwrap_or_default();
-            for (i, (_, agg_f)) in agg_funcs.iter().enumerate() {
-                let agg_name = agg_f.name.0.last().map(|n| n.value.to_uppercase()).unwrap_or_default();
-                if agg_name == func_name && args_match(f, agg_f) {
-                    return Ok(aggs[i].result());
-                }
-            }
-            let mut temp_agg = Aggregator::new(&func_name)?;
-            let arg_expr = if f.args.is_empty() { None } else {
-                match &f.args[0] {
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
-                    _ => None
-                }
-            };
-            if let Some(e) = arg_expr {
-                let val = eval_expr(e, Some(row), Some(schema))?;
-                temp_agg.update(&val)?;
-            } else {
-                temp_agg.update(&Value::Int32(1))?;
-            }
-            Ok(temp_agg.result())
-        }
-        Expr::Nested(e) => eval_having_expr(e, row, schema, agg_funcs, aggs),
-        Expr::Value(v) => super::expr::eval_value_public(v),
-        _ => eval_expr(expr, Some(row), Some(schema)),
-    }
-}
-
-fn args_match(f1: &sqlparser::ast::Function, f2: &sqlparser::ast::Function) -> bool {
-    if f1.args.len() != f2.args.len() {
-        return false;
-    }
-    for (a1, a2) in f1.args.iter().zip(f2.args.iter()) {
-        match (a1, a2) {
-            (FunctionArg::Unnamed(FunctionArgExpr::Wildcard), FunctionArg::Unnamed(FunctionArgExpr::Wildcard)) => {}
-            (FunctionArg::Unnamed(FunctionArgExpr::Expr(e1)), FunctionArg::Unnamed(FunctionArgExpr::Expr(e2))) => {
-                if format!("{:?}", e1) != format!("{:?}", e2) {
-                    return false;
-                }
-            }
-            _ => return false,
-        }
-    }
-    true
-}
-
-fn eval_having_expr_join(
-    expr: &Expr,
-    ctx: &JoinContext,
-    agg_funcs: &[(usize, sqlparser::ast::Function)],
-    aggs: &[Aggregator],
-) -> Result<Value> {
-    match expr {
-        Expr::BinaryOp { left, op, right } => {
-            let left_val = eval_having_expr_join(left, ctx, agg_funcs, aggs)?;
-            let right_val = eval_having_expr_join(right, ctx, agg_funcs, aggs)?;
-            super::expr::eval_binary_op_public(left_val, op, right_val)
-        }
-        Expr::Function(f) => {
-            let func_name = f.name.0.last().map(|i| i.value.to_uppercase()).unwrap_or_default();
-            for (i, (_, agg_f)) in agg_funcs.iter().enumerate() {
-                let agg_name = agg_f.name.0.last().map(|n| n.value.to_uppercase()).unwrap_or_default();
-                if agg_name == func_name && args_match(f, agg_f) {
-                    return Ok(aggs[i].result());
-                }
-            }
-            let mut temp_agg = Aggregator::new(&func_name)?;
-            let arg_expr = if f.args.is_empty() { None } else {
-                match &f.args[0] {
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
-                    _ => None
-                }
-            };
-            if let Some(e) = arg_expr {
-                let val = eval_expr_join(e, ctx)?;
-                temp_agg.update(&val)?;
-            } else {
-                temp_agg.update(&Value::Int32(1))?;
-            }
-            Ok(temp_agg.result())
-        }
-        Expr::Nested(e) => eval_having_expr_join(e, ctx, agg_funcs, aggs),
-        Expr::Value(v) => super::expr::eval_value_public(v),
-        _ => eval_expr_join(expr, ctx),
-    }
-}
-
-fn infer_data_type(value: &Value) -> DataType {
-    match value {
-        Value::Int32(_) => DataType::Int32,
-        Value::Int64(_) => DataType::Int64,
-        Value::Float64(_) => DataType::Float64,
-        Value::Boolean(_) => DataType::Boolean,
-        Value::Text(_) => DataType::Text,
-        Value::Bytes(_) => DataType::Bytes,
-        Value::Timestamp(_) => DataType::Timestamp,
-        Value::Interval { .. } => DataType::Interval,
-        Value::Uuid(_) => DataType::Uuid,
-        Value::Json(_) => DataType::Json,
-        Value::Jsonb(_) => DataType::Jsonb,
-        Value::Array(_) => DataType::Text,
-        Value::Null => DataType::Text,
-    }
-}
-
-fn get_skip_reason(sql_upper: &str) -> Option<String> {
-    if sql_upper.starts_with("DROP DATABASE") { return Some("DROP DATABASE not supported".into()); }
-    if sql_upper.starts_with("CREATE DATABASE") { return Some("CREATE DATABASE not supported".into()); }
-    if sql_upper.starts_with("ALTER DATABASE") { return Some("ALTER DATABASE not supported".into()); }
-    if sql_upper.starts_with("\\") { return Some("psql meta-command not supported".into()); }
-    if sql_upper.starts_with("COPY ") || sql_upper.contains(" FROM STDIN") { return Some("COPY not supported".into()); }
-    None
-}
-
-fn get_unsupported_reason(sql_upper: &str) -> Option<String> {
-    if sql_upper.starts_with("CREATE TRIGGER") { return Some("CREATE TRIGGER not supported".into()); }
-    if sql_upper.starts_with("CREATE DOMAIN") { return Some("CREATE DOMAIN not supported".into()); }
-    if sql_upper.starts_with("CREATE AGGREGATE") { return Some("CREATE AGGREGATE not supported".into()); }
-    if sql_upper.starts_with("ALTER TYPE") { return Some("ALTER TYPE not supported".into()); }
-    if sql_upper.starts_with("ALTER DOMAIN") { return Some("ALTER DOMAIN not supported".into()); }
-    if sql_upper.starts_with("ALTER AGGREGATE") { return Some("ALTER AGGREGATE not supported".into()); }
-    if sql_upper.starts_with("ALTER FUNCTION") { return Some("ALTER FUNCTION not supported".into()); }
-    if sql_upper.starts_with("ALTER SEQUENCE") { return Some("ALTER SEQUENCE not supported".into()); }
-    if sql_upper.starts_with("ALTER TABLE") && sql_upper.contains("OWNER TO") { return Some("ALTER TABLE OWNER TO not supported".into()); }
-    if sql_upper.starts_with("CREATE TYPE") && sql_upper.contains("AS ENUM") { return Some("CREATE TYPE AS ENUM not supported".into()); }
-    if sql_upper.starts_with("CREATE TYPE") && sql_upper.contains("AS (") { return Some("CREATE TYPE AS composite not supported".into()); }
-    if sql_upper.contains("$_$") || sql_upper.contains("$$") { return Some("Dollar-quoted strings not supported".into()); }
-    if sql_upper.starts_with("CREATE SEQUENCE") && sql_upper.contains("INCREMENT") { return Some("CREATE SEQUENCE not supported".into()); }
-    if sql_upper.starts_with("CREATE INDEX") && sql_upper.contains("USING GIST") { return Some("GIST index not supported".into()); }
-    None
 }
