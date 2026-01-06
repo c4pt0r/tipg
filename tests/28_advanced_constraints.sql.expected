@@ -1,0 +1,117 @@
+psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:1: NOTICE:  table "unique_test" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:14: ERROR:  duplicate key value violates unique constraint "unique_test_email_key"
+DETAIL:  Key (email)=(alice@example.com) already exists.
+psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:15: ERROR:  duplicate key value violates unique constraint "unique_username"
+DETAIL:  Key (username)=(alice) already exists.
+psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:16: ERROR:  duplicate key value violates unique constraint "unique_code"
+DETAIL:  Key (code)=(100) already exists.
+INSERT 0 1
+INSERT 0 1
+ id |       email       | username | code 
+----+-------------------+----------+------
+  1 | alice@example.com | alice    |  100
+  2 | bob@example.com   | bob      |  200
+  6 |                   | eve      |  600
+  7 |                   | frank    |  700
+(4 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:22: ERROR:  duplicate key value violates unique constraint "unique_test_email_key"
+DETAIL:  Key (email)=(bob@example.com) already exists.
+ id |       email       | username | code 
+----+-------------------+----------+------
+  1 | alice@example.com | alice    |  100
+  2 | bob@example.com   | bob      |  200
+  6 |                   | eve      |  600
+  7 |                   | frank    |  700
+(4 rows)
+
+DROP TABLE
+psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:28: NOTICE:  table "default_test" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+ id | name  | status  | counter | is_active | price 
+----+-------+---------+---------+-----------+-------
+  1 | test1 | pending |       0 | t         |  9.99
+  2 | test2 | active  |      10 | t         |  9.99
+  3 | test3 |         |       0 | t         |  9.99
+(3 rows)
+
+DROP TABLE
+psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:48: NOTICE:  table "orders" does not exist, skipping
+DROP TABLE
+psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:49: NOTICE:  table "customers" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:68: ERROR:  insert or update on table "orders" violates foreign key constraint "orders_customer_id_fkey"
+DETAIL:  Key (customer_id)=(999) is not present in table "customers".
+INSERT 0 1
+ id  | customer_id | name  | amount 
+-----+-------------+-------+--------
+ 101 |           1 | Alice |  99.99
+ 102 |           2 | Bob   |  149.5
+ 104 |             |       |     25
+(3 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:76: ERROR:  update or delete on table "customers" violates foreign key constraint "orders_customer_id_fkey" on table "orders"
+DETAIL:  Key (id)=(1) is still referenced from table "orders".
+psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:77: ERROR:  update or delete on table "customers" violates foreign key constraint "orders_customer_id_fkey" on table "orders"
+DETAIL:  Key (id)=(1) is still referenced from table "orders".
+ id | name  |       email       
+----+-------+-------------------
+  1 | Alice | alice@example.com
+  2 | Bob   | bob@example.com
+(2 rows)
+
+DROP TABLE
+DROP TABLE
+psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:84: NOTICE:  table "order_items" does not exist, skipping
+DROP TABLE
+psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:85: NOTICE:  table "orders_cascade" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+CREATE TABLE
+INSERT 0 2
+INSERT 0 3
+ id  | order_id |  product  
+-----+----------+-----------
+ 101 |        1 | Widget
+ 102 |        1 | Gadget
+ 103 |        2 | Doohickey
+(3 rows)
+
+DELETE 1
+ id  | order_id |  product  
+-----+----------+-----------
+ 103 |        2 | Doohickey
+(1 row)
+
+DROP TABLE
+DROP TABLE
+psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:111: NOTICE:  table "composite_unique" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:123: ERROR:  duplicate key value violates unique constraint "unique_dept_empno"
+DETAIL:  Key (dept, employee_no)=(Sales, 100) already exists.
+ id |    dept     | employee_no 
+----+-------------+-------------
+  1 | Sales       |         100
+  2 | Engineering |         100
+  3 | Sales       |         200
+(3 rows)
+
+DROP TABLE
