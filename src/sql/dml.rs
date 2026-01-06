@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Assignment, Expr, Ident, OnConflictAction, OnInsert, SelectItem};
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser;
 use tikv_client::Transaction;
 
 use super::expr::eval_expr;
@@ -283,6 +285,41 @@ pub fn coerce_row_values(schema: &TableSchema, row_vals: &mut Vec<Value>) -> Res
     Ok(())
 }
 
+pub fn validate_check_constraints(schema: &TableSchema, row: &Row) -> Result<()> {
+    let dialect = PostgreSqlDialect {};
+    for check in &schema.check_constraints {
+        let expr = Parser::new(&dialect)
+            .try_with_sql(&check.expr)
+            .and_then(|mut p| p.parse_expr())
+            .map_err(|e| anyhow!("Invalid CHECK expression '{}': {}", check.expr, e))?;
+
+        let result = eval_expr(&expr, Some(row), Some(schema))?;
+
+        match result {
+            Value::Boolean(true) => {}
+            Value::Boolean(false) => {
+                let name = check
+                    .name
+                    .as_ref()
+                    .map(|n| format!("\"{}\"", n))
+                    .unwrap_or_else(|| format!("({})", check.expr));
+                return Err(anyhow!(
+                    "new row violates check constraint {}",
+                    name
+                ));
+            }
+            Value::Null => {} // PostgreSQL: NULL satisfies CHECK constraints
+            _ => {
+                return Err(anyhow!(
+                    "CHECK constraint must evaluate to boolean, got {:?}",
+                    result
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_update_columns(
     schema: &TableSchema,
     assignments: &[Assignment],
@@ -343,6 +380,7 @@ pub fn build_update_join_context<'a>(
         version: 1,
         pk_indices: vec![],
         indexes: vec![],
+        check_constraints: vec![],
     };
 
     let mut column_offsets: HashMap<String, usize> = HashMap::new();

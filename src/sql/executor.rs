@@ -321,6 +321,7 @@ impl Executor {
             dml::fill_missing_columns(&self.store, txn, &schema, &mut row_vals, &indices).await?;
             dml::coerce_row_values(&schema, &mut row_vals)?;
             let row = Row::new(row_vals);
+            dml::validate_check_constraints(&schema, &row)?;
             
             let result = dml::execute_insert_row(&self.store, txn, &t, &schema, row, on_conflict).await?;
             if let Some(final_row) = result {
@@ -451,6 +452,7 @@ impl Executor {
             };
             
             let new_row = Row::new(new_vals);
+            dml::validate_check_constraints(&schema, &new_row)?;
             let updated_row = dml::execute_update_row(&self.store, txn, &t, &schema, r, new_row).await?;
             
             if let Some(ret_row) = dml::eval_returning_row(returning, &updated_row, &schema)? {
@@ -502,6 +504,7 @@ impl Executor {
                             pk_indices: vec![],
                             indexes: vec![],
                             version: 1,
+                            check_constraints: vec![],
                         };
                         ctes.insert(cte_name, (schema, rows));
                     }
@@ -937,6 +940,7 @@ impl Executor {
                         pk_indices: vec![],
                         indexes: vec![],
                         version: 1,
+                        check_constraints: vec![],
                     };
                     Ok((schema, rows))
                 }
@@ -1077,6 +1081,7 @@ impl Executor {
                 version: 1,
                 pk_indices: vec![],
                 indexes: vec![],
+                check_constraints: vec![],
             };
 
             let mut new_combined_rows = Vec::new();
@@ -1153,6 +1158,7 @@ impl Executor {
             version: 1,
             pk_indices: vec![],
             indexes: vec![],
+            check_constraints: vec![],
         };
 
         let mut filtered_rows = if let Some(sel) = &select.selection {

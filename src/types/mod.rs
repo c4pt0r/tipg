@@ -178,15 +178,41 @@ pub struct IndexDef {
     pub unique: bool,
 }
 
-/// Table schema definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckConstraint {
+    pub name: Option<String>,
+    pub expr: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TableSchema {
     pub name: String,
     pub table_id: u64,
     pub columns: Vec<ColumnDef>,
     pub version: u64,
     pub pk_indices: Vec<usize>,
-    pub indexes: Vec<IndexDef>, // Secondary indexes
+    pub indexes: Vec<IndexDef>,
+    #[serde(default)]
+    pub check_constraints: Vec<CheckConstraint>,
+}
+
+impl TableSchema {
+    pub fn new(
+        name: String,
+        table_id: u64,
+        columns: Vec<ColumnDef>,
+        pk_indices: Vec<usize>,
+    ) -> Self {
+        Self {
+            name,
+            table_id,
+            columns,
+            version: 1,
+            pk_indices,
+            indexes: Vec::new(),
+            check_constraints: Vec::new(),
+        }
+    }
 }
 
 impl TableSchema {

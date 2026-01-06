@@ -16,3 +16,32 @@ UPDATE 1
 (2 rows)
 
 DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+ERROR:  new row for relation "check_test" violates check constraint "check_test_age_check"
+DETAIL:  Failing row contains (4, -1, 10, active).
+ERROR:  new row for relation "check_test" violates check constraint "positive_price"
+DETAIL:  Failing row contains (5, 30, 0, active).
+ERROR:  new row for relation "check_test" violates check constraint "check_test_status_check"
+DETAIL:  Failing row contains (6, 30, 10, deleted).
+ id | age | price | status   
+----+-----+-------+----------
+  1 |  25 | 99.99 | active
+  2 |   0 |  0.01 | inactive
+  3 |     |       | 
+(3 rows)
+
+UPDATE 1
+ERROR:  new row for relation "check_test" violates check constraint "check_test_age_check"
+DETAIL:  Failing row contains (1, -5, 99.99, active).
+ id | age | price | status   
+----+-----+-------+----------
+  1 |  30 | 99.99 | active
+  2 |   0 |  0.01 | inactive
+  3 |     |       | 
+(3 rows)
+
+DROP TABLE

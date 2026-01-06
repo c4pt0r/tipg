@@ -10,7 +10,7 @@ use tikv_client::Transaction;
 use super::helpers::{convert_data_type, infer_data_type, is_serial_type};
 use super::ExecuteResult;
 use crate::storage::TikvStore;
-use crate::types::{ColumnDef, DataType, IndexDef, Row, TableSchema};
+use crate::types::{CheckConstraint, ColumnDef, DataType, IndexDef, Row, TableSchema};
 
 pub async fn execute_create_table(
     store: &Arc<TikvStore>,
@@ -42,6 +42,17 @@ pub async fn execute_create_table(
             _ => None,
         })
         .flatten()
+        .collect();
+
+    let check_constraints: Vec<CheckConstraint> = constraints
+        .iter()
+        .filter_map(|c| match c {
+            TableConstraint::Check { name, expr } => Some(CheckConstraint {
+                name: name.as_ref().map(|n| n.value.clone()),
+                expr: expr.to_string(),
+            }),
+            _ => None,
+        })
         .collect();
 
     let mut col_defs = Vec::new();
@@ -114,6 +125,7 @@ pub async fn execute_create_table(
         version: 1,
         pk_indices,
         indexes: Vec::new(),
+        check_constraints,
     };
     store.create_table(txn, schema).await?;
 
@@ -182,6 +194,7 @@ pub async fn create_table_from_query_result(
         version: 1,
         pk_indices: vec![],
         indexes: vec![],
+        check_constraints: vec![],
     };
     store.create_table(txn, schema).await?;
 
@@ -234,6 +247,7 @@ pub async fn create_table_from_select_into(
         version: 1,
         pk_indices: vec![],
         indexes: vec![],
+        check_constraints: vec![],
     };
     store.create_table(txn, schema).await?;
 

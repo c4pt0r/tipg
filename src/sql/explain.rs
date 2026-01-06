@@ -636,6 +636,7 @@ mod tests {
                     columns: vec!["id".to_string()],
                     unique: true,
                 }],
+                check_constraints: vec![],
             })
         } else {
             None
