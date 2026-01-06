@@ -1,5 +1,5 @@
 use crate::storage::TikvStore;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -37,12 +37,23 @@ impl TikvClientPool {
         }
 
         info!("Creating new TiKV client for keyspace: {}", key);
-        let store = TikvStore::new_with_keyspace(
+        
+        let result = TikvStore::new_with_keyspace(
             self.pd_endpoints.clone(),
             self.namespace.clone(),
-            keyspace,
-        )
-        .await?;
+            keyspace.clone(),
+        ).await;
+
+        let store = match result {
+            Ok(s) => s,
+            Err(e) => {
+                let err_str = format!("{:?}", e);
+                if err_str.contains("keyspace does not exist") {
+                    return Err(anyhow!("Tenant '{}' does not exist", key));
+                }
+                return Err(e);
+            }
+        };
 
         let store = Arc::new(store);
         clients.insert(key, store.clone());

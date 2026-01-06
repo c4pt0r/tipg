@@ -1345,6 +1345,7 @@ dependencies = [
  "pgwire",
  "rand 0.8.5",
  "regex",
+ "reqwest",
  "rustls-pemfile 2.2.0",
  "rustls-pki-types",
  "serde",
