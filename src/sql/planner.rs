@@ -259,6 +259,89 @@ pub fn extract_index_values(
     Some(values)
 }
 
+#[derive(Debug, Clone)]
+pub struct JoinTableInfo {
+    pub name: String,
+    pub alias: String,
+    pub estimated_rows: usize,
+}
+
+pub fn optimize_join_order(tables: &[JoinTableInfo]) -> Vec<usize> {
+    if tables.len() <= 1 {
+        return (0..tables.len()).collect();
+    }
+
+    let mut indices: Vec<usize> = (0..tables.len()).collect();
+    indices.sort_by_key(|&i| tables[i].estimated_rows);
+    indices
+}
+
+pub fn estimate_join_cost(left_rows: usize, right_rows: usize, selectivity: f64) -> f64 {
+    let scan_cost = (left_rows + right_rows) as f64;
+    let join_cost = (left_rows * right_rows) as f64 * selectivity;
+    scan_cost + join_cost
+}
+
+#[derive(Debug, Clone)]
+pub struct PushdownResult {
+    pub table_predicates: HashMap<String, Vec<PredicateInfo>>,
+    pub remaining_predicates: Vec<PredicateInfo>,
+}
+
+pub fn pushdown_predicates(
+    predicates: &[PredicateInfo],
+    table_columns: &HashMap<String, Vec<String>>,
+) -> PushdownResult {
+    let mut table_predicates: HashMap<String, Vec<PredicateInfo>> = HashMap::new();
+    let mut remaining_predicates = Vec::new();
+
+    for pred in predicates {
+        let mut pushed = false;
+        for (table_name, columns) in table_columns {
+            if columns.contains(&pred.column) {
+                table_predicates
+                    .entry(table_name.clone())
+                    .or_default()
+                    .push(pred.clone());
+                pushed = true;
+                break;
+            }
+        }
+        if !pushed {
+            remaining_predicates.push(pred.clone());
+        }
+    }
+
+    PushdownResult {
+        table_predicates,
+        remaining_predicates,
+    }
+}
+
+pub fn extract_table_predicates(
+    predicates: &[PredicateInfo],
+    table_alias: &str,
+    table_columns: &[String],
+) -> Vec<PredicateInfo> {
+    predicates
+        .iter()
+        .filter(|p| {
+            let col_name = if p.column.contains('.') {
+                let parts: Vec<&str> = p.column.split('.').collect();
+                if parts.len() == 2 && parts[0] == table_alias {
+                    parts[1].to_string()
+                } else {
+                    return false;
+                }
+            } else {
+                p.column.clone()
+            };
+            table_columns.contains(&col_name)
+        })
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +414,47 @@ mod tests {
         }];
         let path = choose_best_access_path(&schema, &predicates, 1000);
         assert!(matches!(path.scan_type, ScanType::IndexScan { .. }));
+    }
+
+    #[test]
+    fn test_optimize_join_order_two_tables() {
+        let tables = vec![
+            JoinTableInfo {
+                name: "small".to_string(),
+                alias: "s".to_string(),
+                estimated_rows: 100,
+            },
+            JoinTableInfo {
+                name: "large".to_string(),
+                alias: "l".to_string(),
+                estimated_rows: 10000,
+            },
+        ];
+        let order = optimize_join_order(&tables);
+        assert_eq!(order[0], 0);
+    }
+
+    #[test]
+    fn test_pushdown_predicates() {
+        let predicates = vec![
+            PredicateInfo {
+                column: "a".to_string(),
+                op: PredicateOp::Eq,
+                value: Value::Int32(1),
+            },
+            PredicateInfo {
+                column: "b".to_string(),
+                op: PredicateOp::Eq,
+                value: Value::Int32(2),
+            },
+        ];
+        let mut table_columns = HashMap::new();
+        table_columns.insert("t1".to_string(), vec!["a".to_string()]);
+        table_columns.insert("t2".to_string(), vec!["b".to_string()]);
+
+        let result = pushdown_predicates(&predicates, &table_columns);
+        assert_eq!(result.table_predicates.get("t1").unwrap().len(), 1);
+        assert_eq!(result.table_predicates.get("t2").unwrap().len(), 1);
+        assert!(result.remaining_predicates.is_empty());
     }
 }
