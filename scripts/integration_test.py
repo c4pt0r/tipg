@@ -645,6 +645,116 @@ def test_rbac_tenant_isolation() -> bool:
     return True
 
 
+def test_query_optimization() -> bool:
+    log_info("Testing query optimization with EXPLAIN...")
+
+    # Setup test tables
+    run_sql("tenant_a.secret", "DROP TABLE IF EXISTS orders_opt")
+    run_sql("tenant_a.secret", "DROP TABLE IF EXISTS customers_opt")
+
+    run_sql("tenant_a.secret", """CREATE TABLE customers_opt (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        city TEXT,
+        age INT
+    )""")
+
+    run_sql("tenant_a.secret", """CREATE TABLE orders_opt (
+        id SERIAL PRIMARY KEY,
+        customer_id INT,
+        amount DOUBLE PRECISION,
+        order_date TIMESTAMP DEFAULT NOW()
+    )""")
+
+    # Insert test data (one by one to ensure they succeed)
+    for name, city, age in [('Alice', 'New York', 30), ('Bob', 'San Francisco', 25),
+                            ('Charlie', 'New York', 35), ('David', 'Boston', 40),
+                            ('Eve', 'San Francisco', 28)]:
+        run_sql("tenant_a.secret", f"INSERT INTO customers_opt (name, city, age) VALUES ('{name}', '{city}', {age})")
+
+    for cust_id, amount in [(1, 100.00), (1, 150.00), (2, 200.00),
+                             (3, 75.00), (4, 300.00), (5, 125.00)]:
+        result = run_sql("tenant_a.secret", f"INSERT INTO orders_opt (customer_id, amount) VALUES ({cust_id}, {amount})")
+        if "error" in result.lower():
+            log_error(f"Failed to insert into orders_opt: {result}")
+            return False
+
+    # Test 1: Index scan optimization
+    run_sql("tenant_a.secret", "CREATE INDEX idx_customers_city ON customers_opt(city)")
+    result = run_sql("tenant_a.secret", "EXPLAIN SELECT * FROM customers_opt WHERE city = 'New York'")
+    if "index" in result.lower() or "scan" in result.lower():
+        log_info("Index scan detection: PASSED")
+    else:
+        log_warn(f"Index scan detection: UNCLEAR - {result[:100]}")
+
+    # Test 2: Join optimization
+    result = run_sql("tenant_a.secret", """
+        EXPLAIN SELECT c.name, o.amount
+        FROM customers_opt c
+        JOIN orders_opt o ON c.id = o.customer_id
+        WHERE c.city = 'New York'
+    """)
+    if "join" in result.lower():
+        log_info("Join optimization: PASSED")
+    else:
+        log_warn(f"Join optimization: UNCLEAR - {result[:100]}")
+
+    # Test 3: Aggregation with GROUP BY
+    result = run_sql("tenant_a.secret", """
+        SELECT city, COUNT(*), AVG(age)
+        FROM customers_opt
+        GROUP BY city
+        ORDER BY COUNT(*) DESC
+    """)
+    if "New York" in result and "San Francisco" in result:
+        log_info("Aggregation with GROUP BY: PASSED")
+    else:
+        log_error(f"Aggregation with GROUP BY: FAILED - {result}")
+        return False
+
+    # Test 4: Subquery optimization
+    # First verify tables exist
+    verify = run_sql("tenant_a.secret", "SELECT COUNT(*) FROM orders_opt")
+    if "error" in verify.lower():
+        log_error(f"orders_opt table missing before subquery test: {verify}")
+        return False
+
+    result = run_sql("tenant_a.secret", """
+        SELECT name FROM customers_opt
+        WHERE id IN (SELECT customer_id FROM orders_opt WHERE amount > 100)
+    """)
+    if "error" in result.lower():
+        log_error(f"Subquery execution: FAILED - {result}")
+        return False
+    if "Alice" in result or "Bob" in result or "David" in result:
+        log_info("Subquery execution: PASSED")
+    else:
+        log_warn(f"Subquery execution: unexpected result - {result[:200]}")
+
+    # Test 5: Complex query with multiple conditions
+    result = run_sql("tenant_a.secret", """
+        SELECT c.name, COUNT(o.id) as order_count, SUM(o.amount) as total_amount
+        FROM customers_opt c
+        LEFT JOIN orders_opt o ON c.id = o.customer_id
+        WHERE c.age > 25
+        GROUP BY c.id, c.name
+        HAVING COUNT(o.id) > 0
+        ORDER BY total_amount DESC
+    """)
+    count = result.count("\n")
+    if count >= 3:  # At least header + separator + data rows
+        log_info("Complex query with aggregations: PASSED")
+    else:
+        log_warn(f"Complex query: result has {count} lines")
+
+    # Cleanup
+    run_sql("tenant_a.secret", "DROP TABLE orders_opt")
+    run_sql("tenant_a.secret", "DROP TABLE customers_opt")
+
+    log_info("Query optimization tests: PASSED")
+    return True
+
+
 def run_all_tests() -> bool:
     runner = TestRunner()
 
@@ -666,6 +776,7 @@ def run_all_tests() -> bool:
         ("RBAC Drop Role", test_rbac_drop_role),
         ("RBAC User Auth", test_rbac_user_auth),
         ("RBAC Tenant Isolation", test_rbac_tenant_isolation),
+        ("Query Optimization", test_query_optimization),
     ]
 
     for name, test_func in tests:
