@@ -1,53 +1,191 @@
 DROP TABLE
+DROP TABLE
+CREATE TABLE
 CREATE TABLE
 CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+INSERT 0 3
 INSERT 0 3
                 QUERY PLAN                
 ------------------------------------------
  Result  (cost=0.00..0.01 rows=1 width=4)
 (1 row)
 
+                QUERY PLAN                
+------------------------------------------
+ Result  (cost=0.00..0.01 rows=1 width=4)
+(1 row)
+
+                QUERY PLAN                
+------------------------------------------
+ Result  (cost=0.00..0.01 rows=1 width=8)
+(1 row)
+
                           QUERY PLAN                          
 --------------------------------------------------------------
- Seq Scan on explain_test  (cost=0.00..25.00 rows=6 width=40)
+ Seq Scan on explain_test  (cost=0.00..24.12 rows=6 width=44)
    Filter: (b = 'one'::text)
 (2 rows)
 
                                       QUERY PLAN                                       
 ---------------------------------------------------------------------------------------
- Index Scan using explain_test_pkey on explain_test  (cost=0.15..8.17 rows=1 width=40)
+ Index Scan using explain_test_pkey on explain_test  (cost=0.15..8.17 rows=1 width=44)
    Index Cond: (id = 1)
 (2 rows)
 
                               QUERY PLAN                              
 ----------------------------------------------------------------------
- Bitmap Heap Scan on explain_test  (cost=4.20..13.67 rows=6 width=40)
+ Bitmap Heap Scan on explain_test  (cost=4.20..13.67 rows=6 width=44)
    Recheck Cond: (a = 10)
-   ->  Bitmap Index Scan on idx_a  (cost=0.00..4.20 rows=6 width=0)
+   ->  Bitmap Index Scan on idx_ab  (cost=0.00..4.20 rows=6 width=0)
          Index Cond: (a = 10)
 (4 rows)
 
+                                    QUERY PLAN                                    
+----------------------------------------------------------------------------------
+ Index Scan using idx_c_unique on explain_test  (cost=0.15..8.17 rows=1 width=44)
+   Index Cond: (c = 100)
+(2 rows)
+
+                                 QUERY PLAN                                 
+----------------------------------------------------------------------------
+ Index Scan using idx_ab on explain_test  (cost=0.15..8.17 rows=1 width=44)
+   Index Cond: ((a = 10) AND (b = 'one'::text))
+(2 rows)
+
                            QUERY PLAN                            
 -----------------------------------------------------------------
- Seq Scan on explain_test  (cost=0.00..22.00 rows=1200 width=40)
+ Seq Scan on explain_test  (cost=0.00..21.30 rows=1130 width=44)
 (1 row)
 
-                                  QUERY PLAN                                   
--------------------------------------------------------------------------------
- Index Scan using idx_a on explain_test  (cost=0.15..66.15 rows=1200 width=40)
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Index Scan using idx_ab on explain_test  (cost=0.15..65.10 rows=1130 width=44)
+(1 row)
+
+                                       QUERY PLAN                                        
+-----------------------------------------------------------------------------------------
+ Index Scan Backward using idx_ab on explain_test  (cost=0.15..65.10 rows=1130 width=44)
+(1 row)
+
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Index Scan using idx_ab on explain_test  (cost=0.15..65.10 rows=1130 width=44)
 (1 row)
 
                               QUERY PLAN                               
 -----------------------------------------------------------------------
- Limit  (cost=0.00..0.02 rows=1 width=40)
-   ->  Seq Scan on explain_test  (cost=0.00..22.00 rows=1200 width=40)
+ Limit  (cost=0.00..0.02 rows=1 width=44)
+   ->  Seq Scan on explain_test  (cost=0.00..21.30 rows=1130 width=44)
+(2 rows)
+
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Limit  (cost=0.09..0.28 rows=10 width=44)
+   ->  Seq Scan on explain_test  (cost=0.00..21.30 rows=1130 width=44)
+(2 rows)
+
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Limit  (cost=0.15..0.27 rows=2 width=44)
+   ->  Index Scan using idx_ab on explain_test  (cost=0.15..65.10 rows=1130 width=44)
 (2 rows)
 
                               QUERY PLAN                              
 ----------------------------------------------------------------------
- HashAggregate  (cost=28.00..30.00 rows=200 width=12)
+ HashAggregate  (cost=26.95..28.95 rows=200 width=12)
    Group Key: a
-   ->  Seq Scan on explain_test  (cost=0.00..22.00 rows=1200 width=40)
+   ->  Seq Scan on explain_test  (cost=0.00..21.30 rows=1130 width=4)
 (3 rows)
 
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ HashAggregate  (cost=29.78..32.28 rows=200 width=44)
+   Group Key: a
+   ->  Seq Scan on explain_test  (cost=0.00..21.30 rows=1130 width=8)
+(3 rows)
+
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ HashAggregate  (cost=26.95..29.45 rows=67 width=12)
+   Group Key: a
+   Filter: (count(*) > 1)
+   ->  Seq Scan on explain_test  (cost=0.00..21.30 rows=1130 width=4)
+(4 rows)
+
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Hash Join  (cost=35.42..60.59 rows=1200 width=84)
+   Hash Cond: (t2.test_id = t1.id)
+   ->  Seq Scan on explain_join t2  (cost=0.00..22.00 rows=1200 width=40)
+   ->  Hash  (cost=21.30..21.30 rows=1130 width=44)
+         ->  Seq Scan on explain_test t1  (cost=0.00..21.30 rows=1130 width=44)
+(5 rows)
+
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Hash Right Join  (cost=35.42..60.59 rows=1200 width=84)
+   Hash Cond: (t2.test_id = t1.id)
+   ->  Seq Scan on explain_join t2  (cost=0.00..22.00 rows=1200 width=40)
+   ->  Hash  (cost=21.30..21.30 rows=1130 width=44)
+         ->  Seq Scan on explain_test t1  (cost=0.00..21.30 rows=1130 width=44)
+(5 rows)
+
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Bitmap Heap Scan on explain_test  (cost=8.40..19.07 rows=11 width=44)
+   Recheck Cond: (a = ANY ('{10,20}'::integer[]))
+   ->  Bitmap Index Scan on idx_ab  (cost=0.00..8.39 rows=11 width=0)
+         Index Cond: (a = ANY ('{10,20}'::integer[]))
+(4 rows)
+
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Bitmap Heap Scan on explain_test  (cost=4.21..13.70 rows=6 width=44)
+   Recheck Cond: ((a >= 10) AND (a <= 20))
+   ->  Bitmap Index Scan on idx_ab  (cost=0.00..4.21 rows=6 width=0)
+         Index Cond: ((a >= 10) AND (a <= 20))
+(4 rows)
+
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Seq Scan on explain_test  (cost=0.00..24.12 rows=6 width=44)
+   Filter: (b ~~ 'o%'::text)
+(2 rows)
+
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Seq Scan on explain_test  (cost=0.00..21.30 rows=1124 width=44)
+   Filter: (b IS NOT NULL)
+(2 rows)
+
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ HashAggregate  (cost=24.12..26.12 rows=200 width=4)
+   Group Key: a
+   ->  Seq Scan on explain_test  (cost=0.00..21.30 rows=1130 width=4)
+(3 rows)
+
+                                    QUERY PLAN                                    
+----------------------------------------------------------------------------------
+ Hash Join  (cost=29.50..60.05 rows=565 width=44)
+   Hash Cond: (explain_test.id = explain_join.test_id)
+   ->  Seq Scan on explain_test  (cost=0.00..21.30 rows=1130 width=44)
+   ->  Hash  (cost=27.00..27.00 rows=200 width=4)
+         ->  HashAggregate  (cost=25.00..27.00 rows=200 width=4)
+               Group Key: explain_join.test_id
+               ->  Seq Scan on explain_join  (cost=0.00..22.00 rows=1200 width=4)
+(7 rows)
+
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Bitmap Heap Scan on explain_test  (cost=4.20..13.67 rows=6 width=44)
+   Recheck Cond: (a = 10)
+   ->  Bitmap Index Scan on idx_ab  (cost=0.00..4.20 rows=6 width=0)
+         Index Cond: (a = 10)
+(4 rows)
+
+DROP TABLE
 DROP TABLE
