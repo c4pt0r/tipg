@@ -388,6 +388,7 @@ mod tests {
             pk_indices: vec![],
             indexes: vec![],
             check_constraints: vec![],
+            foreign_keys: vec![],
         };
         let path = choose_best_access_path(&schema, &[], 1000);
         assert!(matches!(path.scan_type, ScanType::FullTableScan));
@@ -408,6 +409,7 @@ mod tests {
                 unique: false,
             }],
             check_constraints: vec![],
+            foreign_keys: vec![],
         };
         let predicates = vec![PredicateInfo {
             column: "a".to_string(),
@@ -534,6 +536,7 @@ mod tests {
                 },
             ],
             check_constraints: vec![],
+            foreign_keys: vec![],
         };
         let predicates = vec![PredicateInfo {
             column: "a".to_string(),
@@ -571,6 +574,7 @@ mod tests {
                 },
             ],
             check_constraints: vec![],
+            foreign_keys: vec![],
         };
         let predicates = vec![
             PredicateInfo {
@@ -611,6 +615,7 @@ mod tests {
                 unique: false,
             }],
             check_constraints: vec![],
+            foreign_keys: vec![],
         };
         let predicates = vec![PredicateInfo {
             column: "a".to_string(),
@@ -810,6 +815,7 @@ mod tests {
                 unique: false,
             }],
             check_constraints: vec![],
+            foreign_keys: vec![],
         };
         let path_no_pred = choose_best_access_path(&schema, &[], 10);
         assert!(matches!(path_no_pred.scan_type, ScanType::FullTableScan));

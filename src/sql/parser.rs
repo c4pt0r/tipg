@@ -23,8 +23,7 @@ mod tests {
 
     #[test]
     fn test_parse_create_table() {
-        let stmts =
-            parse_sql("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)").unwrap();
+        let stmts = parse_sql("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)").unwrap();
         assert_eq!(stmts.len(), 1);
     }
 

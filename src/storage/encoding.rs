@@ -263,6 +263,7 @@ mod tests {
             pk_indices: vec![0],
             indexes: vec![],
             check_constraints: vec![],
+            foreign_keys: vec![],
         };
         let serialized = serialize_schema(&schema).unwrap();
         let deserialized = deserialize_schema(&serialized).unwrap();

@@ -2,15 +2,18 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
-    AlterTableOperation, ColumnDef as SqlColumnDef, ColumnOption, Expr, ObjectName,
-    OrderByExpr, Query, TableConstraint,
+    AlterTableOperation, ColumnDef as SqlColumnDef, ColumnOption, Expr, ObjectName, OrderByExpr,
+    Query, TableConstraint,
 };
 use tikv_client::Transaction;
 
 use super::helpers::{convert_data_type, infer_data_type, is_serial_type};
 use super::ExecuteResult;
 use crate::storage::TikvStore;
-use crate::types::{CheckConstraint, ColumnDef, DataType, IndexDef, Row, TableSchema};
+use crate::types::{
+    CheckConstraint, ColumnDef, DataType, ForeignKeyAction, ForeignKeyConstraint, IndexDef, Row,
+    TableSchema,
+};
 
 pub async fn execute_create_table(
     store: &Arc<TikvStore>,
@@ -44,7 +47,7 @@ pub async fn execute_create_table(
         .flatten()
         .collect();
 
-    let check_constraints: Vec<CheckConstraint> = constraints
+    let mut check_constraints: Vec<CheckConstraint> = constraints
         .iter()
         .filter_map(|c| match c {
             TableConstraint::Check { name, expr } => Some(CheckConstraint {
@@ -80,6 +83,12 @@ pub async fn execute_create_table(
                 }
                 ColumnOption::NotNull => nullable = false,
                 ColumnOption::Default(expr) => default_expr = Some(expr.to_string()),
+                ColumnOption::Check(expr) => {
+                    check_constraints.push(CheckConstraint {
+                        name: None,
+                        expr: expr.to_string(),
+                    });
+                }
                 _ => {}
             }
         }
@@ -118,14 +127,112 @@ pub async fn execute_create_table(
     }
 
     let table_id = store.next_table_id(txn).await?;
+
+    let mut indexes = Vec::new();
+    let mut next_index_id = 1u64;
+
+    for col in col_defs.iter() {
+        if col.unique && !col.primary_key {
+            indexes.push(IndexDef {
+                name: format!("{}_{}_key", table_name, col.name),
+                id: next_index_id,
+                columns: vec![col.name.clone()],
+                unique: true,
+            });
+            next_index_id += 1;
+        }
+    }
+
+    let mut foreign_keys = Vec::new();
+
+    for constraint in constraints {
+        match constraint {
+            TableConstraint::Unique {
+                name,
+                columns,
+                is_primary,
+                ..
+            } => {
+                if !*is_primary {
+                    let col_names: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
+                    let idx_name = name
+                        .as_ref()
+                        .map(|n| n.value.clone())
+                        .unwrap_or_else(|| format!("{}_{}_key", table_name, col_names.join("_")));
+                    indexes.push(IndexDef {
+                        name: idx_name,
+                        id: next_index_id,
+                        columns: col_names,
+                        unique: true,
+                    });
+                    next_index_id += 1;
+                }
+            }
+            TableConstraint::ForeignKey {
+                name,
+                columns,
+                foreign_table,
+                referred_columns,
+                on_delete,
+                on_update,
+                ..
+            } => {
+                let fk_cols: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
+                let ref_table = foreign_table
+                    .0
+                    .last()
+                    .map(|i| i.value.clone())
+                    .unwrap_or_default();
+                let ref_cols: Vec<String> =
+                    referred_columns.iter().map(|c| c.value.clone()).collect();
+                let fk_name = name
+                    .as_ref()
+                    .map(|n| n.value.clone())
+                    .unwrap_or_else(|| format!("{}_{}_fkey", table_name, fk_cols.join("_")));
+
+                let parse_action =
+                    |action: &Option<sqlparser::ast::ReferentialAction>| -> ForeignKeyAction {
+                        match action {
+                            Some(sqlparser::ast::ReferentialAction::Cascade) => {
+                                ForeignKeyAction::Cascade
+                            }
+                            Some(sqlparser::ast::ReferentialAction::SetNull) => {
+                                ForeignKeyAction::SetNull
+                            }
+                            Some(sqlparser::ast::ReferentialAction::SetDefault) => {
+                                ForeignKeyAction::SetDefault
+                            }
+                            Some(sqlparser::ast::ReferentialAction::Restrict) => {
+                                ForeignKeyAction::Restrict
+                            }
+                            Some(sqlparser::ast::ReferentialAction::NoAction) | None => {
+                                ForeignKeyAction::NoAction
+                            }
+                        }
+                    };
+
+                foreign_keys.push(ForeignKeyConstraint {
+                    name: fk_name,
+                    columns: fk_cols,
+                    ref_table,
+                    ref_columns: ref_cols,
+                    on_delete: parse_action(on_delete),
+                    on_update: parse_action(on_update),
+                });
+            }
+            _ => {}
+        }
+    }
+
     let schema = TableSchema {
         name: table_name.clone(),
         table_id,
         columns: col_defs,
         version: 1,
         pk_indices,
-        indexes: Vec::new(),
+        indexes,
         check_constraints,
+        foreign_keys,
     };
     store.create_table(txn, schema).await?;
 
@@ -195,6 +302,7 @@ pub async fn create_table_from_query_result(
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
+        foreign_keys: vec![],
     };
     store.create_table(txn, schema).await?;
 
@@ -248,6 +356,7 @@ pub async fn create_table_from_select_into(
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
+        foreign_keys: vec![],
     };
     store.create_table(txn, schema).await?;
 
@@ -313,7 +422,14 @@ pub async fn execute_create_index(
         let idx_values = schema.get_index_values(&new_index, &row);
         let pk_values = schema.get_pk_values(&row);
         store
-            .create_index_entry(txn, schema.table_id, index_id, &idx_values, &pk_values, unique)
+            .create_index_entry(
+                txn,
+                schema.table_id,
+                index_id,
+                &idx_values,
+                &pk_values,
+                unique,
+            )
             .await?;
     }
 
@@ -474,41 +590,39 @@ pub async fn execute_alter_table(
             schema.version += 1;
             store.update_schema(txn, schema).await?;
         }
-        AlterTableOperation::AddConstraint(constraint) => {
-            match constraint {
-                TableConstraint::Unique {
-                    columns,
-                    is_primary,
-                    ..
-                } if *is_primary => {
-                    let pk_names: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
-                    let mut pk_indices = Vec::new();
-                    for pk_name in &pk_names {
-                        if let Some(idx) = schema.columns.iter().position(|c| c.name == *pk_name) {
-                            schema.columns[idx].primary_key = true;
-                            schema.columns[idx].nullable = false;
-                            pk_indices.push(idx);
-                        } else {
-                            return Err(anyhow!("Column '{}' does not exist", pk_name));
-                        }
+        AlterTableOperation::AddConstraint(constraint) => match constraint {
+            TableConstraint::Unique {
+                columns,
+                is_primary,
+                ..
+            } if *is_primary => {
+                let pk_names: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
+                let mut pk_indices = Vec::new();
+                for pk_name in &pk_names {
+                    if let Some(idx) = schema.columns.iter().position(|c| c.name == *pk_name) {
+                        schema.columns[idx].primary_key = true;
+                        schema.columns[idx].nullable = false;
+                        pk_indices.push(idx);
+                    } else {
+                        return Err(anyhow!("Column '{}' does not exist", pk_name));
                     }
-                    schema.pk_indices = pk_indices;
-                    schema.version += 1;
-                    store.update_schema(txn, schema).await?;
                 }
-                TableConstraint::Unique { columns, .. } => {
-                    for col in columns {
-                        if let Some(idx) = schema.columns.iter().position(|c| c.name == col.value) {
-                            schema.columns[idx].unique = true;
-                        }
-                    }
-                    schema.version += 1;
-                    store.update_schema(txn, schema).await?;
-                }
-                TableConstraint::ForeignKey { .. } | TableConstraint::Check { .. } => {}
-                _ => {}
+                schema.pk_indices = pk_indices;
+                schema.version += 1;
+                store.update_schema(txn, schema).await?;
             }
-        }
+            TableConstraint::Unique { columns, .. } => {
+                for col in columns {
+                    if let Some(idx) = schema.columns.iter().position(|c| c.name == col.value) {
+                        schema.columns[idx].unique = true;
+                    }
+                }
+                schema.version += 1;
+                store.update_schema(txn, schema).await?;
+            }
+            TableConstraint::ForeignKey { .. } | TableConstraint::Check { .. } => {}
+            _ => {}
+        },
         AlterTableOperation::DropConstraint { .. } => {}
         AlterTableOperation::DropColumn {
             column_name,

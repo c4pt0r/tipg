@@ -9,9 +9,14 @@ use pgwire::api::auth::{ServerParameterProvider, StartupHandler};
 use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
-use pgwire::api::results::{CopyResponse, DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
+use pgwire::api::results::{
+    CopyResponse, DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat,
+    FieldInfo, QueryResponse, Response, Tag,
+};
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
-use pgwire::api::{ClientInfo, NoopErrorHandler, PgWireConnectionState, PgWireServerHandlers, Type, METADATA_USER};
+use pgwire::api::{
+    ClientInfo, NoopErrorHandler, PgWireConnectionState, PgWireServerHandlers, Type, METADATA_USER,
+};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::data::DataRow;
@@ -60,7 +65,7 @@ fn parse_tenant_username(username: &str) -> (Option<String>, String) {
             return (Some(tenant.to_string()), user.to_string());
         }
     }
-    // Try colon separator: "tenant_a:admin" -> keyspace=tenant_a, user=admin  
+    // Try colon separator: "tenant_a:admin" -> keyspace=tenant_a, user=admin
     if let Some(pos) = username.find(':') {
         let tenant = &username[..pos];
         let user = &username[pos + 1..];
@@ -122,11 +127,16 @@ impl DynamicPgHandler {
         }
     }
 
-    async fn init_executor(&self, keyspace: Option<String>, username: Option<String>, is_superuser: bool) -> Result<(), String> {
+    async fn init_executor(
+        &self,
+        keyspace: Option<String>,
+        username: Option<String>,
+        is_superuser: bool,
+    ) -> Result<(), String> {
         let effective_keyspace = keyspace
             .or_else(|| self.default_keyspace.clone())
             .or_else(|| Some("default".to_string()));
-        
+
         let store = if let Some(pool) = &self.client_pool {
             pool.get_client(effective_keyspace.clone())
                 .await
@@ -136,23 +146,31 @@ impl DynamicPgHandler {
                 self.pd_endpoints.clone(),
                 self.namespace.clone(),
                 effective_keyspace.clone(),
-            ).await.map_err(|e| format!("Failed to connect to TiKV: {}", e))?;
+            )
+            .await
+            .map_err(|e| format!("Failed to connect to TiKV: {}", e))?;
             Arc::new(s)
         };
 
-        let executor = Arc::new(Executor::new_with_namespace(store.clone(), self.namespace.clone()));
-        
+        let executor = Arc::new(Executor::new_with_namespace(
+            store.clone(),
+            self.namespace.clone(),
+        ));
+
         let session = match username {
             Some(user) => Session::new_with_user(store, user, is_superuser),
             None => Session::new(store),
         };
-        
+
         let _ = self.executor.set(executor);
-        
+
         let mut session_guard = self.session.lock().await;
         *session_guard = Some(session);
-        
-        info!("Initialized executor with keyspace: {:?}", effective_keyspace);
+
+        info!(
+            "Initialized executor with keyspace: {:?}",
+            effective_keyspace
+        );
         Ok(())
     }
 
@@ -168,12 +186,16 @@ impl DynamicPgHandler {
 
     fn parse_copy_command(query: &str) -> Option<(String, Vec<String>)> {
         let query_upper = query.to_uppercase();
-        if !query_upper.contains("COPY") || !query_upper.contains("FROM") || !query_upper.contains("STDIN") {
+        if !query_upper.contains("COPY")
+            || !query_upper.contains("FROM")
+            || !query_upper.contains("STDIN")
+        {
             return None;
         }
 
         // Regex: COPY [public.]table_name (col1, col2, ...) FROM stdin
-        let re = regex::Regex::new(r"(?i)COPY\s+(?:public\.)?(\w+)\s*\(([^)]+)\)\s+FROM\s+stdin").ok()?;
+        let re = regex::Regex::new(r"(?i)COPY\s+(?:public\.)?(\w+)\s*\(([^)]+)\)\s+FROM\s+stdin")
+            .ok()?;
         if let Some(caps) = re.captures(query) {
             let table_name = caps.get(1)?.as_str().to_string();
             let columns_str = caps.get(2)?.as_str();
@@ -194,13 +216,21 @@ impl DynamicPgHandler {
         None
     }
 
-    async fn authenticate_user(&self, keyspace: &Option<String>, username: &str, password: &str) -> Result<(bool, bool), String> {
-        let effective_keyspace = keyspace.clone()
+    async fn authenticate_user(
+        &self,
+        keyspace: &Option<String>,
+        username: &str,
+        password: &str,
+    ) -> Result<(bool, bool), String> {
+        let effective_keyspace = keyspace
+            .clone()
             .or_else(|| self.default_keyspace.clone())
             .or_else(|| Some("default".to_string()));
-        
-        let ks_name = effective_keyspace.clone().unwrap_or_else(|| "default".to_string());
-        
+
+        let ks_name = effective_keyspace
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+
         let store = if let Some(pool) = &self.client_pool {
             match pool.get_client(effective_keyspace).await {
                 Ok(s) => s,
@@ -219,7 +249,9 @@ impl DynamicPgHandler {
                 self.pd_endpoints.clone(),
                 self.namespace.clone(),
                 effective_keyspace,
-            ).await {
+            )
+            .await
+            {
                 Ok(s) => Arc::new(s),
                 Err(e) => {
                     error!("Failed to connect to TiKV: {}", e);
@@ -227,18 +259,34 @@ impl DynamicPgHandler {
                 }
             }
         };
-        
+
         let auth_manager = AuthManager::new(self.namespace.clone());
-        let mut txn = store.begin().await.map_err(|e| format!("Failed to begin transaction: {}", e))?;
-        
-        auth_manager.bootstrap(&mut txn).await.map_err(|e| format!("Failed to bootstrap auth: {}", e))?;
-        txn.commit().await.map_err(|e| format!("Failed to commit bootstrap: {}", e))?;
-        
-        let mut txn = store.begin().await.map_err(|e| format!("Failed to begin transaction: {}", e))?;
-        
-        match auth_manager.authenticate(&mut txn, username, password).await {
+        let mut txn = store
+            .begin()
+            .await
+            .map_err(|e| format!("Failed to begin transaction: {}", e))?;
+
+        auth_manager
+            .bootstrap(&mut txn)
+            .await
+            .map_err(|e| format!("Failed to bootstrap auth: {}", e))?;
+        txn.commit()
+            .await
+            .map_err(|e| format!("Failed to commit bootstrap: {}", e))?;
+
+        let mut txn = store
+            .begin()
+            .await
+            .map_err(|e| format!("Failed to begin transaction: {}", e))?;
+
+        match auth_manager
+            .authenticate(&mut txn, username, password)
+            .await
+        {
             Ok(Some(user)) => {
-                txn.commit().await.map_err(|e| format!("Failed to commit: {}", e))?;
+                txn.commit()
+                    .await
+                    .map_err(|e| format!("Failed to commit: {}", e))?;
                 Ok((true, user.is_superuser))
             }
             Ok(None) => {
@@ -273,18 +321,22 @@ impl StartupHandler for DynamicPgHandler {
         match message {
             PgWireFrontendMessage::Startup(ref startup) => {
                 pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
-                
+
                 if let Some(raw_user) = client.metadata().get(METADATA_USER).cloned() {
                     let (keyspace, actual_user) = parse_tenant_username(&raw_user);
-                    
+
                     if let Some(ks) = &keyspace {
-                        client.metadata_mut().insert(METADATA_KEYSPACE.to_string(), ks.clone());
+                        client
+                            .metadata_mut()
+                            .insert(METADATA_KEYSPACE.to_string(), ks.clone());
                         info!("Extracted keyspace '{}' from username '{}'", ks, raw_user);
                     }
-                    client.metadata_mut().insert(METADATA_ACTUAL_USER.to_string(), actual_user.clone());
+                    client
+                        .metadata_mut()
+                        .insert(METADATA_ACTUAL_USER.to_string(), actual_user.clone());
                     info!("Actual user: {}", actual_user);
                 }
-                
+
                 client.set_state(PgWireConnectionState::AuthenticationInProgress);
                 client
                     .send(PgWireBackendMessage::Authentication(
@@ -296,35 +348,71 @@ impl StartupHandler for DynamicPgHandler {
                 let pwd = pwd.into_password()?;
                 let provided_password = pwd.password.clone();
                 let keyspace = client.metadata().get(METADATA_KEYSPACE).cloned();
-                let actual_user = client.metadata().get(METADATA_ACTUAL_USER).cloned().unwrap_or_else(|| "admin".to_string());
-                
-                let auth_result = self.authenticate_user(&keyspace, &actual_user, &provided_password).await;
-                
+                let actual_user = client
+                    .metadata()
+                    .get(METADATA_ACTUAL_USER)
+                    .cloned()
+                    .unwrap_or_else(|| "admin".to_string());
+
+                let auth_result = self
+                    .authenticate_user(&keyspace, &actual_user, &provided_password)
+                    .await;
+
                 match auth_result {
                     Ok((is_authenticated, is_superuser)) => {
                         if is_authenticated {
-                            if let Err(e) = self.init_executor(keyspace.clone(), Some(actual_user.clone()), is_superuser).await {
-                                let error_info = ErrorInfo::new("FATAL".to_owned(), "XX000".to_owned(), e);
-                                client.feed(PgWireBackendMessage::ErrorResponse(ErrorResponse::from(error_info))).await?;
+                            if let Err(e) = self
+                                .init_executor(
+                                    keyspace.clone(),
+                                    Some(actual_user.clone()),
+                                    is_superuser,
+                                )
+                                .await
+                            {
+                                let error_info =
+                                    ErrorInfo::new("FATAL".to_owned(), "XX000".to_owned(), e);
+                                client
+                                    .feed(PgWireBackendMessage::ErrorResponse(ErrorResponse::from(
+                                        error_info,
+                                    )))
+                                    .await?;
                                 client.close().await?;
                                 return Ok(());
                             }
-                            
-                            pgwire::api::auth::finish_authentication(client, &PgServerParameterProvider).await?;
-                            info!("Authentication successful for user '{}' with keyspace {:?}", actual_user, keyspace);
+
+                            pgwire::api::auth::finish_authentication(
+                                client,
+                                &PgServerParameterProvider,
+                            )
+                            .await?;
+                            info!(
+                                "Authentication successful for user '{}' with keyspace {:?}",
+                                actual_user, keyspace
+                            );
                         } else {
                             let error_info = ErrorInfo::new(
                                 "FATAL".to_owned(),
                                 "28P01".to_owned(),
-                                format!("Password authentication failed for user \"{}\"", actual_user),
+                                format!(
+                                    "Password authentication failed for user \"{}\"",
+                                    actual_user
+                                ),
                             );
-                            client.feed(PgWireBackendMessage::ErrorResponse(ErrorResponse::from(error_info))).await?;
+                            client
+                                .feed(PgWireBackendMessage::ErrorResponse(ErrorResponse::from(
+                                    error_info,
+                                )))
+                                .await?;
                             client.close().await?;
                         }
                     }
                     Err(e) => {
                         let error_info = ErrorInfo::new("FATAL".to_owned(), "XX000".to_owned(), e);
-                        client.feed(PgWireBackendMessage::ErrorResponse(ErrorResponse::from(error_info))).await?;
+                        client
+                            .feed(PgWireBackendMessage::ErrorResponse(ErrorResponse::from(
+                                error_info,
+                            )))
+                            .await?;
                         client.close().await?;
                     }
                 }
@@ -352,13 +440,18 @@ impl SimpleQueryHandler for DynamicPgHandler {
         let executor = self.get_executor()?;
 
         if let Some((table_name, columns)) = Self::parse_copy_command(query) {
-            info!("COPY command detected: table={}, columns={:?}", table_name, columns);
-            
+            info!(
+                "COPY command detected: table={}, columns={:?}",
+                table_name, columns
+            );
+
             let col_count = if columns.is_empty() {
                 let mut session_guard = self.session.lock().await;
                 let session = session_guard.as_mut().ok_or_else(|| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_string(), "XX000".to_string(), "Session not initialized".to_string(),
+                        "ERROR".to_string(),
+                        "XX000".to_string(),
+                        "Session not initialized".to_string(),
                     )))
                 })?;
                 session.begin().await.ok();
@@ -376,22 +469,28 @@ impl SimpleQueryHandler for DynamicPgHandler {
             } else {
                 columns.len()
             };
-            
+
             let mut ctx = self.copy_context.lock().await;
             *ctx = Some(CopyContext {
                 table_name,
                 columns,
                 data_buffer: Vec::new(),
             });
-            
+
             let column_formats: Vec<i16> = vec![0; col_count];
-            return Ok(vec![Response::CopyIn(CopyResponse::new(0, col_count, column_formats))]);
+            return Ok(vec![Response::CopyIn(CopyResponse::new(
+                0,
+                col_count,
+                column_formats,
+            ))]);
         }
 
         let mut session_guard = self.session.lock().await;
         let session = session_guard.as_mut().ok_or_else(|| {
             PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_string(), "XX000".to_string(), "Session not initialized".to_string(),
+                "ERROR".to_string(),
+                "XX000".to_string(),
+                "Session not initialized".to_string(),
             )))
         })?;
 
@@ -434,41 +533,62 @@ impl CopyHandler for DynamicPgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let executor = self.get_executor()?;
-        
+
         let ctx_opt = {
             let mut ctx_guard = self.copy_context.lock().await;
             ctx_guard.take()
         };
 
         let row_count = if let Some(ctx) = ctx_opt {
-            info!("COPY done for table {}, processing {} data chunks", ctx.table_name, ctx.data_buffer.len());
-            
+            info!(
+                "COPY done for table {}, processing {} data chunks",
+                ctx.table_name,
+                ctx.data_buffer.len()
+            );
+
             let mut session_guard = self.session.lock().await;
             let session = session_guard.as_mut().ok_or_else(|| {
                 PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_string(), "XX000".to_string(), "Session not initialized".to_string(),
+                    "ERROR".to_string(),
+                    "XX000".to_string(),
+                    "Session not initialized".to_string(),
                 )))
             })?;
-            
-            session.begin().await.map_err(|e| PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_string(), "XX000".to_string(), e.to_string(),
-            ))))?;
+
+            session.begin().await.map_err(|e| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "XX000".to_string(),
+                    e.to_string(),
+                )))
+            })?;
 
             let schema = {
-                let txn = session.get_mut_txn().ok_or_else(|| PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_string(), "XX000".to_string(), "No transaction".to_string(),
-                ))))?;
-                executor.store()
+                let txn = session.get_mut_txn().ok_or_else(|| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "XX000".to_string(),
+                        "No transaction".to_string(),
+                    )))
+                })?;
+                executor
+                    .store()
                     .get_schema(txn, &ctx.table_name)
                     .await
-                    .map_err(|e| PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_string(), "XX000".to_string(), e.to_string(),
-                    ))))?
-                    .ok_or_else(|| PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_string(),
-                        "42P01".to_string(),
-                        format!("relation \"{}\" does not exist", ctx.table_name),
-                    ))))?
+                    .map_err(|e| {
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".to_string(),
+                            "XX000".to_string(),
+                            e.to_string(),
+                        )))
+                    })?
+                    .ok_or_else(|| {
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".to_string(),
+                            "42P01".to_string(),
+                            format!("relation \"{}\" does not exist", ctx.table_name),
+                        )))
+                    })?
             };
             session.rollback().await.ok();
 
@@ -482,19 +602,27 @@ impl CopyHandler for DynamicPgHandler {
             for chunk in &ctx.data_buffer {
                 all_data.extend_from_slice(chunk);
             }
-            
+
             let data_str = String::from_utf8_lossy(&all_data);
             let lines: Vec<&str> = data_str.lines().filter(|l| !l.is_empty()).collect();
-            
-            info!("Processing {} rows for COPY into {}", lines.len(), ctx.table_name);
+
+            info!(
+                "Processing {} rows for COPY into {}",
+                lines.len(),
+                ctx.table_name
+            );
 
             let mut count = 0usize;
 
             for line in lines {
                 let values: Vec<&str> = line.split('\t').collect();
-                
+
                 if values.len() != columns.len() {
-                    warn!("COPY row has {} values but expected {} columns, skipping", values.len(), columns.len());
+                    warn!(
+                        "COPY row has {} values but expected {} columns, skipping",
+                        values.len(),
+                        columns.len()
+                    );
                     continue;
                 }
 
@@ -513,24 +641,34 @@ impl CopyHandler for DynamicPgHandler {
                     col_values.push((col_name.clone(), value));
                 }
 
-                if let Err(e) = executor.execute_copy_insert(session, &ctx.table_name, col_values).await {
+                if let Err(e) = executor
+                    .execute_copy_insert(session, &ctx.table_name, col_values)
+                    .await
+                {
                     error!("COPY insert error: {}", e);
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_string(), "XX000".to_string(), e.to_string(),
+                        "ERROR".to_string(),
+                        "XX000".to_string(),
+                        e.to_string(),
                     ))));
                 }
                 count += 1;
             }
 
-            info!("COPY completed: {} rows inserted into {}", count, ctx.table_name);
+            info!(
+                "COPY completed: {} rows inserted into {}",
+                count, ctx.table_name
+            );
             count
         } else {
             0
         };
 
-        client.send(PgWireBackendMessage::CommandComplete(
-            CommandComplete::new(format!("COPY {}", row_count))
-        )).await?;
+        client
+            .send(PgWireBackendMessage::CommandComplete(CommandComplete::new(
+                format!("COPY {}", row_count),
+            )))
+            .await?;
 
         Ok(())
     }
@@ -545,7 +683,7 @@ impl CopyHandler for DynamicPgHandler {
         *ctx_guard = None;
 
         warn!("COPY failed: {}", fail.message);
-        
+
         PgWireError::UserError(Box::new(ErrorInfo::new(
             "ERROR".to_owned(),
             "XX000".to_owned(),
@@ -582,10 +720,12 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         let mut session_guard = self.session.lock().await;
         let session = session_guard.as_mut().ok_or_else(|| {
             PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_string(), "XX000".to_string(), "Session not initialized".to_string(),
+                "ERROR".to_string(),
+                "XX000".to_string(),
+                "Session not initialized".to_string(),
             )))
         })?;
-        
+
         match executor.execute(session, &final_query).await {
             Ok(result) => result_to_response(result),
             Err(e) => {
@@ -627,7 +767,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
 
 fn substitute_parameters(query: &str, portal: &Portal<String>) -> String {
     let mut result = query.to_string();
-    
+
     for i in 0..portal.parameter_len() {
         let placeholder = format!("${}", i + 1);
         let param_type = portal
@@ -636,62 +776,55 @@ fn substitute_parameters(query: &str, portal: &Portal<String>) -> String {
             .get(i)
             .cloned()
             .unwrap_or(Type::TEXT);
-        
+
         let value_str = match &param_type {
-            t if *t == Type::BOOL => {
-                portal.parameter::<bool>(i, &param_type)
-                    .ok()
-                    .flatten()
-                    .map(|v| if v { "true" } else { "false" }.to_string())
-                    .unwrap_or_else(|| "NULL".to_string())
-            }
-            t if *t == Type::INT2 => {
-                portal.parameter::<i16>(i, &param_type)
-                    .ok()
-                    .flatten()
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "NULL".to_string())
-            }
-            t if *t == Type::INT4 => {
-                portal.parameter::<i32>(i, &param_type)
-                    .ok()
-                    .flatten()
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "NULL".to_string())
-            }
-            t if *t == Type::INT8 => {
-                portal.parameter::<i64>(i, &param_type)
-                    .ok()
-                    .flatten()
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "NULL".to_string())
-            }
-            t if *t == Type::FLOAT4 => {
-                portal.parameter::<f32>(i, &param_type)
-                    .ok()
-                    .flatten()
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "NULL".to_string())
-            }
-            t if *t == Type::FLOAT8 => {
-                portal.parameter::<f64>(i, &param_type)
-                    .ok()
-                    .flatten()
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "NULL".to_string())
-            }
-            _ => {
-                portal.parameter::<String>(i, &param_type)
-                    .ok()
-                    .flatten()
-                    .map(|v| format!("'{}'", v.replace("'", "''")))
-                    .unwrap_or_else(|| "NULL".to_string())
-            }
+            t if *t == Type::BOOL => portal
+                .parameter::<bool>(i, &param_type)
+                .ok()
+                .flatten()
+                .map(|v| if v { "true" } else { "false" }.to_string())
+                .unwrap_or_else(|| "NULL".to_string()),
+            t if *t == Type::INT2 => portal
+                .parameter::<i16>(i, &param_type)
+                .ok()
+                .flatten()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "NULL".to_string()),
+            t if *t == Type::INT4 => portal
+                .parameter::<i32>(i, &param_type)
+                .ok()
+                .flatten()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "NULL".to_string()),
+            t if *t == Type::INT8 => portal
+                .parameter::<i64>(i, &param_type)
+                .ok()
+                .flatten()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "NULL".to_string()),
+            t if *t == Type::FLOAT4 => portal
+                .parameter::<f32>(i, &param_type)
+                .ok()
+                .flatten()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "NULL".to_string()),
+            t if *t == Type::FLOAT8 => portal
+                .parameter::<f64>(i, &param_type)
+                .ok()
+                .flatten()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "NULL".to_string()),
+            _ => portal
+                .parameter::<String>(i, &param_type)
+                .ok()
+                .flatten()
+                .map(|v| format!("'{}'", v.replace("'", "''")))
+                .unwrap_or_else(|| "NULL".to_string()),
         };
-        
+
         result = result.replace(&placeholder, &value_str);
     }
-    
+
     result
 }
 
@@ -781,7 +914,7 @@ pub struct HandlerFactory {
 
 impl HandlerFactory {
     pub fn new(executor: Arc<Executor>) -> Self {
-        Self { 
+        Self {
             handler: Arc::new(PgHandler::new(executor)),
         }
     }
@@ -807,11 +940,15 @@ impl PgHandler {
 
     fn parse_copy_command(query: &str) -> Option<(String, Vec<String>)> {
         let query_upper = query.to_uppercase();
-        if !query_upper.contains("COPY") || !query_upper.contains("FROM") || !query_upper.contains("STDIN") {
+        if !query_upper.contains("COPY")
+            || !query_upper.contains("FROM")
+            || !query_upper.contains("STDIN")
+        {
             return None;
         }
 
-        let re = regex::Regex::new(r"(?i)COPY\s+(?:public\.)?(\w+)\s*\(([^)]+)\)\s+FROM\s+stdin").ok()?;
+        let re = regex::Regex::new(r"(?i)COPY\s+(?:public\.)?(\w+)\s*\(([^)]+)\)\s+FROM\s+stdin")
+            .ok()?;
         if let Some(caps) = re.captures(query) {
             let table_name = caps.get(1)?.as_str().to_string();
             let columns_str = caps.get(2)?.as_str();
@@ -867,13 +1004,18 @@ impl SimpleQueryHandler for PgHandler {
         info!("Received query: {}", query);
 
         if let Some((table_name, columns)) = Self::parse_copy_command(query) {
-            info!("COPY command detected: table={}, columns={:?}", table_name, columns);
-            
+            info!(
+                "COPY command detected: table={}, columns={:?}",
+                table_name, columns
+            );
+
             let col_count = if columns.is_empty() {
                 let mut session = self.session.lock().await;
                 session.begin().await.ok();
                 let count = if let Some(txn) = session.get_mut_txn() {
-                    if let Ok(Some(schema)) = self.executor.store().get_schema(txn, &table_name).await {
+                    if let Ok(Some(schema)) =
+                        self.executor.store().get_schema(txn, &table_name).await
+                    {
                         schema.columns.len()
                     } else {
                         1
@@ -886,16 +1028,20 @@ impl SimpleQueryHandler for PgHandler {
             } else {
                 columns.len()
             };
-            
+
             let mut ctx = self.copy_context.lock().await;
             *ctx = Some(CopyContext {
                 table_name,
                 columns,
                 data_buffer: Vec::new(),
             });
-            
+
             let column_formats: Vec<i16> = vec![0; col_count];
-            return Ok(vec![Response::CopyIn(CopyResponse::new(0, col_count, column_formats))]);
+            return Ok(vec![Response::CopyIn(CopyResponse::new(
+                0,
+                col_count,
+                column_formats,
+            ))]);
         }
 
         let mut session = self.session.lock().await;
@@ -944,28 +1090,47 @@ impl CopyHandler for PgHandler {
         };
 
         let row_count = if let Some(ctx) = ctx_opt {
-            info!("COPY done for table {}, processing {} data chunks", ctx.table_name, ctx.data_buffer.len());
-            
+            info!(
+                "COPY done for table {}, processing {} data chunks",
+                ctx.table_name,
+                ctx.data_buffer.len()
+            );
+
             let mut session = self.session.lock().await;
-            session.begin().await.map_err(|e| PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_string(), "XX000".to_string(), e.to_string(),
-            ))))?;
+            session.begin().await.map_err(|e| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "XX000".to_string(),
+                    e.to_string(),
+                )))
+            })?;
 
             let schema = {
-                let txn = session.get_mut_txn().ok_or_else(|| PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_string(), "XX000".to_string(), "No transaction".to_string(),
-                ))))?;
-                self.executor.store()
+                let txn = session.get_mut_txn().ok_or_else(|| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "XX000".to_string(),
+                        "No transaction".to_string(),
+                    )))
+                })?;
+                self.executor
+                    .store()
                     .get_schema(txn, &ctx.table_name)
                     .await
-                    .map_err(|e| PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_string(), "XX000".to_string(), e.to_string(),
-                    ))))?
-                    .ok_or_else(|| PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_string(),
-                        "42P01".to_string(),
-                        format!("relation \"{}\" does not exist", ctx.table_name),
-                    ))))?
+                    .map_err(|e| {
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".to_string(),
+                            "XX000".to_string(),
+                            e.to_string(),
+                        )))
+                    })?
+                    .ok_or_else(|| {
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".to_string(),
+                            "42P01".to_string(),
+                            format!("relation \"{}\" does not exist", ctx.table_name),
+                        )))
+                    })?
             };
             session.rollback().await.ok();
 
@@ -979,19 +1144,27 @@ impl CopyHandler for PgHandler {
             for chunk in &ctx.data_buffer {
                 all_data.extend_from_slice(chunk);
             }
-            
+
             let data_str = String::from_utf8_lossy(&all_data);
             let lines: Vec<&str> = data_str.lines().filter(|l| !l.is_empty()).collect();
-            
-            info!("Processing {} rows for COPY into {}", lines.len(), ctx.table_name);
+
+            info!(
+                "Processing {} rows for COPY into {}",
+                lines.len(),
+                ctx.table_name
+            );
 
             let mut count = 0usize;
 
             for line in lines {
                 let values: Vec<&str> = line.split('\t').collect();
-                
+
                 if values.len() != columns.len() {
-                    warn!("COPY row has {} values but expected {} columns, skipping", values.len(), columns.len());
+                    warn!(
+                        "COPY row has {} values but expected {} columns, skipping",
+                        values.len(),
+                        columns.len()
+                    );
                     continue;
                 }
 
@@ -1010,24 +1183,35 @@ impl CopyHandler for PgHandler {
                     col_values.push((col_name.clone(), value));
                 }
 
-                if let Err(e) = self.executor.execute_copy_insert(&mut session, &ctx.table_name, col_values).await {
+                if let Err(e) = self
+                    .executor
+                    .execute_copy_insert(&mut session, &ctx.table_name, col_values)
+                    .await
+                {
                     error!("COPY insert error: {}", e);
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_string(), "XX000".to_string(), e.to_string(),
+                        "ERROR".to_string(),
+                        "XX000".to_string(),
+                        e.to_string(),
                     ))));
                 }
                 count += 1;
             }
 
-            info!("COPY completed: {} rows inserted into {}", count, ctx.table_name);
+            info!(
+                "COPY completed: {} rows inserted into {}",
+                count, ctx.table_name
+            );
             count
         } else {
             0
         };
 
-        client.send(PgWireBackendMessage::CommandComplete(
-            CommandComplete::new(format!("COPY {}", row_count))
-        )).await?;
+        client
+            .send(PgWireBackendMessage::CommandComplete(CommandComplete::new(
+                format!("COPY {}", row_count),
+            )))
+            .await?;
 
         Ok(())
     }
@@ -1042,7 +1226,7 @@ impl CopyHandler for PgHandler {
         *ctx_guard = None;
 
         warn!("COPY failed: {}", fail.message);
-        
+
         PgWireError::UserError(Box::new(ErrorInfo::new(
             "ERROR".to_owned(),
             "XX000".to_owned(),
@@ -1148,13 +1332,11 @@ fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> 
         ExecuteResult::Select { columns, rows } => {
             let fields: Vec<FieldInfo> = columns
                 .iter()
-                .map(|name| {
-                    FieldInfo::new(name.clone(), None, None, Type::TEXT, FieldFormat::Text)
-                })
+                .map(|name| FieldInfo::new(name.clone(), None, None, Type::TEXT, FieldFormat::Text))
                 .collect();
 
             let fields = Arc::new(fields);
-            
+
             let mut data_rows: Vec<PgWireResult<DataRow>> = Vec::new();
             for row in rows {
                 let mut encoder = DataRowEncoder::new(fields.clone());
@@ -1170,49 +1352,35 @@ fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> 
             Ok(Response::Query(results))
         }
 
-        ExecuteResult::CreateTable { .. } => {
-            Ok(Response::Execution(Tag::new("CREATE TABLE")))
-        }
+        ExecuteResult::CreateTable { .. } => Ok(Response::Execution(Tag::new("CREATE TABLE"))),
 
-        ExecuteResult::DropTable { .. } => {
-            Ok(Response::Execution(Tag::new("DROP TABLE")))
-        }
+        ExecuteResult::DropTable { .. } => Ok(Response::Execution(Tag::new("DROP TABLE"))),
 
-        ExecuteResult::TruncateTable { .. } => {
-            Ok(Response::Execution(Tag::new("TRUNCATE TABLE")))
-        }
+        ExecuteResult::TruncateTable { .. } => Ok(Response::Execution(Tag::new("TRUNCATE TABLE"))),
 
-        ExecuteResult::CreateIndex { .. } => {
-            Ok(Response::Execution(Tag::new("CREATE INDEX")))
-        }
+        ExecuteResult::CreateIndex { .. } => Ok(Response::Execution(Tag::new("CREATE INDEX"))),
 
-        ExecuteResult::DropIndex { .. } => {
-            Ok(Response::Execution(Tag::new("DROP INDEX")))
-        }
+        ExecuteResult::DropIndex { .. } => Ok(Response::Execution(Tag::new("DROP INDEX"))),
 
-        ExecuteResult::CreateView { .. } => {
-            Ok(Response::Execution(Tag::new("CREATE VIEW")))
-        }
+        ExecuteResult::CreateView { .. } => Ok(Response::Execution(Tag::new("CREATE VIEW"))),
 
-        ExecuteResult::DropView { .. } => {
-            Ok(Response::Execution(Tag::new("DROP VIEW")))
-        }
+        ExecuteResult::DropView { .. } => Ok(Response::Execution(Tag::new("DROP VIEW"))),
 
-        ExecuteResult::AlterTable { .. } => {
-            Ok(Response::Execution(Tag::new("ALTER TABLE")))
-        }
+        ExecuteResult::AlterTable { .. } => Ok(Response::Execution(Tag::new("ALTER TABLE"))),
 
-        ExecuteResult::Insert { affected_rows } => {
-            Ok(Response::Execution(Tag::new("INSERT").with_oid(0).with_rows(affected_rows as usize)))
-        }
+        ExecuteResult::Insert { affected_rows } => Ok(Response::Execution(
+            Tag::new("INSERT")
+                .with_oid(0)
+                .with_rows(affected_rows as usize),
+        )),
 
-        ExecuteResult::Delete { affected_rows } => {
-            Ok(Response::Execution(Tag::new("DELETE").with_rows(affected_rows as usize)))
-        }
+        ExecuteResult::Delete { affected_rows } => Ok(Response::Execution(
+            Tag::new("DELETE").with_rows(affected_rows as usize),
+        )),
 
-        ExecuteResult::Update { affected_rows } => {
-            Ok(Response::Execution(Tag::new("UPDATE").with_rows(affected_rows as usize)))
-        }
+        ExecuteResult::Update { affected_rows } => Ok(Response::Execution(
+            Tag::new("UPDATE").with_rows(affected_rows as usize),
+        )),
 
         ExecuteResult::ShowTables { tables } => {
             let fields = vec![FieldInfo::new(
@@ -1239,11 +1407,41 @@ fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> 
 
         ExecuteResult::Describe { schema } => {
             let fields = vec![
-                FieldInfo::new("column_name".to_string(), None, None, Type::TEXT, FieldFormat::Text),
-                FieldInfo::new("data_type".to_string(), None, None, Type::TEXT, FieldFormat::Text),
-                FieldInfo::new("nullable".to_string(), None, None, Type::BOOL, FieldFormat::Text),
-                FieldInfo::new("primary_key".to_string(), None, None, Type::BOOL, FieldFormat::Text),
-                FieldInfo::new("default".to_string(), None, None, Type::TEXT, FieldFormat::Text),
+                FieldInfo::new(
+                    "column_name".to_string(),
+                    None,
+                    None,
+                    Type::TEXT,
+                    FieldFormat::Text,
+                ),
+                FieldInfo::new(
+                    "data_type".to_string(),
+                    None,
+                    None,
+                    Type::TEXT,
+                    FieldFormat::Text,
+                ),
+                FieldInfo::new(
+                    "nullable".to_string(),
+                    None,
+                    None,
+                    Type::BOOL,
+                    FieldFormat::Text,
+                ),
+                FieldInfo::new(
+                    "primary_key".to_string(),
+                    None,
+                    None,
+                    Type::BOOL,
+                    FieldFormat::Text,
+                ),
+                FieldInfo::new(
+                    "default".to_string(),
+                    None,
+                    None,
+                    Type::TEXT,
+                    FieldFormat::Text,
+                ),
             ];
             let fields = Arc::new(fields);
 
@@ -1254,14 +1452,14 @@ fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> 
                 encoder.encode_field(&col.data_type.to_string())?;
                 encoder.encode_field(&col.nullable)?;
                 encoder.encode_field(&col.primary_key)?;
-                
+
                 let default_val = if col.is_serial {
                     Some("SERIAL (AUTO_INC)".to_string())
                 } else {
                     col.default_expr.clone()
                 };
                 encoder.encode_field(&default_val)?;
-                
+
                 data_rows.push(encoder.finish());
             }
 
@@ -1271,33 +1469,27 @@ fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> 
             Ok(Response::Query(results))
         }
 
-        ExecuteResult::Empty => {
-            Ok(Response::EmptyQuery)
-        }
+        ExecuteResult::Empty => Ok(Response::EmptyQuery),
 
-        ExecuteResult::CreateRole => {
-            Ok(Response::Execution(Tag::new("CREATE ROLE")))
-        }
+        ExecuteResult::CreateRole => Ok(Response::Execution(Tag::new("CREATE ROLE"))),
 
-        ExecuteResult::AlterRole => {
-            Ok(Response::Execution(Tag::new("ALTER ROLE")))
-        }
+        ExecuteResult::AlterRole => Ok(Response::Execution(Tag::new("ALTER ROLE"))),
 
-        ExecuteResult::DropRole => {
-            Ok(Response::Execution(Tag::new("DROP ROLE")))
-        }
+        ExecuteResult::DropRole => Ok(Response::Execution(Tag::new("DROP ROLE"))),
 
-        ExecuteResult::Grant => {
-            Ok(Response::Execution(Tag::new("GRANT")))
-        }
+        ExecuteResult::Grant => Ok(Response::Execution(Tag::new("GRANT"))),
 
-        ExecuteResult::Revoke => {
-            Ok(Response::Execution(Tag::new("REVOKE")))
-        }
+        ExecuteResult::Revoke => Ok(Response::Execution(Tag::new("REVOKE"))),
 
         ExecuteResult::Skipped { message } => {
             tracing::warn!("SKIPPED: {}", message);
-            let fields = vec![FieldInfo::new("warning".to_string(), None, None, Type::TEXT, FieldFormat::Text)];
+            let fields = vec![FieldInfo::new(
+                "warning".to_string(),
+                None,
+                None,
+                Type::TEXT,
+                FieldFormat::Text,
+            )];
             let fields = Arc::new(fields);
             let mut encoder = DataRowEncoder::new(fields.clone());
             encoder.encode_field(&format!("SKIPPED: {}", message))?;
@@ -1322,12 +1514,12 @@ fn encode_value(encoder: &mut DataRowEncoder, value: &Value) -> PgWireResult<()>
             let seconds = ts / 1000;
             let nanos = (ts % 1000) * 1_000_000;
             if let Some(naive) = NaiveDateTime::from_timestamp_opt(seconds, nanos as u32) {
-                 let dt = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc);
-                 encoder.encode_field(&dt.to_rfc3339())
+                let dt = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc);
+                encoder.encode_field(&dt.to_rfc3339())
             } else {
-                 encoder.encode_field(&ts.to_string())
+                encoder.encode_field(&ts.to_string())
             }
-        },
+        }
         Value::Interval(ms) => {
             let days = *ms / (1000 * 60 * 60 * 24);
             let remaining = *ms % (1000 * 60 * 60 * 24);
@@ -1336,11 +1528,14 @@ fn encode_value(encoder: &mut DataRowEncoder, value: &Value) -> PgWireResult<()>
             let mins = remaining / (1000 * 60);
             let secs = (remaining % (1000 * 60)) / 1000;
             if days != 0 {
-                encoder.encode_field(&format!("{} days {:02}:{:02}:{:02}", days, hours, mins, secs))
+                encoder.encode_field(&format!(
+                    "{} days {:02}:{:02}:{:02}",
+                    days, hours, mins, secs
+                ))
             } else {
                 encoder.encode_field(&format!("{:02}:{:02}:{:02}", hours, mins, secs))
             }
-        },
+        }
         Value::Uuid(bytes) => {
             let uuid = uuid::Uuid::from_bytes(*bytes);
             encoder.encode_field(&uuid.to_string())
@@ -1489,7 +1684,13 @@ mod tests {
     #[test]
     fn test_parse_copy_command_basic() {
         let result = DynamicPgHandler::parse_copy_command("COPY users (id, name) FROM stdin");
-        assert_eq!(result, Some(("users".to_string(), vec!["id".to_string(), "name".to_string()])));
+        assert_eq!(
+            result,
+            Some((
+                "users".to_string(),
+                vec!["id".to_string(), "name".to_string()]
+            ))
+        );
     }
 
     #[test]
@@ -1500,36 +1701,67 @@ mod tests {
 
     #[test]
     fn test_parse_copy_command_with_public_schema() {
-        let result = DynamicPgHandler::parse_copy_command("COPY public.users (id, name) FROM stdin");
-        assert_eq!(result, Some(("users".to_string(), vec!["id".to_string(), "name".to_string()])));
+        let result =
+            DynamicPgHandler::parse_copy_command("COPY public.users (id, name) FROM stdin");
+        assert_eq!(
+            result,
+            Some((
+                "users".to_string(),
+                vec!["id".to_string(), "name".to_string()]
+            ))
+        );
     }
 
     #[test]
     fn test_parse_copy_command_case_insensitive() {
         let result = DynamicPgHandler::parse_copy_command("copy USERS (ID, NAME) from STDIN");
-        assert_eq!(result, Some(("USERS".to_string(), vec!["ID".to_string(), "NAME".to_string()])));
+        assert_eq!(
+            result,
+            Some((
+                "USERS".to_string(),
+                vec!["ID".to_string(), "NAME".to_string()]
+            ))
+        );
     }
 
     #[test]
     fn test_parse_copy_command_not_copy() {
-        assert_eq!(DynamicPgHandler::parse_copy_command("SELECT * FROM users"), None);
-        assert_eq!(DynamicPgHandler::parse_copy_command("INSERT INTO users VALUES (1)"), None);
+        assert_eq!(
+            DynamicPgHandler::parse_copy_command("SELECT * FROM users"),
+            None
+        );
+        assert_eq!(
+            DynamicPgHandler::parse_copy_command("INSERT INTO users VALUES (1)"),
+            None
+        );
     }
 
     #[test]
     fn test_parse_copy_command_copy_to() {
-        assert_eq!(DynamicPgHandler::parse_copy_command("COPY users TO stdout"), None);
+        assert_eq!(
+            DynamicPgHandler::parse_copy_command("COPY users TO stdout"),
+            None
+        );
     }
 
     #[test]
     fn test_parse_copy_command_many_columns() {
         let result = DynamicPgHandler::parse_copy_command(
-            "COPY orders (id, user_id, product, quantity, price, created_at) FROM stdin"
+            "COPY orders (id, user_id, product, quantity, price, created_at) FROM stdin",
         );
-        assert_eq!(result, Some((
-            "orders".to_string(),
-            vec!["id".to_string(), "user_id".to_string(), "product".to_string(), 
-                 "quantity".to_string(), "price".to_string(), "created_at".to_string()]
-        )));
+        assert_eq!(
+            result,
+            Some((
+                "orders".to_string(),
+                vec![
+                    "id".to_string(),
+                    "user_id".to_string(),
+                    "product".to_string(),
+                    "quantity".to_string(),
+                    "price".to_string(),
+                    "created_at".to_string()
+                ]
+            ))
+        );
     }
 }

@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
-    AlterRoleOperation, Expr, GrantObjects, Ident, ObjectName, Password as SqlPassword,
-    Privileges, Value as SqlValue,
+    AlterRoleOperation, Expr, GrantObjects, Ident, ObjectName, Password as SqlPassword, Privileges,
+    Value as SqlValue,
 };
 use tikv_client::Transaction;
 
@@ -76,7 +76,9 @@ pub async fn execute_alter_role(
         .ok_or_else(|| anyhow!("Role '{}' does not exist", role_name))?;
 
     match operation {
-        AlterRoleOperation::RenameRole { role_name: new_name } => {
+        AlterRoleOperation::RenameRole {
+            role_name: new_name,
+        } => {
             auth_manager.drop_user(txn, &role_name).await?;
             user.name = new_name.value.clone();
             auth_manager.create_user(txn, user).await?;

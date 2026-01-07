@@ -1,17 +1,17 @@
 //! SQL parsing and execution
 
+mod ddl;
+mod dml;
 mod executor;
-mod parser;
-mod result;
+mod explain;
 mod expr;
 mod helpers;
-mod window;
-mod ddl;
-mod rbac;
-mod dml;
-mod query;
+mod parser;
 mod planner;
-mod explain;
+mod query;
+mod rbac;
+mod result;
+mod window;
 
 pub use executor::*;
 pub use parser::*;

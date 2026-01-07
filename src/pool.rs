@@ -37,12 +37,13 @@ impl TikvClientPool {
         }
 
         info!("Creating new TiKV client for keyspace: {}", key);
-        
+
         let result = TikvStore::new_with_keyspace(
             self.pd_endpoints.clone(),
             self.namespace.clone(),
             keyspace.clone(),
-        ).await;
+        )
+        .await;
 
         let store = match result {
             Ok(s) => s,

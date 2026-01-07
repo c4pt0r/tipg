@@ -66,12 +66,16 @@ pub async fn execute_insert_row(
 ) -> Result<Option<Row>> {
     let pk_values = schema.get_pk_values(&row);
 
+    if !schema.foreign_keys.is_empty() {
+        validate_foreign_keys(store, txn, schema, &row).await?;
+    }
+
     let insert_result = store.insert(txn, table_name, row.clone()).await;
     match insert_result {
         Ok(()) => {
             for index in &schema.indexes {
                 let idx_values = schema.get_index_values(index, &row);
-                store
+                let result = store
                     .create_index_entry(
                         txn,
                         schema.table_id,
@@ -80,38 +84,28 @@ pub async fn execute_insert_row(
                         &pk_values,
                         index.unique,
                     )
-                    .await?;
+                    .await;
+                if let Err(e) = result {
+                    if e.to_string().contains("Duplicate entry") {
+                        let cols = index.columns.join(", ");
+                        let vals: Vec<String> =
+                            idx_values.iter().map(|v| format!("{}", v)).collect();
+                        return Err(anyhow!(
+                            "duplicate key value violates unique constraint \"{}\"\nDETAIL:  Key ({})=({}) already exists.",
+                            index.name,
+                            cols,
+                            vals.join(", ")
+                        ));
+                    }
+                    return Err(e);
+                }
             }
             Ok(Some(row))
         }
-        Err(e) if e.to_string().contains("Duplicate primary key") => {
-            match on_conflict {
-                Some(OnInsert::OnConflict(oc)) => match &oc.action {
-                    OnConflictAction::DoNothing => Ok(None),
-                    OnConflictAction::DoUpdate(do_update) => {
-                        let existing_rows = store
-                            .batch_get_rows(txn, schema.table_id, vec![pk_values.clone()], schema)
-                            .await?;
-                        if existing_rows.is_empty() {
-                            return Err(anyhow!("Failed to fetch existing row for upsert"));
-                        }
-                        let existing_row = &existing_rows[0];
-                        let mut updated_vals = existing_row.values.clone();
-                        for assignment in &do_update.assignments {
-                            let col_name = assignment.id.last().unwrap().value.clone();
-                            let col_idx = schema.column_index(&col_name).ok_or_else(|| {
-                                anyhow!("Unknown column in DO UPDATE: {}", col_name)
-                            })?;
-                            updated_vals[col_idx] =
-                                eval_expr(&assignment.value, Some(existing_row), Some(schema))?;
-                        }
-                        let updated_row = Row::new(updated_vals);
-                        update_row_indexes(store, txn, schema, existing_row, &updated_row).await?;
-                        store.upsert(txn, table_name, updated_row.clone()).await?;
-                        Ok(Some(updated_row))
-                    }
-                },
-                Some(OnInsert::DuplicateKeyUpdate(assignments)) => {
+        Err(e) if e.to_string().contains("Duplicate primary key") => match on_conflict {
+            Some(OnInsert::OnConflict(oc)) => match &oc.action {
+                OnConflictAction::DoNothing => Ok(None),
+                OnConflictAction::DoUpdate(do_update) => {
                     let existing_rows = store
                         .batch_get_rows(txn, schema.table_id, vec![pk_values.clone()], schema)
                         .await?;
@@ -120,11 +114,11 @@ pub async fn execute_insert_row(
                     }
                     let existing_row = &existing_rows[0];
                     let mut updated_vals = existing_row.values.clone();
-                    for assignment in assignments {
+                    for assignment in &do_update.assignments {
                         let col_name = assignment.id.last().unwrap().value.clone();
                         let col_idx = schema
                             .column_index(&col_name)
-                            .ok_or_else(|| anyhow!("Unknown column: {}", col_name))?;
+                            .ok_or_else(|| anyhow!("Unknown column in DO UPDATE: {}", col_name))?;
                         updated_vals[col_idx] =
                             eval_expr(&assignment.value, Some(existing_row), Some(schema))?;
                     }
@@ -133,10 +127,32 @@ pub async fn execute_insert_row(
                     store.upsert(txn, table_name, updated_row.clone()).await?;
                     Ok(Some(updated_row))
                 }
-                None => Err(e),
-                _ => Err(e),
+            },
+            Some(OnInsert::DuplicateKeyUpdate(assignments)) => {
+                let existing_rows = store
+                    .batch_get_rows(txn, schema.table_id, vec![pk_values.clone()], schema)
+                    .await?;
+                if existing_rows.is_empty() {
+                    return Err(anyhow!("Failed to fetch existing row for upsert"));
+                }
+                let existing_row = &existing_rows[0];
+                let mut updated_vals = existing_row.values.clone();
+                for assignment in assignments {
+                    let col_name = assignment.id.last().unwrap().value.clone();
+                    let col_idx = schema
+                        .column_index(&col_name)
+                        .ok_or_else(|| anyhow!("Unknown column: {}", col_name))?;
+                    updated_vals[col_idx] =
+                        eval_expr(&assignment.value, Some(existing_row), Some(schema))?;
+                }
+                let updated_row = Row::new(updated_vals);
+                update_row_indexes(store, txn, schema, existing_row, &updated_row).await?;
+                store.upsert(txn, table_name, updated_row.clone()).await?;
+                Ok(Some(updated_row))
             }
-        }
+            None => Err(e),
+            _ => Err(e),
+        },
         Err(e) => Err(e),
     }
 }
@@ -178,6 +194,298 @@ async fn update_row_indexes(
     Ok(())
 }
 
+pub async fn handle_foreign_key_on_delete(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    table_name: &str,
+    schema: &TableSchema,
+    row: &Row,
+) -> Result<()> {
+    let pk_values = schema.get_pk_values(row);
+
+    let table_names = store.list_tables(txn).await?;
+    let mut table_rows: HashMap<String, Vec<Row>> = HashMap::new();
+    let mut table_schemas: HashMap<String, TableSchema> = HashMap::new();
+    for t in &table_names {
+        if let Some(s) = store.get_schema(txn, t).await? {
+            if !s.foreign_keys.is_empty() {
+                let rows = store.scan(txn, t).await?;
+                table_rows.insert(t.clone(), rows);
+                table_schemas.insert(t.clone(), s);
+            }
+        }
+    }
+
+    let mut deleted_pks: HashMap<String, Vec<Vec<Value>>> = HashMap::new();
+
+    Box::pin(cascade_delete_recursive(
+        store,
+        txn,
+        table_name,
+        &pk_values,
+        &table_rows,
+        &table_schemas,
+        &mut deleted_pks,
+    ))
+    .await
+}
+
+async fn cascade_delete_recursive(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    table_name: &str,
+    pk_values: &[Value],
+    table_rows: &HashMap<String, Vec<Row>>,
+    table_schemas: &HashMap<String, TableSchema>,
+    deleted_pks: &mut HashMap<String, Vec<Vec<Value>>>,
+) -> Result<()> {
+    use crate::types::ForeignKeyAction;
+
+    for (other_table, other_schema) in table_schemas {
+        if other_table == table_name {
+            continue;
+        }
+
+        for fk in &other_schema.foreign_keys {
+            if fk.ref_table != table_name {
+                continue;
+            }
+
+            let all_rows = table_rows.get(other_table).cloned().unwrap_or_default();
+            let deleted_in_table = deleted_pks.entry(other_table.clone()).or_default();
+
+            let mut rows_to_cascade: Vec<Row> = Vec::new();
+            let mut rows_to_update: Vec<(Row, Row)> = Vec::new();
+
+            for other_row in &all_rows {
+                let other_pk = other_schema.get_pk_values(other_row);
+                if deleted_in_table.contains(&other_pk) {
+                    continue;
+                }
+
+                let mut fk_values: Vec<Value> = Vec::new();
+                let mut all_null = true;
+
+                for col_name in &fk.columns {
+                    if let Some(idx) = other_schema.column_index(col_name) {
+                        let val = other_row.values[idx].clone();
+                        if val != Value::Null {
+                            all_null = false;
+                        }
+                        fk_values.push(val);
+                    }
+                }
+
+                if all_null {
+                    continue;
+                }
+
+                if fk_values == pk_values {
+                    match fk.on_delete {
+                        ForeignKeyAction::Cascade => {
+                            rows_to_cascade.push(other_row.clone());
+                        }
+                        ForeignKeyAction::SetNull => {
+                            let mut new_values = other_row.values.clone();
+                            for col_name in &fk.columns {
+                                if let Some(idx) = other_schema.column_index(col_name) {
+                                    new_values[idx] = Value::Null;
+                                }
+                            }
+                            rows_to_update.push((other_row.clone(), Row::new(new_values)));
+                        }
+                        ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {
+                            let cols = fk.ref_columns.join(", ");
+                            let pk_val_strs: Vec<String> =
+                                pk_values.iter().map(|v| format!("{}", v)).collect();
+                            return Err(anyhow!(
+                                "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"\n\
+                                 DETAIL:  Key ({})=({}) is still referenced from table \"{}\".",
+                                table_name,
+                                fk.name,
+                                other_table,
+                                cols,
+                                pk_val_strs.join(", "),
+                                other_table
+                            ));
+                        }
+                        ForeignKeyAction::SetDefault => {
+                            let mut new_values = other_row.values.clone();
+                            for col_name in &fk.columns {
+                                if let Some(idx) = other_schema.column_index(col_name) {
+                                    let col = &other_schema.columns[idx];
+                                    let default_val = if let Some(ref def_expr) = col.default_expr {
+                                        eval_default_expr(def_expr)?
+                                    } else {
+                                        Value::Null
+                                    };
+                                    new_values[idx] = default_val;
+                                }
+                            }
+                            rows_to_update.push((other_row.clone(), Row::new(new_values)));
+                        }
+                    }
+                }
+            }
+
+            for del_row in rows_to_cascade {
+                let del_pk = other_schema.get_pk_values(&del_row);
+
+                Box::pin(cascade_delete_recursive(
+                    store,
+                    txn,
+                    other_table,
+                    &del_pk,
+                    table_rows,
+                    table_schemas,
+                    deleted_pks,
+                ))
+                .await?;
+
+                deleted_pks
+                    .entry(other_table.clone())
+                    .or_default()
+                    .push(del_pk.clone());
+
+                store.delete_by_pk(txn, other_table, &del_pk).await?;
+            }
+
+            for (old_row, new_row) in rows_to_update {
+                execute_update_row(store, txn, other_table, other_schema, &old_row, new_row)
+                    .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn handle_foreign_key_on_update(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    table_name: &str,
+    schema: &TableSchema,
+    old_row: &Row,
+    new_row: &Row,
+) -> Result<()> {
+    use crate::types::ForeignKeyAction;
+
+    let old_pk_values = schema.get_pk_values(old_row);
+    let new_pk_values = schema.get_pk_values(new_row);
+
+    if old_pk_values == new_pk_values {
+        return Ok(());
+    }
+
+    let table_names = store.list_tables(txn).await?;
+
+    for other_table in &table_names {
+        if other_table == table_name {
+            continue;
+        }
+
+        let other_schema = match store.get_schema(txn, other_table).await? {
+            Some(s) => s,
+            None => continue,
+        };
+
+        for fk in &other_schema.foreign_keys {
+            if fk.ref_table != table_name {
+                continue;
+            }
+
+            let all_rows = store.scan(txn, other_table).await?;
+            let mut rows_to_update: Vec<(Row, Row)> = Vec::new();
+
+            for other_row in &all_rows {
+                let mut fk_values: Vec<Value> = Vec::new();
+                let mut all_null = true;
+
+                for col_name in &fk.columns {
+                    if let Some(idx) = other_schema.column_index(col_name) {
+                        let val = other_row.values[idx].clone();
+                        if val != Value::Null {
+                            all_null = false;
+                        }
+                        fk_values.push(val);
+                    }
+                }
+
+                if all_null {
+                    continue;
+                }
+
+                if fk_values == old_pk_values {
+                    match fk.on_update {
+                        ForeignKeyAction::Cascade => {
+                            let mut new_values = other_row.values.clone();
+                            for (i, col_name) in fk.columns.iter().enumerate() {
+                                if let Some(idx) = other_schema.column_index(col_name) {
+                                    if i < new_pk_values.len() {
+                                        new_values[idx] = new_pk_values[i].clone();
+                                    }
+                                }
+                            }
+                            rows_to_update.push((other_row.clone(), Row::new(new_values)));
+                        }
+                        ForeignKeyAction::SetNull => {
+                            let mut new_values = other_row.values.clone();
+                            for col_name in &fk.columns {
+                                if let Some(idx) = other_schema.column_index(col_name) {
+                                    new_values[idx] = Value::Null;
+                                }
+                            }
+                            rows_to_update.push((other_row.clone(), Row::new(new_values)));
+                        }
+                        ForeignKeyAction::SetDefault => {
+                            let mut new_values = other_row.values.clone();
+                            for col_name in &fk.columns {
+                                if let Some(idx) = other_schema.column_index(col_name) {
+                                    let col = &other_schema.columns[idx];
+                                    let default_val = if let Some(ref def_expr) = col.default_expr {
+                                        eval_default_expr(def_expr)?
+                                    } else {
+                                        Value::Null
+                                    };
+                                    new_values[idx] = default_val;
+                                }
+                            }
+                            rows_to_update.push((other_row.clone(), Row::new(new_values)));
+                        }
+                        ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {
+                            let cols = fk.ref_columns.join(", ");
+                            let pk_val_strs: Vec<String> =
+                                old_pk_values.iter().map(|v| format!("{}", v)).collect();
+                            return Err(anyhow!(
+                                "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"\n\
+                                 DETAIL:  Key ({})=({}) is still referenced from table \"{}\".",
+                                table_name,
+                                fk.name,
+                                other_table,
+                                cols,
+                                pk_val_strs.join(", "),
+                                other_table
+                            ));
+                        }
+                    }
+                }
+            }
+
+            for (old_child_row, new_child_row) in rows_to_update {
+                Box::pin(execute_update_row(
+                    store,
+                    txn,
+                    other_table,
+                    &other_schema,
+                    &old_child_row,
+                    new_child_row,
+                ))
+                .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn execute_delete_row(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
@@ -185,12 +493,21 @@ pub async fn execute_delete_row(
     schema: &TableSchema,
     row: &Row,
 ) -> Result<()> {
+    handle_foreign_key_on_delete(store, txn, table_name, schema, row).await?;
+
     let pks = schema.get_pk_values(row);
     store.delete_by_pk(txn, table_name, &pks).await?;
     for index in &schema.indexes {
         let idx_values = schema.get_index_values(index, row);
         store
-            .delete_index_entry(txn, schema.table_id, index.id, &idx_values, &pks, index.unique)
+            .delete_index_entry(
+                txn,
+                schema.table_id,
+                index.id,
+                &idx_values,
+                &pks,
+                index.unique,
+            )
             .await?;
     }
     Ok(())
@@ -204,6 +521,12 @@ pub async fn execute_update_row(
     old_row: &Row,
     new_row: Row,
 ) -> Result<Row> {
+    if !schema.foreign_keys.is_empty() {
+        validate_foreign_keys(store, txn, schema, &new_row).await?;
+    }
+
+    handle_foreign_key_on_update(store, txn, table_name, schema, old_row, &new_row).await?;
+
     let pks = schema.get_pk_values(old_row);
     for index in &schema.indexes {
         let old_idx = schema.get_index_values(index, old_row);
@@ -303,10 +626,7 @@ pub fn validate_check_constraints(schema: &TableSchema, row: &Row) -> Result<()>
                     .as_ref()
                     .map(|n| format!("\"{}\"", n))
                     .unwrap_or_else(|| format!("({})", check.expr));
-                return Err(anyhow!(
-                    "new row violates check constraint {}",
-                    name
-                ));
+                return Err(anyhow!("new row violates check constraint {}", name));
             }
             Value::Null => {} // PostgreSQL: NULL satisfies CHECK constraints
             _ => {
@@ -315,6 +635,65 @@ pub fn validate_check_constraints(schema: &TableSchema, row: &Row) -> Result<()>
                     result
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+pub async fn validate_foreign_keys(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    schema: &TableSchema,
+    row: &Row,
+) -> Result<()> {
+    for fk in &schema.foreign_keys {
+        let mut fk_values: Vec<Value> = Vec::with_capacity(fk.columns.len());
+        let mut all_null = true;
+
+        for col_name in &fk.columns {
+            let col_idx = schema
+                .column_index(col_name)
+                .ok_or_else(|| anyhow!("FK column '{}' not found in schema", col_name))?;
+            let val = row.values[col_idx].clone();
+            if val != Value::Null {
+                all_null = false;
+            }
+            fk_values.push(val);
+        }
+
+        if all_null {
+            continue;
+        }
+
+        let ref_schema = store.get_schema(txn, &fk.ref_table).await?.ok_or_else(|| {
+            anyhow!(
+                "Referenced table '{}' not found for foreign key '{}'",
+                fk.ref_table,
+                fk.name
+            )
+        })?;
+
+        let ref_rows = store
+            .batch_get_rows(
+                txn,
+                ref_schema.table_id,
+                vec![fk_values.clone()],
+                &ref_schema,
+            )
+            .await?;
+
+        if ref_rows.is_empty() {
+            let cols = fk.columns.join(", ");
+            let vals: Vec<String> = fk_values.iter().map(|v| format!("{}", v)).collect();
+            return Err(anyhow!(
+                "insert or update on table \"{}\" violates foreign key constraint \"{}\"\n\
+                 DETAIL:  Key ({})=({}) is not present in table \"{}\".",
+                schema.name,
+                fk.name,
+                cols,
+                vals.join(", "),
+                fk.ref_table
+            ));
         }
     }
     Ok(())
@@ -381,6 +760,7 @@ pub fn build_update_join_context<'a>(
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
+        foreign_keys: vec![],
     };
 
     let mut column_offsets: HashMap<String, usize> = HashMap::new();

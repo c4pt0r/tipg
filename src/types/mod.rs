@@ -184,6 +184,26 @@ pub struct CheckConstraint {
     pub expr: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForeignKeyConstraint {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub ref_table: String,
+    pub ref_columns: Vec<String>,
+    pub on_delete: ForeignKeyAction,
+    pub on_update: ForeignKeyAction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub enum ForeignKeyAction {
+    #[default]
+    NoAction,
+    Restrict,
+    Cascade,
+    SetNull,
+    SetDefault,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TableSchema {
     pub name: String,
@@ -194,6 +214,8 @@ pub struct TableSchema {
     pub indexes: Vec<IndexDef>,
     #[serde(default)]
     pub check_constraints: Vec<CheckConstraint>,
+    #[serde(default)]
+    pub foreign_keys: Vec<ForeignKeyConstraint>,
 }
 
 impl TableSchema {
@@ -211,6 +233,7 @@ impl TableSchema {
             pk_indices,
             indexes: Vec::new(),
             check_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
         }
     }
 }

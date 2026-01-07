@@ -2,7 +2,9 @@ use super::encoding::*;
 use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
-use tikv_client::{BoundRange, CheckLevel, Config, Transaction, TransactionClient, TransactionOptions};
+use tikv_client::{
+    BoundRange, CheckLevel, Config, Transaction, TransactionClient, TransactionOptions,
+};
 use tracing::{debug, info};
 
 pub struct TikvStore {
@@ -48,21 +50,38 @@ impl TikvStore {
 
     pub async fn begin(&self) -> Result<Transaction> {
         let options = TransactionOptions::new_pessimistic().drop_check(CheckLevel::Warn);
-        self.client.begin_with_options(options).await.map_err(|e| anyhow!(e))
+        self.client
+            .begin_with_options(options)
+            .await
+            .map_err(|e| anyhow!(e))
     }
 
     pub async fn begin_optimistic(&self) -> Result<Transaction> {
         let options = TransactionOptions::new_optimistic().drop_check(CheckLevel::Warn);
-        self.client.begin_with_options(options).await.map_err(|e| anyhow!(e))
+        self.client
+            .begin_with_options(options)
+            .await
+            .map_err(|e| anyhow!(e))
     }
 
-    pub async fn lock_rows(&self, txn: &mut Transaction, table_name: &str, rows: &[Row]) -> Result<()> {
-        let schema = self.get_schema(txn, table_name).await?.ok_or_else(|| anyhow!("Table not found"))?;
-        let keys: Vec<Vec<u8>> = rows.iter().map(|row| {
-            let pk_values = schema.get_pk_values(row);
-            let row_key = encode_pk_values(&pk_values);
-            self.key(&encode_data_key(schema.table_id, &row_key))
-        }).collect();
+    pub async fn lock_rows(
+        &self,
+        txn: &mut Transaction,
+        table_name: &str,
+        rows: &[Row],
+    ) -> Result<()> {
+        let schema = self
+            .get_schema(txn, table_name)
+            .await?
+            .ok_or_else(|| anyhow!("Table not found"))?;
+        let keys: Vec<Vec<u8>> = rows
+            .iter()
+            .map(|row| {
+                let pk_values = schema.get_pk_values(row);
+                let row_key = encode_pk_values(&pk_values);
+                self.key(&encode_data_key(schema.table_id, &row_key))
+            })
+            .collect();
         txn.lock_keys(keys).await.map_err(|e| anyhow!(e))
     }
 
@@ -75,7 +94,8 @@ impl TikvStore {
 
     /// Get the next table ID (auto-increment)
     pub async fn next_table_id(&self, txn: &mut Transaction) -> Result<u64> {
-        self.increment_sys_key(txn, encode_next_table_id_key()).await
+        self.increment_sys_key(txn, encode_next_table_id_key())
+            .await
     }
 
     /// Get next sequence value for a table (for SERIAL columns)
@@ -92,7 +112,8 @@ impl TikvStore {
         let current = txn.get(key.clone()).await?;
         let next_val = match current {
             Some(data) => {
-                let id = u64::from_be_bytes(data.try_into().map_err(|_| anyhow!("Invalid ID format"))?);
+                let id =
+                    u64::from_be_bytes(data.try_into().map_err(|_| anyhow!("Invalid ID format"))?);
                 id + 1
             }
             None => 1,
@@ -109,12 +130,19 @@ impl TikvStore {
         }
         let schema_data = serialize_schema(&schema)?;
         txn.put(schema_key, schema_data).await?;
-        info!("Created table '{}' with ID {}", schema.name, schema.table_id);
+        info!(
+            "Created table '{}' with ID {}",
+            schema.name, schema.table_id
+        );
         Ok(())
     }
 
     /// Get a table schema by name
-    pub async fn get_schema(&self, txn: &mut Transaction, table_name: &str) -> Result<Option<TableSchema>> {
+    pub async fn get_schema(
+        &self,
+        txn: &mut Transaction,
+        table_name: &str,
+    ) -> Result<Option<TableSchema>> {
         let key = self.key(&encode_schema_key(table_name));
         let val = txn.get(key).await?;
         match val {
@@ -137,7 +165,7 @@ impl TikvStore {
             for pair in pairs {
                 txn.delete(pair.key().clone()).await?;
             }
-            
+
             info!("Dropped table '{}'", table_name);
             Ok(true)
         } else {
@@ -147,13 +175,20 @@ impl TikvStore {
 
     /// Insert a row into a table
     pub async fn insert(&self, txn: &mut Transaction, table_name: &str, row: Row) -> Result<()> {
-        let schema = self.get_schema(txn, table_name).await?.ok_or_else(|| anyhow!("Table not found"))?;
-        if row.values.len() != schema.columns.len() { return Err(anyhow!("Column count mismatch")); }
+        let schema = self
+            .get_schema(txn, table_name)
+            .await?
+            .ok_or_else(|| anyhow!("Table not found"))?;
+        if row.values.len() != schema.columns.len() {
+            return Err(anyhow!("Column count mismatch"));
+        }
         let pk_values = schema.get_pk_values(&row);
         let row_key = encode_pk_values(&pk_values);
         let data_key = self.key(&encode_data_key(schema.table_id, &row_key));
         let row_data = serialize_row(&row)?;
-        if txn.get(data_key.clone()).await?.is_some() { return Err(anyhow!("Duplicate primary key: {:?}", pk_values)); }
+        if txn.get(data_key.clone()).await?.is_some() {
+            return Err(anyhow!("Duplicate primary key: {:?}", pk_values));
+        }
         txn.put(data_key, row_data).await?;
         debug!("Inserted row into '{}'", table_name);
         Ok(())
@@ -161,7 +196,10 @@ impl TikvStore {
 
     /// Upsert a row into a table
     pub async fn upsert(&self, txn: &mut Transaction, table_name: &str, row: Row) -> Result<()> {
-        let schema = self.get_schema(txn, table_name).await?.ok_or_else(|| anyhow!("Table not found"))?;
+        let schema = self
+            .get_schema(txn, table_name)
+            .await?
+            .ok_or_else(|| anyhow!("Table not found"))?;
         let pk_values = schema.get_pk_values(&row);
         let row_key = encode_pk_values(&pk_values);
         let data_key = self.key(&encode_data_key(schema.table_id, &row_key));
@@ -173,12 +211,15 @@ impl TikvStore {
 
     /// Scan all rows from a table
     pub async fn scan(&self, txn: &mut Transaction, table_name: &str) -> Result<Vec<Row>> {
-        let schema = self.get_schema(txn, table_name).await?.ok_or_else(|| anyhow!("Table not found"))?;
+        let schema = self
+            .get_schema(txn, table_name)
+            .await?
+            .ok_or_else(|| anyhow!("Table not found"))?;
         let (raw_start, raw_end) = encode_table_data_range(schema.table_id);
         let start = self.key(&raw_start);
         let end = self.key(&raw_end);
         let range: BoundRange = (start..end).into();
-        let pairs = txn.scan(range, u32::MAX).await?;
+        let pairs: Vec<_> = txn.scan(range, u32::MAX).await?.collect();
         let mut rows = Vec::new();
         for pair in pairs {
             let row = deserialize_row(&pair.value())?;
@@ -189,8 +230,16 @@ impl TikvStore {
     }
 
     /// Delete rows matching a simple condition
-    pub async fn delete_by_pk(&self, txn: &mut Transaction, table_name: &str, pk_values: &[Value]) -> Result<u64> {
-        let schema = self.get_schema(txn, table_name).await?.ok_or_else(|| anyhow!("Table not found"))?;
+    pub async fn delete_by_pk(
+        &self,
+        txn: &mut Transaction,
+        table_name: &str,
+        pk_values: &[Value],
+    ) -> Result<u64> {
+        let schema = self
+            .get_schema(txn, table_name)
+            .await?
+            .ok_or_else(|| anyhow!("Table not found"))?;
         let row_key = encode_pk_values(pk_values);
         let data_key = self.key(&encode_data_key(schema.table_id, &row_key));
         let existed = txn.get(data_key.clone()).await?.is_some();
@@ -199,6 +248,24 @@ impl TikvStore {
             Ok(1)
         } else {
             Ok(0)
+        }
+    }
+
+    pub async fn get_by_pk(
+        &self,
+        txn: &mut Transaction,
+        table_name: &str,
+        pk_values: &[Value],
+    ) -> Result<Option<Row>> {
+        let schema = self
+            .get_schema(txn, table_name)
+            .await?
+            .ok_or_else(|| anyhow!("Table not found"))?;
+        let row_key = encode_pk_values(pk_values);
+        let data_key = self.key(&encode_data_key(schema.table_id, &row_key));
+        match txn.get(data_key).await? {
+            Some(data) => Ok(Some(deserialize_row(&data)?)),
+            None => Ok(None),
         }
     }
 
@@ -251,7 +318,15 @@ impl TikvStore {
     }
 
     /// Create an index entry
-    pub async fn create_index_entry(&self, txn: &mut Transaction, table_id: u64, index_id: u64, values: &[Value], pk_values: &[Value], unique: bool) -> Result<()> {
+    pub async fn create_index_entry(
+        &self,
+        txn: &mut Transaction,
+        table_id: u64,
+        index_id: u64,
+        values: &[Value],
+        pk_values: &[Value],
+        unique: bool,
+    ) -> Result<()> {
         if unique {
             let idx_key = self.key(&encode_index_key(table_id, index_id, values, None));
             if txn.get(idx_key.clone()).await?.is_some() {
@@ -260,26 +335,51 @@ impl TikvStore {
             let idx_val = encode_pk_values(pk_values);
             txn.put(idx_key, idx_val).await?;
         } else {
-            let idx_key = self.key(&encode_index_key(table_id, index_id, values, Some(pk_values)));
+            let idx_key = self.key(&encode_index_key(
+                table_id,
+                index_id,
+                values,
+                Some(pk_values),
+            ));
             txn.put(idx_key, vec![]).await?;
         }
         Ok(())
     }
-    
+
     /// Delete an index entry
-    pub async fn delete_index_entry(&self, txn: &mut Transaction, table_id: u64, index_id: u64, values: &[Value], pk_values: &[Value], unique: bool) -> Result<()> {
+    pub async fn delete_index_entry(
+        &self,
+        txn: &mut Transaction,
+        table_id: u64,
+        index_id: u64,
+        values: &[Value],
+        pk_values: &[Value],
+        unique: bool,
+    ) -> Result<()> {
         if unique {
             let idx_key = self.key(&encode_index_key(table_id, index_id, values, None));
             txn.delete(idx_key).await?;
         } else {
-            let idx_key = self.key(&encode_index_key(table_id, index_id, values, Some(pk_values)));
+            let idx_key = self.key(&encode_index_key(
+                table_id,
+                index_id,
+                values,
+                Some(pk_values),
+            ));
             txn.delete(idx_key).await?;
         }
         Ok(())
     }
 
     /// Scan index to get PKs
-    pub async fn scan_index(&self, txn: &mut Transaction, table_id: u64, index_id: u64, values: &[Value], unique: bool) -> Result<Vec<Vec<Value>>> {
+    pub async fn scan_index(
+        &self,
+        txn: &mut Transaction,
+        table_id: u64,
+        index_id: u64,
+        values: &[Value],
+        unique: bool,
+    ) -> Result<Vec<Vec<Value>>> {
         if unique {
             let idx_key = self.key(&encode_index_key(table_id, index_id, values, None));
             if let Some(val) = txn.get(idx_key).await? {
@@ -294,10 +394,10 @@ impl TikvStore {
             let prefix_key = self.key(&prefix);
             let mut end_key = prefix_key.clone();
             end_key.push(0xFF);
-            
+
             let range: BoundRange = (prefix_key.clone()..end_key).into();
             let pairs = txn.scan(range, u32::MAX).await?;
-            
+
             let mut pks = Vec::new();
             for pair in pairs {
                 let full_key: &[u8] = pair.key().as_ref().into();
@@ -310,7 +410,13 @@ impl TikvStore {
     }
 
     /// Batch get rows by PKs
-    pub async fn batch_get_rows(&self, txn: &mut Transaction, table_id: u64, pks: Vec<Vec<Value>>, _schema: &TableSchema) -> Result<Vec<Row>> {
+    pub async fn batch_get_rows(
+        &self,
+        txn: &mut Transaction,
+        table_id: u64,
+        pks: Vec<Vec<Value>>,
+        _schema: &TableSchema,
+    ) -> Result<Vec<Row>> {
         let mut rows = Vec::new();
         for pk in &pks {
             let row_key = encode_pk_values(pk);

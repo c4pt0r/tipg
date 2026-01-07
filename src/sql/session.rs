@@ -97,9 +97,7 @@ impl Session {
     /// Rollback a transaction block (ROLLBACK)
     pub async fn rollback(&mut self) -> Result<()> {
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
-            TransactionState::Active(mut txn) => {
-                txn.rollback().await.map_err(|e| anyhow!(e))
-            }
+            TransactionState::Active(mut txn) => txn.rollback().await.map_err(|e| anyhow!(e)),
             TransactionState::Idle => {
                 Ok(()) // No-op
             }

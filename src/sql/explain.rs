@@ -637,6 +637,7 @@ mod tests {
                     unique: true,
                 }],
                 check_constraints: vec![],
+                foreign_keys: vec![],
             })
         } else {
             None

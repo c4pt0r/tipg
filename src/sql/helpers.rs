@@ -164,6 +164,7 @@ pub fn convert_data_type(sql_type: &SqlDataType) -> Result<DataType> {
         SqlDataType::BigInt(_) => Ok(DataType::Int64),
         SqlDataType::Float(_)
         | SqlDataType::Double
+        | SqlDataType::DoublePrecision
         | SqlDataType::Real
         | SqlDataType::Numeric(_)
         | SqlDataType::Decimal(_) => Ok(DataType::Float64),

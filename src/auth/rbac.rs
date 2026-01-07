@@ -151,8 +151,14 @@ impl User {
         self.password_hash = super::password::hash_password(password, &self.password_salt);
     }
 
-    pub fn grant_privilege(&mut self, privilege: Privilege, object: PrivilegeObject, with_grant_option: bool) {
-        self.privileges.retain(|p| !(p.privilege == privilege && p.object == object));
+    pub fn grant_privilege(
+        &mut self,
+        privilege: Privilege,
+        object: PrivilegeObject,
+        with_grant_option: bool,
+    ) {
+        self.privileges
+            .retain(|p| !(p.privilege == privilege && p.object == object));
         self.privileges.push(GrantedPrivilege {
             privilege,
             object,
@@ -161,7 +167,8 @@ impl User {
     }
 
     pub fn revoke_privilege(&mut self, privilege: &Privilege, object: &PrivilegeObject) {
-        self.privileges.retain(|p| !(&p.privilege == privilege && &p.object == object));
+        self.privileges
+            .retain(|p| !(&p.privilege == privilege && &p.object == object));
     }
 
     pub fn has_privilege(&self, privilege: &Privilege, object: &PrivilegeObject) -> bool {
@@ -170,8 +177,9 @@ impl User {
         }
 
         for granted in &self.privileges {
-            if Self::privilege_matches(&granted.privilege, privilege) 
-                && Self::object_matches(&granted.object, object) {
+            if Self::privilege_matches(&granted.privilege, privilege)
+                && Self::object_matches(&granted.object, object)
+            {
                 return true;
             }
         }
@@ -189,7 +197,7 @@ impl User {
         if granted == &PrivilegeObject::Global {
             return true;
         }
-        
+
         match (granted, required) {
             (PrivilegeObject::AllTablesInSchema(gs), PrivilegeObject::Table { schema, .. }) => {
                 gs == schema
@@ -301,7 +309,12 @@ impl AuthManager {
         Ok(true)
     }
 
-    pub async fn authenticate(&self, txn: &mut Transaction, username: &str, password: &str) -> Result<Option<User>> {
+    pub async fn authenticate(
+        &self,
+        txn: &mut Transaction,
+        username: &str,
+        password: &str,
+    ) -> Result<Option<User>> {
         match self.get_user(txn, username).await? {
             Some(user) => {
                 if !user.can_login {
@@ -351,34 +364,50 @@ impl AuthManager {
         Ok(true)
     }
 
-    pub async fn grant_role_to_user(&self, txn: &mut Transaction, username: &str, rolename: &str) -> Result<()> {
-        let mut user = self.get_user(txn, username).await?
+    pub async fn grant_role_to_user(
+        &self,
+        txn: &mut Transaction,
+        username: &str,
+        rolename: &str,
+    ) -> Result<()> {
+        let mut user = self
+            .get_user(txn, username)
+            .await?
             .ok_or_else(|| anyhow!("User '{}' does not exist", username))?;
-        
+
         if self.get_role(txn, rolename).await?.is_none() {
             return Err(anyhow!("Role '{}' does not exist", rolename));
         }
-        
+
         user.roles.insert(rolename.to_string());
         self.update_user(txn, user).await
     }
 
-    pub async fn revoke_role_from_user(&self, txn: &mut Transaction, username: &str, rolename: &str) -> Result<()> {
-        let mut user = self.get_user(txn, username).await?
+    pub async fn revoke_role_from_user(
+        &self,
+        txn: &mut Transaction,
+        username: &str,
+        rolename: &str,
+    ) -> Result<()> {
+        let mut user = self
+            .get_user(txn, username)
+            .await?
             .ok_or_else(|| anyhow!("User '{}' does not exist", username))?;
-        
+
         user.roles.remove(rolename);
         self.update_user(txn, user).await
     }
 
     pub async fn check_privilege(
-        &self, 
-        txn: &mut Transaction, 
-        username: &str, 
-        privilege: &Privilege, 
-        object: &PrivilegeObject
+        &self,
+        txn: &mut Transaction,
+        username: &str,
+        privilege: &Privilege,
+        object: &PrivilegeObject,
     ) -> Result<bool> {
-        let user = self.get_user(txn, username).await?
+        let user = self
+            .get_user(txn, username)
+            .await?
             .ok_or_else(|| anyhow!("User '{}' does not exist", username))?;
 
         if user.is_superuser {
@@ -396,7 +425,8 @@ impl AuthManager {
                 }
                 for granted in &role.privileges {
                     if User::privilege_matches(&granted.privilege, privilege)
-                        && User::object_matches(&granted.object, object) {
+                        && User::object_matches(&granted.object, object)
+                    {
                         return Ok(true);
                     }
                 }
@@ -413,13 +443,13 @@ impl AuthManager {
             prefix.push(b'_');
         }
         prefix.extend_from_slice(USER_KEY_PREFIX);
-        
+
         let mut end = prefix.clone();
         end.push(0xFF);
-        
+
         let range: tikv_client::BoundRange = (prefix..end).into();
         let pairs = txn.scan(range, u32::MAX).await?;
-        
+
         let mut users = Vec::new();
         for pair in pairs {
             let user: User = bincode::deserialize(pair.value())?;
@@ -435,13 +465,13 @@ impl AuthManager {
             prefix.push(b'_');
         }
         prefix.extend_from_slice(ROLE_KEY_PREFIX);
-        
+
         let mut end = prefix.clone();
         end.push(0xFF);
-        
+
         let range: tikv_client::BoundRange = (prefix..end).into();
         let pairs = txn.scan(range, u32::MAX).await?;
-        
+
         let mut roles = Vec::new();
         for pair in pairs {
             let role: Role = bincode::deserialize(pair.value())?;
@@ -481,7 +511,7 @@ mod tests {
     fn test_grant_privilege() {
         let mut user = User::new("test", "pass");
         user.grant_privilege(Privilege::Select, PrivilegeObject::table("users"), false);
-        
+
         assert!(user.has_privilege(&Privilege::Select, &PrivilegeObject::table("users")));
         assert!(!user.has_privilege(&Privilege::Insert, &PrivilegeObject::table("users")));
         assert!(!user.has_privilege(&Privilege::Select, &PrivilegeObject::table("orders")));
@@ -491,7 +521,7 @@ mod tests {
     fn test_grant_all_tables_in_schema() {
         let mut user = User::new("test", "pass");
         user.grant_privilege(Privilege::Select, PrivilegeObject::all_tables(), false);
-        
+
         assert!(user.has_privilege(&Privilege::Select, &PrivilegeObject::table("users")));
         assert!(user.has_privilege(&Privilege::Select, &PrivilegeObject::table("orders")));
         assert!(!user.has_privilege(&Privilege::Insert, &PrivilegeObject::table("users")));
@@ -501,7 +531,7 @@ mod tests {
     fn test_grant_all_privileges() {
         let mut user = User::new("test", "pass");
         user.grant_privilege(Privilege::All, PrivilegeObject::table("users"), false);
-        
+
         assert!(user.has_privilege(&Privilege::Select, &PrivilegeObject::table("users")));
         assert!(user.has_privilege(&Privilege::Insert, &PrivilegeObject::table("users")));
         assert!(user.has_privilege(&Privilege::Delete, &PrivilegeObject::table("users")));
@@ -512,9 +542,9 @@ mod tests {
         let mut user = User::new("test", "pass");
         user.grant_privilege(Privilege::Select, PrivilegeObject::table("users"), false);
         user.grant_privilege(Privilege::Insert, PrivilegeObject::table("users"), false);
-        
+
         user.revoke_privilege(&Privilege::Select, &PrivilegeObject::table("users"));
-        
+
         assert!(!user.has_privilege(&Privilege::Select, &PrivilegeObject::table("users")));
         assert!(user.has_privilege(&Privilege::Insert, &PrivilegeObject::table("users")));
     }
@@ -556,7 +586,10 @@ mod tests {
         assert_eq!(Privilege::from_str("UPDATE"), Some(Privilege::Update));
         assert_eq!(Privilege::from_str("DELETE"), Some(Privilege::Delete));
         assert_eq!(Privilege::from_str("TRUNCATE"), Some(Privilege::Truncate));
-        assert_eq!(Privilege::from_str("REFERENCES"), Some(Privilege::References));
+        assert_eq!(
+            Privilege::from_str("REFERENCES"),
+            Some(Privilege::References)
+        );
         assert_eq!(Privilege::from_str("TRIGGER"), Some(Privilege::Trigger));
         assert_eq!(Privilege::from_str("CREATE"), Some(Privilege::CreateTable));
         assert_eq!(Privilege::from_str("CONNECT"), Some(Privilege::Connect));
@@ -566,7 +599,10 @@ mod tests {
         assert_eq!(Privilege::from_str("USAGE"), Some(Privilege::Usage));
         assert_eq!(Privilege::from_str("SUPERUSER"), Some(Privilege::SuperUser));
         assert_eq!(Privilege::from_str("CREATEDB"), Some(Privilege::CreateDB));
-        assert_eq!(Privilege::from_str("CREATEROLE"), Some(Privilege::CreateRole));
+        assert_eq!(
+            Privilege::from_str("CREATEROLE"),
+            Some(Privilege::CreateRole)
+        );
     }
 
     #[test]
@@ -633,7 +669,7 @@ mod tests {
         user.grant_privilege(Privilege::Select, PrivilegeObject::table("t1"), false);
         assert_eq!(user.privileges.len(), 1);
         assert!(!user.privileges[0].with_grant_option);
-        
+
         user.grant_privilege(Privilege::Select, PrivilegeObject::table("t1"), true);
         assert_eq!(user.privileges.len(), 1);
         assert!(user.privileges[0].with_grant_option);
@@ -644,10 +680,10 @@ mod tests {
         let mut user = User::new("test", "pass");
         user.grant_privilege(Privilege::Select, PrivilegeObject::table("t1"), false);
         assert_eq!(user.privileges.len(), 1);
-        
+
         user.revoke_privilege(&Privilege::Insert, &PrivilegeObject::table("t1"));
         assert_eq!(user.privileges.len(), 1);
-        
+
         user.revoke_privilege(&Privilege::Select, &PrivilegeObject::table("t2"));
         assert_eq!(user.privileges.len(), 1);
     }
@@ -656,7 +692,7 @@ mod tests {
     fn test_has_privilege_global_object() {
         let mut user = User::new("test", "pass");
         user.grant_privilege(Privilege::Select, PrivilegeObject::Global, false);
-        
+
         assert!(user.has_privilege(&Privilege::Select, &PrivilegeObject::table("any")));
         assert!(user.has_privilege(&Privilege::Select, &PrivilegeObject::database("any")));
     }
@@ -665,7 +701,7 @@ mod tests {
     fn test_all_privilege_matches_specific() {
         let mut user = User::new("test", "pass");
         user.grant_privilege(Privilege::All, PrivilegeObject::table("users"), false);
-        
+
         assert!(user.has_privilege(&Privilege::Select, &PrivilegeObject::table("users")));
         assert!(user.has_privilege(&Privilege::Insert, &PrivilegeObject::table("users")));
         assert!(user.has_privilege(&Privilege::Update, &PrivilegeObject::table("users")));
@@ -677,23 +713,32 @@ mod tests {
     fn test_all_tables_in_schema_matches_table() {
         let mut user = User::new("test", "pass");
         user.grant_privilege(
-            Privilege::Select, 
-            PrivilegeObject::AllTablesInSchema("public".to_string()), 
-            false
+            Privilege::Select,
+            PrivilegeObject::AllTablesInSchema("public".to_string()),
+            false,
         );
-        
-        assert!(user.has_privilege(&Privilege::Select, &PrivilegeObject::Table {
-            schema: "public".to_string(),
-            name: "users".to_string(),
-        }));
-        assert!(user.has_privilege(&Privilege::Select, &PrivilegeObject::Table {
-            schema: "public".to_string(),
-            name: "orders".to_string(),
-        }));
-        assert!(!user.has_privilege(&Privilege::Select, &PrivilegeObject::Table {
-            schema: "private".to_string(),
-            name: "secrets".to_string(),
-        }));
+
+        assert!(user.has_privilege(
+            &Privilege::Select,
+            &PrivilegeObject::Table {
+                schema: "public".to_string(),
+                name: "users".to_string(),
+            }
+        ));
+        assert!(user.has_privilege(
+            &Privilege::Select,
+            &PrivilegeObject::Table {
+                schema: "public".to_string(),
+                name: "orders".to_string(),
+            }
+        ));
+        assert!(!user.has_privilege(
+            &Privilege::Select,
+            &PrivilegeObject::Table {
+                schema: "private".to_string(),
+                name: "secrets".to_string(),
+            }
+        ));
     }
 
     #[test]
@@ -716,13 +761,13 @@ mod tests {
     fn test_user_roles_management() {
         let mut user = User::new("test", "pass");
         assert!(user.roles.is_empty());
-        
+
         user.roles.insert("reader".to_string());
         user.roles.insert("writer".to_string());
         assert_eq!(user.roles.len(), 2);
         assert!(user.roles.contains("reader"));
         assert!(user.roles.contains("writer"));
-        
+
         user.roles.remove("reader");
         assert_eq!(user.roles.len(), 1);
         assert!(!user.roles.contains("reader"));
@@ -780,7 +825,7 @@ mod tests {
         user.grant_privilege(Privilege::Select, PrivilegeObject::table("t1"), false);
         user.grant_privilege(Privilege::Insert, PrivilegeObject::table("t1"), false);
         user.grant_privilege(Privilege::Update, PrivilegeObject::table("t1"), false);
-        
+
         assert_eq!(user.privileges.len(), 3);
         assert!(user.has_privilege(&Privilege::Select, &PrivilegeObject::table("t1")));
         assert!(user.has_privilege(&Privilege::Insert, &PrivilegeObject::table("t1")));
@@ -792,7 +837,7 @@ mod tests {
     fn test_role_member_of() {
         let mut role = Role::new("admin");
         assert!(role.member_of.is_empty());
-        
+
         role.member_of.insert("superadmin".to_string());
         assert!(role.member_of.contains("superadmin"));
     }
@@ -803,11 +848,11 @@ mod tests {
         assert!(!role.is_superuser);
         assert!(!role.can_create_db);
         assert!(!role.can_create_role);
-        
+
         role.is_superuser = true;
         role.can_create_db = true;
         role.can_create_role = true;
-        
+
         assert!(role.is_superuser);
         assert!(role.can_create_db);
         assert!(role.can_create_role);
