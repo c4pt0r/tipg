@@ -6,7 +6,7 @@ use super::explain;
 use super::helpers::{
     collect_having_agg_funcs, dedup_rows, eval_default_expr, eval_having_expr,
     eval_having_expr_join, fill_row_defaults, get_select_item_name, get_skip_reason,
-    get_unsupported_reason, parse_value_for_copy, value_to_sql_expr,
+    get_unsupported_reason, infer_data_type, parse_value_for_copy, value_to_sql_expr,
 };
 use super::planner::{self, ScanType};
 use super::query;
@@ -66,6 +66,24 @@ impl Executor {
         let sql_upper = sql.trim().to_uppercase();
         if let Some(reason) = get_skip_reason(&sql_upper) {
             return Ok(ExecuteResult::Skipped { message: reason });
+        }
+
+        if sql_upper.starts_with("REFRESH MATERIALIZED VIEW") {
+            return self
+                .execute_refresh_materialized_view_cmd(session, sql)
+                .await;
+        }
+
+        if sql_upper.starts_with("DROP MATERIALIZED VIEW") {
+            return self.execute_drop_materialized_view_cmd(session, sql).await;
+        }
+
+        if sql_upper.starts_with("CALL ") {
+            return self.execute_call_cmd(session, sql).await;
+        }
+
+        if sql_upper.starts_with("DROP PROCEDURE") {
+            return self.execute_drop_procedure_cmd(session, sql).await;
         }
 
         let statements = match parse_sql(sql) {
@@ -237,18 +255,30 @@ impl Executor {
             Statement::SetVariable { .. }
             | Statement::SetTimeZone { .. }
             | Statement::SetNames { .. } => Ok(ExecuteResult::Empty),
-            Statement::CreateType { .. }
-            | Statement::CreateFunction { .. }
-            | Statement::CreateProcedure { .. } => Ok(ExecuteResult::Empty),
+            Statement::CreateType { .. } | Statement::CreateFunction { .. } => {
+                Ok(ExecuteResult::Empty)
+            }
+            Statement::CreateProcedure {
+                name, params, body, ..
+            } => {
+                self.execute_create_procedure(txn, name, params.as_deref(), body)
+                    .await
+            }
             Statement::CreateSequence { .. } => Ok(ExecuteResult::Empty),
             Statement::CreateView {
                 name,
                 query,
                 or_replace,
+                materialized,
                 ..
             } => {
-                self.execute_create_view(txn, name, query, *or_replace)
-                    .await
+                if *materialized {
+                    self.execute_create_materialized_view(txn, name, query, *or_replace)
+                        .await
+                } else {
+                    self.execute_create_view(txn, name, query, *or_replace)
+                        .await
+                }
             }
             Statement::AlterIndex { .. } => Ok(ExecuteResult::Empty),
             Statement::CreateRole {
@@ -445,6 +475,394 @@ impl Executor {
         if_exists: bool,
     ) -> Result<ExecuteResult> {
         ddl::execute_drop_view(&self.store, txn, names, if_exists).await
+    }
+
+    async fn execute_create_materialized_view(
+        &self,
+        txn: &mut Transaction,
+        name: &ObjectName,
+        query: &Query,
+        or_replace: bool,
+    ) -> Result<ExecuteResult> {
+        let result = self
+            .execute_query_with_ctes(txn, query, &HashMap::new())
+            .await?;
+        let (columns, rows) = match result {
+            ExecuteResult::Select { columns, rows } => (columns, rows),
+            _ => return Err(anyhow!("Materialized view must be a SELECT query")),
+        };
+
+        let view_name = name
+            .0
+            .last()
+            .ok_or_else(|| anyhow!("Invalid view name"))?
+            .value
+            .to_lowercase();
+
+        let table_id = self.store.next_table_id(txn).await?;
+        let col_defs: Vec<crate::types::ColumnDef> = columns
+            .iter()
+            .enumerate()
+            .map(|(i, col_name)| {
+                let data_type = if rows.is_empty() {
+                    crate::types::DataType::Text
+                } else {
+                    infer_data_type(&rows[0].values[i])
+                };
+                crate::types::ColumnDef {
+                    name: col_name.clone(),
+                    data_type,
+                    nullable: true,
+                    primary_key: i == 0,
+                    default_expr: None,
+                    is_serial: false,
+                    unique: false,
+                }
+            })
+            .collect();
+
+        let schema = crate::types::TableSchema {
+            table_id,
+            name: view_name.clone(),
+            columns: col_defs,
+            version: 1,
+            pk_indices: vec![0],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+        };
+
+        ddl::execute_create_materialized_view(
+            &self.store,
+            txn,
+            name,
+            query,
+            or_replace,
+            schema,
+            rows,
+        )
+        .await
+    }
+
+    async fn execute_refresh_materialized_view_cmd(
+        &self,
+        session: &mut Session,
+        sql: &str,
+    ) -> Result<ExecuteResult> {
+        let sql_upper = sql.trim().to_uppercase();
+        let rest = sql_upper
+            .strip_prefix("REFRESH MATERIALIZED VIEW")
+            .ok_or_else(|| anyhow!("Invalid REFRESH MATERIALIZED VIEW syntax"))?
+            .trim();
+
+        let view_name = rest
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| anyhow!("Missing view name"))?
+            .trim_end_matches(';')
+            .to_lowercase();
+
+        let is_autocommit = !session.is_in_transaction();
+        if is_autocommit {
+            session.begin().await?;
+        }
+
+        let result = async {
+            let txn = session.get_mut_txn().expect("Transaction must be active");
+
+            let query_str = self
+                .store
+                .get_materialized_view(txn, &view_name)
+                .await?
+                .ok_or_else(|| anyhow!("Materialized view '{}' does not exist", view_name))?;
+
+            let ast = parse_sql(&query_str)?;
+            let query = match ast.into_iter().next() {
+                Some(Statement::Query(q)) => q,
+                _ => return Err(anyhow!("Invalid materialized view query")),
+            };
+
+            let result = self
+                .execute_query_with_ctes(txn, &query, &HashMap::new())
+                .await?;
+            let rows = match result {
+                ExecuteResult::Select { rows, .. } => rows,
+                _ => return Err(anyhow!("Materialized view must be a SELECT query")),
+            };
+
+            ddl::execute_refresh_materialized_view(&self.store, txn, &view_name, rows).await
+        }
+        .await;
+
+        if is_autocommit {
+            if result.is_ok() {
+                session.commit().await?;
+            } else {
+                session.rollback().await?;
+            }
+        }
+
+        result
+    }
+
+    async fn execute_drop_materialized_view_cmd(
+        &self,
+        session: &mut Session,
+        sql: &str,
+    ) -> Result<ExecuteResult> {
+        let sql_upper = sql.trim().to_uppercase();
+        let rest = sql_upper
+            .strip_prefix("DROP MATERIALIZED VIEW")
+            .ok_or_else(|| anyhow!("Invalid DROP MATERIALIZED VIEW syntax"))?
+            .trim();
+
+        let if_exists = rest.starts_with("IF EXISTS");
+        let name_part = if if_exists {
+            rest.strip_prefix("IF EXISTS").unwrap().trim()
+        } else {
+            rest
+        };
+
+        let view_name = name_part
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| anyhow!("Missing view name"))?
+            .trim_end_matches(';')
+            .to_lowercase();
+
+        let is_autocommit = !session.is_in_transaction();
+        if is_autocommit {
+            session.begin().await?;
+        }
+
+        let result = async {
+            let txn = session.get_mut_txn().expect("Transaction must be active");
+            let name = ObjectName(vec![sqlparser::ast::Ident::new(view_name)]);
+            ddl::execute_drop_materialized_view(&self.store, txn, &[name], if_exists).await
+        }
+        .await;
+
+        if is_autocommit {
+            if result.is_ok() {
+                session.commit().await?;
+            } else {
+                session.rollback().await?;
+            }
+        }
+
+        result
+    }
+
+    async fn execute_create_procedure(
+        &self,
+        txn: &mut Transaction,
+        name: &ObjectName,
+        params: Option<&[sqlparser::ast::ProcedureParam]>,
+        body: &[Statement],
+    ) -> Result<ExecuteResult> {
+        let proc_name = name
+            .0
+            .last()
+            .ok_or_else(|| anyhow!("Invalid procedure name"))?
+            .value
+            .to_lowercase();
+
+        let param_defs: Vec<String> = params
+            .map(|p| {
+                p.iter()
+                    .map(|param| format!("{} {}", param.name.value, param.data_type))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let body_stmts: Vec<String> = body.iter().map(|s| s.to_string()).collect();
+
+        let definition = format!(
+            "PARAMS:{}\nBODY:{}",
+            param_defs.join(","),
+            body_stmts.join(";")
+        );
+
+        self.store
+            .create_procedure(txn, &proc_name, &definition)
+            .await?;
+
+        Ok(ExecuteResult::CreateProcedure { proc_name })
+    }
+
+    async fn execute_call_cmd(&self, session: &mut Session, sql: &str) -> Result<ExecuteResult> {
+        let sql_trimmed = sql.trim();
+        let rest = sql_trimmed
+            .strip_prefix("CALL ")
+            .or_else(|| sql_trimmed.strip_prefix("call "))
+            .ok_or_else(|| anyhow!("Invalid CALL syntax"))?
+            .trim();
+
+        let paren_pos = rest.find('(').unwrap_or(rest.len());
+        let proc_name = rest[..paren_pos].trim().to_lowercase();
+
+        let args_str = if let Some(start) = rest.find('(') {
+            let end = rest.rfind(')').unwrap_or(rest.len());
+            rest[start + 1..end].trim()
+        } else {
+            ""
+        };
+
+        let is_autocommit = !session.is_in_transaction();
+        if is_autocommit {
+            session.begin().await?;
+        }
+
+        let result = async {
+            let txn = session.get_mut_txn().expect("Transaction must be active");
+
+            let definition = self
+                .store
+                .get_procedure(txn, &proc_name)
+                .await?
+                .ok_or_else(|| anyhow!("Procedure '{}' does not exist", proc_name))?;
+
+            let parts: Vec<&str> = definition.splitn(2, "\nBODY:").collect();
+            if parts.len() != 2 {
+                return Err(anyhow!("Invalid procedure definition"));
+            }
+
+            let param_str = parts[0].strip_prefix("PARAMS:").unwrap_or("");
+            let body_str = parts[1];
+
+            let param_defs: Vec<(&str, &str)> = if param_str.is_empty() {
+                vec![]
+            } else {
+                param_str
+                    .split(',')
+                    .filter_map(|p| {
+                        let parts: Vec<&str> = p.trim().splitn(2, ' ').collect();
+                        if parts.len() == 2 {
+                            Some((parts[0], parts[1]))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            };
+
+            let call_args: Vec<String> = if args_str.is_empty() {
+                vec![]
+            } else {
+                args_str.split(',').map(|s| s.trim().to_string()).collect()
+            };
+
+            if call_args.len() != param_defs.len() {
+                return Err(anyhow!(
+                    "Procedure '{}' expects {} arguments, got {}",
+                    proc_name,
+                    param_defs.len(),
+                    call_args.len()
+                ));
+            }
+
+            let mut param_map: HashMap<String, (String, String)> = HashMap::new();
+            for (i, (name, data_type)) in param_defs.iter().enumerate() {
+                param_map.insert(
+                    name.to_string(),
+                    (call_args[i].clone(), data_type.to_string()),
+                );
+            }
+
+            let body_statements: Vec<&str> = body_str
+                .split(';')
+                .filter(|s| !s.trim().is_empty())
+                .collect();
+
+            for stmt_str in body_statements {
+                let mut expanded_stmt = stmt_str.to_string();
+                for (name, (value, data_type)) in &param_map {
+                    let dt_lower = data_type.to_lowercase();
+                    let formatted_value = if dt_lower.contains("int")
+                        || dt_lower.contains("float")
+                        || dt_lower.contains("real")
+                        || dt_lower.contains("numeric")
+                        || dt_lower.contains("decimal")
+                        || dt_lower.contains("double")
+                    {
+                        value.clone()
+                    } else if value.starts_with('\'') && value.ends_with('\'') {
+                        value.clone()
+                    } else {
+                        format!("'{}'", value)
+                    };
+                    expanded_stmt = expanded_stmt.replace(name, &formatted_value);
+                }
+
+                let stmts = parse_sql(&expanded_stmt)?;
+                for stmt in stmts {
+                    self.execute_statement_on_txn(txn, &stmt).await?;
+                }
+            }
+
+            Ok(ExecuteResult::Call)
+        }
+        .await;
+
+        if is_autocommit {
+            if result.is_ok() {
+                session.commit().await?;
+            } else {
+                session.rollback().await?;
+            }
+        }
+
+        result
+    }
+
+    async fn execute_drop_procedure_cmd(
+        &self,
+        session: &mut Session,
+        sql: &str,
+    ) -> Result<ExecuteResult> {
+        let sql_upper = sql.trim().to_uppercase();
+        let rest = sql_upper
+            .strip_prefix("DROP PROCEDURE")
+            .ok_or_else(|| anyhow!("Invalid DROP PROCEDURE syntax"))?
+            .trim();
+
+        let if_exists = rest.starts_with("IF EXISTS");
+        let name_part = if if_exists {
+            rest.strip_prefix("IF EXISTS").unwrap().trim()
+        } else {
+            rest
+        };
+
+        let proc_name = name_part
+            .split(|c: char| c.is_whitespace() || c == '(' || c == ';')
+            .next()
+            .ok_or_else(|| anyhow!("Missing procedure name"))?
+            .to_lowercase();
+
+        let is_autocommit = !session.is_in_transaction();
+        if is_autocommit {
+            session.begin().await?;
+        }
+
+        let result = async {
+            let txn = session.get_mut_txn().expect("Transaction must be active");
+            let dropped = self.store.drop_procedure(txn, &proc_name).await?;
+            if !dropped && !if_exists {
+                return Err(anyhow!("Procedure '{}' does not exist", proc_name));
+            }
+            Ok(ExecuteResult::DropProcedure { proc_name })
+        }
+        .await;
+
+        if is_autocommit {
+            if result.is_ok() {
+                session.commit().await?;
+            } else {
+                session.rollback().await?;
+            }
+        }
+
+        result
     }
 
     async fn execute_drop_index(
@@ -795,47 +1213,229 @@ impl Executor {
     ) -> Result<HashMap<String, (TableSchema, Vec<Row>)>> {
         let mut ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
         if let Some(with) = &query.with {
-            if with.recursive {
-                return Err(anyhow!("Recursive CTEs not yet supported"));
-            }
             for cte in &with.cte_tables {
                 let cte_name = cte.alias.name.value.to_lowercase();
-                let cte_result = self.execute_query_with_ctes(txn, &cte.query, &ctes).await?;
-                match cte_result {
-                    ExecuteResult::Select { columns, rows } => {
-                        let col_names: Vec<String> = if cte.alias.columns.is_empty() {
-                            columns
-                        } else {
-                            cte.alias.columns.iter().map(|c| c.value.clone()).collect()
-                        };
-                        let schema = TableSchema {
-                            table_id: 0,
-                            name: cte_name.clone(),
-                            columns: col_names
-                                .iter()
-                                .map(|n| ColumnDef {
-                                    name: n.clone(),
-                                    data_type: DataType::Text,
-                                    nullable: true,
-                                    primary_key: false,
-                                    unique: false,
-                                    is_serial: false,
-                                    default_expr: None,
-                                })
-                                .collect(),
-                            pk_indices: vec![],
-                            indexes: vec![],
-                            version: 1,
-                            check_constraints: vec![],
-                            foreign_keys: vec![],
-                        };
-                        ctes.insert(cte_name, (schema, rows));
+
+                if with.recursive && self.cte_is_recursive(&cte.query, &cte_name) {
+                    let (schema, rows) = self
+                        .execute_recursive_cte(
+                            txn,
+                            &cte_name,
+                            &cte.query,
+                            &cte.alias.columns,
+                            &ctes,
+                        )
+                        .await?;
+                    ctes.insert(cte_name, (schema, rows));
+                } else {
+                    let cte_result = self.execute_query_with_ctes(txn, &cte.query, &ctes).await?;
+                    match cte_result {
+                        ExecuteResult::Select { columns, rows } => {
+                            let col_names: Vec<String> = if cte.alias.columns.is_empty() {
+                                columns
+                            } else {
+                                cte.alias.columns.iter().map(|c| c.value.clone()).collect()
+                            };
+                            let schema = TableSchema {
+                                table_id: 0,
+                                name: cte_name.clone(),
+                                columns: col_names
+                                    .iter()
+                                    .map(|n| ColumnDef {
+                                        name: n.clone(),
+                                        data_type: DataType::Text,
+                                        nullable: true,
+                                        primary_key: false,
+                                        unique: false,
+                                        is_serial: false,
+                                        default_expr: None,
+                                    })
+                                    .collect(),
+                                pk_indices: vec![],
+                                indexes: vec![],
+                                version: 1,
+                                check_constraints: vec![],
+                                foreign_keys: vec![],
+                            };
+                            ctes.insert(cte_name, (schema, rows));
+                        }
+                        _ => return Err(anyhow!("CTE must be a SELECT query")),
                     }
-                    _ => return Err(anyhow!("CTE must be a SELECT query")),
                 }
             }
         }
         Ok(ctes)
+    }
+
+    fn cte_is_recursive(&self, query: &Query, cte_name: &str) -> bool {
+        if let SetExpr::SetOperation { left, right, .. } = &*query.body {
+            self.set_expr_references_table(right, cte_name)
+                || self.set_expr_references_table(left, cte_name)
+        } else {
+            false
+        }
+    }
+
+    fn set_expr_references_table(&self, expr: &SetExpr, table_name: &str) -> bool {
+        match expr {
+            SetExpr::Select(select) => {
+                for from in &select.from {
+                    if self.table_factor_references(&from.relation, table_name) {
+                        return true;
+                    }
+                    for join in &from.joins {
+                        if self.table_factor_references(&join.relation, table_name) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            SetExpr::SetOperation { left, right, .. } => {
+                self.set_expr_references_table(left, table_name)
+                    || self.set_expr_references_table(right, table_name)
+            }
+            SetExpr::Query(q) => self.set_expr_references_table(&q.body, table_name),
+            _ => false,
+        }
+    }
+
+    fn table_factor_references(&self, factor: &TableFactor, table_name: &str) -> bool {
+        match factor {
+            TableFactor::Table { name, .. } => {
+                name.0.last().map(|i| i.value.to_lowercase()) == Some(table_name.to_lowercase())
+            }
+            TableFactor::Derived { subquery, .. } => {
+                self.set_expr_references_table(&subquery.body, table_name)
+            }
+            _ => false,
+        }
+    }
+
+    async fn execute_recursive_cte(
+        &self,
+        txn: &mut Transaction,
+        cte_name: &str,
+        query: &Query,
+        alias_columns: &[Ident],
+        existing_ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
+    ) -> Result<(TableSchema, Vec<Row>)> {
+        let (base_expr, recursive_expr, is_union_all) = match &*query.body {
+            SetExpr::SetOperation {
+                op: SetOperator::Union,
+                set_quantifier,
+                left,
+                right,
+            } => {
+                let is_all = matches!(set_quantifier, SetQuantifier::All);
+                if self.set_expr_references_table(left, cte_name) {
+                    (right.clone(), left.clone(), is_all)
+                } else {
+                    (left.clone(), right.clone(), is_all)
+                }
+            }
+            _ => return Err(anyhow!("Recursive CTE must use UNION or UNION ALL")),
+        };
+
+        let base_query = Query {
+            with: None,
+            body: base_expr,
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            fetch: None,
+            locks: vec![],
+            limit_by: vec![],
+            for_clause: None,
+        };
+        let base_result = self
+            .execute_query_with_ctes(txn, &base_query, existing_ctes)
+            .await?;
+        let (columns, mut all_rows) = match base_result {
+            ExecuteResult::Select { columns, rows } => (columns, rows),
+            _ => return Err(anyhow!("Recursive CTE base must be SELECT")),
+        };
+
+        let col_names: Vec<String> = if alias_columns.is_empty() {
+            columns
+        } else {
+            alias_columns.iter().map(|c| c.value.clone()).collect()
+        };
+        let schema = TableSchema {
+            table_id: 0,
+            name: cte_name.to_string(),
+            columns: col_names
+                .iter()
+                .map(|n| ColumnDef {
+                    name: n.clone(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                })
+                .collect(),
+            pk_indices: vec![],
+            indexes: vec![],
+            version: 1,
+            check_constraints: vec![],
+            foreign_keys: vec![],
+        };
+
+        let mut working_table = all_rows.clone();
+        let max_iterations = 1000;
+        let mut iteration = 0;
+
+        while !working_table.is_empty() && iteration < max_iterations {
+            iteration += 1;
+
+            let mut temp_ctes = existing_ctes.clone();
+            temp_ctes.insert(
+                cte_name.to_string(),
+                (schema.clone(), working_table.clone()),
+            );
+
+            let recursive_query = Query {
+                with: None,
+                body: recursive_expr.clone(),
+                order_by: vec![],
+                limit: None,
+                offset: None,
+                fetch: None,
+                locks: vec![],
+                limit_by: vec![],
+                for_clause: None,
+            };
+            let recursive_result = self
+                .execute_query_with_ctes(txn, &recursive_query, &temp_ctes)
+                .await?;
+
+            let new_rows = match recursive_result {
+                ExecuteResult::Select { rows, .. } => rows,
+                _ => return Err(anyhow!("Recursive CTE iteration must be SELECT")),
+            };
+
+            if new_rows.is_empty() {
+                break;
+            }
+
+            if is_union_all {
+                all_rows.extend(new_rows.clone());
+                working_table = new_rows;
+            } else {
+                let mut unique_new_rows = Vec::new();
+                for row in new_rows {
+                    if !all_rows.contains(&row) {
+                        unique_new_rows.push(row.clone());
+                        all_rows.push(row);
+                    }
+                }
+                working_table = unique_new_rows;
+            }
+        }
+
+        Ok((schema, all_rows))
     }
 
     async fn execute_query_with_ctes(

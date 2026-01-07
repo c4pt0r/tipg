@@ -1,0 +1,160 @@
+DROP MATERIALIZED VIEW
+DROP MATERIALIZED VIEW
+DROP MATERIALIZED VIEW
+DROP MATERIALIZED VIEW
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+SELECT 3
+  category   | order_count | total_quantity | total_revenue 
+-------------+-------------+----------------+---------------
+ Electronics |           1 |             20 |          4000
+ Hardware    |           4 |             38 |          4450
+ Software    |           3 |              6 |          3250
+(3 rows)
+
+SELECT 5
+ customer_name | region |  tier  | order_count | total_spent 
+---------------+--------+--------+-------------+-------------
+ Gamma LLC     | North  | Bronze |           1 |        4000
+ Delta Co      | East   | Gold   |           2 |        2700
+ Acme Corp     | North  | Gold   |           2 |        2000
+ Beta Inc      | South  | Silver |           2 |        1500
+ Epsilon Ltd   | West   | Silver |           1 |        1500
+(5 rows)
+
+  category   | order_count | total_quantity | total_revenue 
+-------------+-------------+----------------+---------------
+ Electronics |           1 |             20 |          4000
+ Hardware    |           4 |             38 |          4450
+ Software    |           3 |              6 |          3250
+(3 rows)
+
+ customer_name | region |  tier  | order_count | total_spent 
+---------------+--------+--------+-------------+-------------
+ Acme Corp     | North  | Gold   |           2 |        2000
+ Beta Inc      | South  | Silver |           2 |        1500
+ Delta Co      | East   | Gold   |           2 |        2700
+ Epsilon Ltd   | West   | Silver |           1 |        1500
+ Gamma LLC     | North  | Bronze |           1 |        4000
+(5 rows)
+
+ grand_total 
+-------------
+       11700
+(1 row)
+
+  avg_customer_spend   
+-----------------------
+ 2340.0000000000000000
+(1 row)
+
+   name    | order_count | total_spent 
+-----------+-------------+-------------
+ Delta Co  |           2 |        2700
+ Acme Corp |           2 |        2000
+(2 rows)
+
+INSERT 0 1
+INSERT 0 1
+  category   | order_count | total_quantity | total_revenue 
+-------------+-------------+----------------+---------------
+ Electronics |           1 |             20 |          4000
+ Hardware    |           4 |             38 |          4450
+ Software    |           3 |              6 |          3250
+(3 rows)
+
+REFRESH MATERIALIZED VIEW
+  category   | order_count | total_quantity | total_revenue 
+-------------+-------------+----------------+---------------
+ Electronics |           1 |             20 |          4000
+ Hardware    |           4 |             38 |          4450
+ Software    |           5 |             21 |         12000
+(3 rows)
+
+REFRESH MATERIALIZED VIEW
+ customer_name | region |  tier  | order_count | total_spent 
+---------------+--------+--------+-------------+-------------
+ Gamma LLC     | North  | Bronze |           2 |        9000
+ Acme Corp     | North  | Gold   |           3 |        5750
+ Delta Co      | East   | Gold   |           2 |        2700
+ Beta Inc      | South  | Silver |           2 |        1500
+ Epsilon Ltd   | West   | Silver |           1 |        1500
+(5 rows)
+
+SELECT 5
+ product_name |  category   | price | units_sold | revenue | demand_level 
+--------------+-------------+-------+------------+---------+--------------
+ Service X    | Software    |   500 |         15 |    7500 | High
+ Service Y    | Software    |   750 |          6 |    4500 | Medium
+ Gadget Z     | Electronics |   200 |         20 |    4000 | High
+ Widget A     | Hardware    |   100 |         25 |    2500 | High
+ Widget B     | Hardware    |   150 |         13 |    1950 | High
+(5 rows)
+
+ product_name | category | price | units_sold | revenue | demand_level 
+--------------+----------+-------+------------+---------+--------------
+ Service Y    | Software |   750 |          6 |    4500 | Medium
+ Service X    | Software |   500 |         15 |    7500 | High
+(2 rows)
+
+ category | total_revenue 
+----------+---------------
+ Software |         12000
+ Hardware |          4450
+(2 rows)
+
+  category   | total_revenue | premium_customers 
+-------------+---------------+-------------------
+ Software    |         12000 |                 5
+ Hardware    |          4450 |                 5
+ Electronics |          4000 |                 5
+(3 rows)
+
+    view_name    | rows 
+-----------------+------
+ sales_summary   |    3
+ customer_stats  |    5
+ product_ranking |    5
+(3 rows)
+
+DROP MATERIALIZED VIEW
+DROP MATERIALIZED VIEW
+SELECT 5
+   name    | qty 
+-----------+-----
+ Widget A  |  25
+ Gadget Z  |  20
+ Service X |  15
+ Widget B  |  13
+ Service Y |   6
+(5 rows)
+
+DROP MATERIALIZED VIEW
+DROP MATERIALIZED VIEW
+DROP MATERIALIZED VIEW
+DROP TABLE
+DROP TABLE
+DROP TABLE

@@ -1,0 +1,194 @@
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+CREATE PROCEDURE
+ id |  name   | department  | salary 
+----+---------+-------------+--------
+  1 | Alice   | Engineering |  80000
+  2 | Bob     | Engineering |  75000
+  3 | Charlie | Sales       |  60000
+  4 | Diana   | Sales       |  65000
+(4 rows)
+
+CALL
+ id |  name   | department  | salary 
+----+---------+-------------+--------
+  1 | Alice   | Engineering |  80000
+  2 | Bob     | Engineering |  75000
+  3 | Charlie | Sales       |  60000
+  4 | Diana   | Sales       |  65000
+  5 | Eve     | HR          |  55000
+(5 rows)
+
+CREATE PROCEDURE
+ name  | department  | salary 
+-------+-------------+--------
+ Alice | Engineering |  80000
+ Bob   | Engineering |  75000
+(2 rows)
+
+CALL
+ name  | department  | salary 
+-------+-------------+--------
+ Alice | Engineering |  85000
+ Bob   | Engineering |  80000
+(2 rows)
+
+CREATE PROCEDURE
+ before_count 
+--------------
+            5
+(1 row)
+
+CALL
+ after_count 
+-------------
+           6
+(1 row)
+
+ id |   action   | details  
+----+------------+----------
+  1 | bulk_start | TempUser
+(1 row)
+
+CREATE PROCEDURE
+   name   | salary 
+----------+--------
+ TempUser |  40000
+ Eve      |  55000
+ Charlie  |  60000
+ Diana    |  65000
+ Bob      |  80000
+ Alice    |  85000
+(6 rows)
+
+CALL
+   name   | salary 
+----------+--------
+ TempUser |  44000
+ Eve      |  60500
+ Charlie  |  66000
+ Diana    |  71500
+ Bob      |  88000
+ Alice    |  93500
+(6 rows)
+
+DROP PROCEDURE
+CREATE PROCEDURE
+ before_cleanup 
+----------------
+              6
+(1 row)
+
+CALL
+ after_cleanup 
+---------------
+             5
+(1 row)
+
+DROP PROCEDURE
+CREATE PROCEDURE
+CALL
+CALL
+ id |   action    |         details         
+----+-------------+-------------------------
+  1 | bulk_start  | TempUser
+  2 | USER_LOGIN  | User Alice logged in
+  3 | DATA_UPDATE | Salary update completed
+(3 rows)
+
+DROP PROCEDURE
+CREATE PROCEDURE
+ name  | salary 
+-------+--------
+ Alice |  93500
+(1 row)
+
+CALL
+ name  | salary 
+-------+--------
+ Alice | 107525
+(1 row)
+
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+CREATE PROCEDURE
+CALL
+ id | name  | department | salary 
+----+-------+------------+--------
+  7 | Frank | Marketing  |  58000
+(1 row)
+
+CREATE PROCEDURE
+ id |  owner  | balance 
+----+---------+---------
+  1 | Alice   |   10000
+  2 | Bob     |    5000
+  3 | Charlie |    8000
+(3 rows)
+
+CALL
+ id |  owner  | balance 
+----+---------+---------
+  1 | Alice   |    8000
+  2 | Bob     |    7000
+  3 | Charlie |    8000
+(3 rows)
+
+CALL
+CALL
+CALL
+ id |  owner  | balance 
+----+---------+---------
+  1 | Alice   |    8000
+  2 | Bob     |    6000
+  3 | Charlie |    9000
+(3 rows)
+
+ id |  action  |       details       
+----+----------+---------------------
+  4 | TRANSFER | Alice to Bob 2000
+  5 | TRANSFER | Bob to Charlie 1000
+(2 rows)
+
+ total_employees 
+-----------------
+               6
+(1 row)
+
+ total_balance 
+---------------
+         23000
+(1 row)
+
+ log_entries 
+-------------
+           5
+(1 row)
+
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP TABLE
+DROP TABLE
+DROP TABLE

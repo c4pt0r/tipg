@@ -1,0 +1,252 @@
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+INSERT 0 5
+INSERT 0 4
+INSERT 0 5
+INSERT 0 6
+INSERT 0 3
+CREATE PROCEDURE
+    name    | total_qty 
+------------+-----------
+ Laptop Pro |        50
+(1 row)
+
+CALL
+    name    | total_qty 
+------------+-----------
+ Laptop Pro |       100
+(1 row)
+
+CREATE PROCEDURE
+ id |    name    |  tier  | unit_price | discount_pct 
+----+------------+--------+------------+--------------
+  3 | StartupXYZ | Silver |        250 |            0
+  6 | SmallBiz   | Bronze |         25 |            0
+(2 rows)
+
+CALL
+CALL
+ id |    name    |  tier  | unit_price | discount_pct 
+----+------------+--------+------------+--------------
+  3 | StartupXYZ | Silver |        250 |           10
+  6 | SmallBiz   | Bronze |         25 |            5
+(2 rows)
+
+CREATE PROCEDURE
+  status   | cnt 
+-----------+-----
+ completed |   3
+ pending   |   2
+ shipped   |   1
+(3 rows)
+
+CALL
+   status   | cnt 
+------------+-----
+ completed  |   3
+ processing |   2
+ shipped    |   1
+(3 rows)
+
+CREATE PROCEDURE
+      name      |  category   | price 
+----------------+-------------+-------
+ Wireless Mouse | Electronics |    30
+ USB Hub        | Electronics |    25
+ Laptop Pro     | Electronics |  1200
+(3 rows)
+
+CALL
+      name      |  category   | price 
+----------------+-------------+-------
+ Wireless Mouse | Electronics |    34
+ USB Hub        | Electronics |    28
+ Laptop Pro     | Electronics |  1380
+(3 rows)
+
+CREATE PROCEDURE
+    name    | total_sales | total_commission 
+------------+-------------+------------------
+ John Smith |           0 |                0
+ Jane Doe   |           0 |                0
+ Bob Wilson |           0 |                0
+(3 rows)
+
+CALL
+CALL
+CALL
+    name    | total_sales | total_commission 
+------------+-------------+------------------
+ John Smith |       10000 |              500
+ Jane Doe   |       15000 |              900
+ Bob Wilson |        8000 |              320
+(3 rows)
+
+CREATE PROCEDURE
+ id |   status   
+----+------------
+  3 | processing
+(1 row)
+
+CALL
+ id |  status  
+----+----------
+  3 | refunded
+(1 row)
+
+CREATE PROCEDURE
+CALL
+CALL
+ id |  table_name   | operation | record_id | old_value | new_value | changed_at 
+----+---------------+-----------+-----------+-----------+-----------+------------
+  1 | order_details | VIEW      |         1 |           |           | 2024-01-20
+  2 | adv_products  | UPDATE    |         2 |           |           | 2024-01-20
+(2 rows)
+
+CREATE PROCEDURE
+ product_count 
+---------------
+             5
+(1 row)
+
+ order_count 
+-------------
+           1
+(1 row)
+
+CALL
+ product_count 
+---------------
+             4
+(1 row)
+
+ order_count 
+-------------
+           0
+(1 row)
+
+CREATE PROCEDURE
+CALL
+CALL
+CALL
+ id |  table_name   | operation | record_id | old_value |    new_value    | changed_at 
+----+---------------+-----------+-----------+-----------+-----------------+------------
+  1 | order_details | VIEW      |         1 |           |                 | 2024-01-20
+  2 | adv_products  | UPDATE    |         2 |           |                 | 2024-01-20
+  3 | adv_customers | UPDATE    |         1 | tier=Gold | tier=Platinum   | 2024-01-20
+  4 | adv_products  | INSERT    |         6 |           | name=NewProduct | 2024-01-20
+  5 | inventory     | DELETE    |        99 | qty=100   |                 | 2024-01-20
+(5 rows)
+
+        stage         
+----------------------
+ Before chained calls
+(1 row)
+
+    name    | stock 
+------------+-------
+ Laptop Pro |    75
+(1 row)
+
+    name    | total_sales 
+------------+-------------
+ John Smith |       10000
+(1 row)
+
+CALL
+CALL
+CALL
+        stage        
+---------------------
+ After chained calls
+(1 row)
+
+    name    | stock 
+------------+-------
+ Laptop Pro |    85
+(1 row)
+
+    name    | total_sales 
+------------+-------------
+ John Smith |       15000
+(1 row)
+
+      report      
+------------------
+ Final Statistics
+(1 row)
+
+ total_products 
+----------------
+              4
+(1 row)
+
+ total_customers 
+-----------------
+               4
+(1 row)
+
+ total_orders 
+--------------
+            5
+(1 row)
+
+ archived_orders 
+-----------------
+               0
+(1 row)
+
+ audit_entries 
+---------------
+             6
+(1 row)
+
+ total_commissions 
+-------------------
+              1970
+(1 row)
+
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP PROCEDURE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE

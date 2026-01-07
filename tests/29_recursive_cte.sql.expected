@@ -1,0 +1,195 @@
+ n  
+----
+  1
+  2
+  3
+  4
+  5
+  6
+  7
+  8
+  9
+ 10
+(10 rows)
+
+ n  | fib_n 
+----+-------
+  1 |     1
+  2 |     1
+  3 |     2
+  4 |     3
+  5 |     5
+  6 |     8
+  7 |    13
+  8 |    21
+  9 |    34
+ 10 |    55
+(10 rows)
+
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+ level |      name      |          title           |                  path                   
+-------+----------------+--------------------------+-----------------------------------------
+     0 | CEO            | Chief Executive Officer  | CEO
+     1 | CFO            | Chief Financial Officer  | CEO > CFO
+     2 | Accountant     | Staff Accountant         | CEO > CFO > Accountant
+     1 | CTO            | Chief Technology Officer | CEO > CTO
+     2 | VP Engineering | VP of Engineering        | CEO > CTO > VP Engineering
+     3 | Junior Dev     | Junior Developer         | CEO > CTO > VP Engineering > Junior Dev
+     3 | Senior Dev     | Senior Developer         | CEO > CTO > VP Engineering > Senior Dev
+     2 | VP Product     | VP of Product            | CEO > CTO > VP Product
+(8 rows)
+
+ id |      name      | manager_id | depth 
+----+----------------+------------+-------
+  4 | VP Engineering |          2 |     1
+  5 | VP Product     |          2 |     1
+  7 | Junior Dev     |          4 |     2
+  6 | Senior Dev     |          4 |     2
+(4 rows)
+
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+ depth |      name      |                     full_path                      
+-------+----------------+----------------------------------------------------
+     1 | Clothing       | Clothing
+     2 | Mens           | Clothing / Mens
+     3 | Shirts         | Clothing / Mens / Shirts
+     1 | Electronics    | Electronics
+     2 | Computers      | Electronics / Computers
+     3 | Laptops        | Electronics / Computers / Laptops
+     4 | Gaming Laptops | Electronics / Computers / Laptops / Gaming Laptops
+     2 | Phones         | Electronics / Phones
+     3 | Smartphones    | Electronics / Phones / Smartphones
+(9 rows)
+
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+       path       | hops 
+------------------+------
+ A -> B           |    1
+ A -> C           |    1
+ A -> B -> D      |    2
+ A -> C -> D      |    2
+ A -> B -> D -> E |    3
+ A -> C -> D -> E |    3
+(6 rows)
+
+ x 
+---
+ 1
+ 2
+ 3
+(3 rows)
+
+ x 
+---
+ 1
+(1 row)
+
+ day_num | day_name  
+---------+-----------
+       1 | Monday
+       2 | Tuesday
+       3 | Wednesday
+       4 | Thursday
+       5 | Friday
+       6 | Saturday
+       7 | Sunday
+(7 rows)
+
+ n  | power_of_2 
+----+------------
+  1 |          2
+  2 |          4
+  3 |          8
+  4 |         16
+  5 |         32
+  6 |         64
+  7 |        128
+  8 |        256
+  9 |        512
+ 10 |       1024
+(10 rows)
+
+ pos | letter | accumulated 
+-----+--------+-------------
+   1 | A      | A
+   2 | B      | AB
+   3 | C      | ABC
+   4 | D      | ABCD
+   5 | E      | ABCDE
+(5 rows)
+
+ total | sum_1_to_100 |         avg         
+-------+--------------+---------------------
+   100 |         5050 | 50.5000000000000000
+(1 row)
+
+ type | n  
+------+----
+ odd  |  1
+ even |  2
+ odd  |  3
+ even |  4
+ odd  |  5
+ even |  6
+ odd  |  7
+ even |  8
+ odd  |  9
+ even | 10
+ odd  | 11
+(11 rows)
+
+ max_tree_depth 
+----------------
+              3
+(1 row)
+
+ n  |  fact   
+----+---------
+  1 |       1
+  2 |       2
+  3 |       6
+  4 |      24
+  5 |     120
+  6 |     720
+  7 |    5040
+  8 |   40320
+  9 |  362880
+ 10 | 3628800
+(10 rows)
+
+ level |      name      
+-------+----------------
+     0 | Junior Dev
+     1 | VP Engineering
+     2 | CTO
+     3 | CEO
+(4 rows)
+
+DROP TABLE
+DROP TABLE
+DROP TABLE

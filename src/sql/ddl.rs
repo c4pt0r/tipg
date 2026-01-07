@@ -487,6 +487,95 @@ pub async fn execute_drop_view(
     Ok(ExecuteResult::DropView { view_name: last })
 }
 
+pub async fn execute_create_materialized_view(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    name: &ObjectName,
+    query: &Query,
+    or_replace: bool,
+    schema: TableSchema,
+    rows: Vec<Row>,
+) -> Result<ExecuteResult> {
+    let view_name = name
+        .0
+        .last()
+        .ok_or_else(|| anyhow!("Invalid materialized view name"))?
+        .value
+        .clone();
+    let view_name_lower = view_name.to_lowercase();
+
+    if store
+        .get_materialized_view(txn, &view_name_lower)
+        .await?
+        .is_some()
+    {
+        if or_replace {
+            store.drop_materialized_view(txn, &view_name_lower).await?;
+            store.drop_table(txn, &view_name_lower).await?;
+        } else {
+            return Err(anyhow!("Materialized view '{}' already exists", view_name));
+        }
+    }
+
+    let query_str = query.to_string();
+    store
+        .create_materialized_view(txn, &view_name_lower, &query_str)
+        .await?;
+
+    store.create_table(txn, schema).await?;
+    for row in rows {
+        store.insert(txn, &view_name_lower, row).await?;
+    }
+
+    Ok(ExecuteResult::CreateMaterializedView { view_name })
+}
+
+pub async fn execute_drop_materialized_view(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    names: &[ObjectName],
+    if_exists: bool,
+) -> Result<ExecuteResult> {
+    let mut last = String::new();
+    for name in names {
+        let v = name.0.last().unwrap().value.to_lowercase();
+        let exists = store.drop_materialized_view(txn, &v).await?;
+        if !exists && !if_exists {
+            return Err(anyhow!("Materialized view '{}' does not exist", v));
+        }
+        if exists {
+            store.drop_table(txn, &v).await?;
+        }
+        last = v;
+    }
+    Ok(ExecuteResult::DropMaterializedView { view_name: last })
+}
+
+pub async fn execute_refresh_materialized_view(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    name: &str,
+    rows: Vec<Row>,
+) -> Result<ExecuteResult> {
+    let name_lower = name.to_lowercase();
+    if store
+        .get_materialized_view(txn, &name_lower)
+        .await?
+        .is_none()
+    {
+        return Err(anyhow!("Materialized view '{}' does not exist", name));
+    }
+
+    store.truncate_table(txn, &name_lower).await?;
+    for row in rows {
+        store.insert(txn, &name_lower, row).await?;
+    }
+
+    Ok(ExecuteResult::RefreshMaterializedView {
+        view_name: name_lower,
+    })
+}
+
 pub async fn execute_drop_table(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,

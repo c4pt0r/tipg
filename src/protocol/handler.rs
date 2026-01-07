@@ -1366,6 +1366,26 @@ fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> 
 
         ExecuteResult::DropView { .. } => Ok(Response::Execution(Tag::new("DROP VIEW"))),
 
+        ExecuteResult::CreateMaterializedView { .. } => {
+            Ok(Response::Execution(Tag::new("CREATE MATERIALIZED VIEW")))
+        }
+
+        ExecuteResult::DropMaterializedView { .. } => {
+            Ok(Response::Execution(Tag::new("DROP MATERIALIZED VIEW")))
+        }
+
+        ExecuteResult::RefreshMaterializedView { .. } => {
+            Ok(Response::Execution(Tag::new("REFRESH MATERIALIZED VIEW")))
+        }
+
+        ExecuteResult::CreateProcedure { .. } => {
+            Ok(Response::Execution(Tag::new("CREATE PROCEDURE")))
+        }
+
+        ExecuteResult::DropProcedure { .. } => Ok(Response::Execution(Tag::new("DROP PROCEDURE"))),
+
+        ExecuteResult::Call => Ok(Response::Execution(Tag::new("CALL"))),
+
         ExecuteResult::AlterTable { .. } => Ok(Response::Execution(Tag::new("ALTER TABLE"))),
 
         ExecuteResult::Insert { affected_rows } => Ok(Response::Execution(

@@ -14,6 +14,8 @@ use anyhow::{Context, Result};
 const SYS_NEXT_TABLE_ID: &[u8] = b"_sys_next_table_id";
 const SYS_SCHEMA_PREFIX: &[u8] = b"_sys_schema_";
 const SYS_VIEW_PREFIX: &[u8] = b"_sys_view_";
+const SYS_MATVIEW_PREFIX: &[u8] = b"_sys_matview_";
+const SYS_PROCEDURE_PREFIX: &[u8] = b"_sys_proc_";
 const TABLE_DATA_PREFIX: &[u8] = b"t_";
 const TABLE_INDEX_PREFIX: &[u8] = b"i_";
 
@@ -64,6 +66,27 @@ pub fn encode_view_key(view_name: &str) -> Vec<u8> {
 
 pub fn encode_view_prefix() -> Vec<u8> {
     SYS_VIEW_PREFIX.to_vec()
+}
+
+/// Encode the key for a materialized view definition
+pub fn encode_matview_key(matview_name: &str) -> Vec<u8> {
+    let mut key = SYS_MATVIEW_PREFIX.to_vec();
+    key.extend_from_slice(matview_name.as_bytes());
+    key
+}
+
+pub fn encode_matview_prefix() -> Vec<u8> {
+    SYS_MATVIEW_PREFIX.to_vec()
+}
+
+pub fn encode_procedure_key(proc_name: &str) -> Vec<u8> {
+    let mut key = SYS_PROCEDURE_PREFIX.to_vec();
+    key.extend_from_slice(proc_name.as_bytes());
+    key
+}
+
+pub fn encode_procedure_prefix() -> Vec<u8> {
+    SYS_PROCEDURE_PREFIX.to_vec()
 }
 
 /// Encode a data key for a row

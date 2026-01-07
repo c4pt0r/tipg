@@ -477,4 +477,108 @@ impl TikvStore {
         }
         Ok(views)
     }
+
+    pub async fn create_materialized_view(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+        query: &str,
+    ) -> Result<()> {
+        let key = self.key(&encode_matview_key(name));
+        if txn.get(key.clone()).await?.is_some() {
+            return Err(anyhow!("Materialized view '{}' already exists", name));
+        }
+        txn.put(key, query.as_bytes().to_vec()).await?;
+        info!("Created materialized view '{}'", name);
+        Ok(())
+    }
+
+    pub async fn get_materialized_view(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+    ) -> Result<Option<String>> {
+        let key = self.key(&encode_matview_key(name));
+        match txn.get(key).await? {
+            Some(data) => Ok(Some(String::from_utf8(data)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn drop_materialized_view(&self, txn: &mut Transaction, name: &str) -> Result<bool> {
+        let key = self.key(&encode_matview_key(name));
+        if txn.get(key.clone()).await?.is_some() {
+            txn.delete(key).await?;
+            info!("Dropped materialized view '{}'", name);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn list_materialized_views(&self, txn: &mut Transaction) -> Result<Vec<String>> {
+        let raw_start = encode_matview_prefix();
+        let mut raw_end = raw_start.clone();
+        raw_end.push(0xFF);
+        let start = self.key(&raw_start);
+        let end = self.key(&raw_end);
+        let range: BoundRange = (start..end).into();
+        let pairs = txn.scan(range, u32::MAX).await?;
+        let mut matviews = Vec::new();
+        for pair in pairs {
+            let full_key: &[u8] = pair.key().as_ref().into();
+            let raw_key = strip_namespace(&self.namespace, full_key);
+            if raw_key.starts_with(&raw_start) {
+                let name = String::from_utf8_lossy(&raw_key[raw_start.len()..]).to_string();
+                matviews.push(name);
+            }
+        }
+        Ok(matviews)
+    }
+
+    pub async fn create_procedure(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+        definition: &str,
+    ) -> Result<()> {
+        let key = self.key(&encode_procedure_key(name));
+        if txn.get(key.clone()).await?.is_some() {
+            return Err(anyhow!("Procedure '{}' already exists", name));
+        }
+        txn.put(key, definition.as_bytes().to_vec()).await?;
+        info!("Created procedure '{}'", name);
+        Ok(())
+    }
+
+    pub async fn get_procedure(&self, txn: &mut Transaction, name: &str) -> Result<Option<String>> {
+        let key = self.key(&encode_procedure_key(name));
+        match txn.get(key).await? {
+            Some(data) => Ok(Some(String::from_utf8(data)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn drop_procedure(&self, txn: &mut Transaction, name: &str) -> Result<bool> {
+        let key = self.key(&encode_procedure_key(name));
+        if txn.get(key.clone()).await?.is_some() {
+            txn.delete(key).await?;
+            info!("Dropped procedure '{}'", name);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn replace_procedure(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+        definition: &str,
+    ) -> Result<()> {
+        let key = self.key(&encode_procedure_key(name));
+        txn.put(key, definition.as_bytes().to_vec()).await?;
+        info!("Replaced procedure '{}'", name);
+        Ok(())
+    }
 }

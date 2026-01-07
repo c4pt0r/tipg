@@ -270,7 +270,7 @@ impl TableSchema {
 }
 
 /// A row of data
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Row {
     pub values: Vec<Value>,
 }

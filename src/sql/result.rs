@@ -39,6 +39,22 @@ pub enum ExecuteResult {
     DropView {
         view_name: String,
     },
+    CreateMaterializedView {
+        view_name: String,
+    },
+    DropMaterializedView {
+        view_name: String,
+    },
+    RefreshMaterializedView {
+        view_name: String,
+    },
+    CreateProcedure {
+        proc_name: String,
+    },
+    DropProcedure {
+        proc_name: String,
+    },
+    Call,
     CreateRole,
     AlterRole,
     DropRole,

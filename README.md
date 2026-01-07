@@ -37,15 +37,16 @@ A PostgreSQL-compatible distributed SQL database built on TiKV.
 
 | Category | Features |
 |----------|----------|
-| **DDL** | `CREATE TABLE`, `DROP TABLE`, `TRUNCATE`, `ALTER TABLE ADD COLUMN`, `CREATE INDEX`, `CREATE VIEW`, `DROP VIEW`, `SHOW TABLES` |
+| **DDL** | `CREATE TABLE`, `DROP TABLE`, `TRUNCATE`, `ALTER TABLE ADD COLUMN`, `CREATE INDEX`, `CREATE VIEW`, `DROP VIEW`, `CREATE MATERIALIZED VIEW`, `DROP MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW`, `SHOW TABLES` |
 | **DML** | `INSERT`, `UPDATE`, `DELETE` with `RETURNING`, `SELECT` with full `WHERE` support |
-| **Queries** | `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`, `GROUP BY`, `HAVING`, `WITH ... AS` (CTEs) |
-| **Joins** | `INNER JOIN`, `LEFT JOIN` with `ON` clause |
+| **Queries** | `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`, `GROUP BY`, `HAVING`, `WITH ... AS` (CTEs), `WITH RECURSIVE` (Recursive CTEs) |
+| **Joins** | `INNER JOIN`, `LEFT JOIN`, `RIGHT JOIN`, `FULL OUTER JOIN`, `CROSS JOIN`, `NATURAL JOIN` |
 | **Aggregates** | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` |
 | **Window Functions** | `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LEAD`, `LAG`, `SUM/AVG/COUNT/MIN/MAX OVER` |
 | **Expressions** | `+`, `-`, `*`, `/`, `%`, `\|\|`, `AND`, `OR`, `NOT`, comparisons |
 | **Predicates** | `IN (...)`, `IN (SELECT ...)`, `EXISTS`, `BETWEEN`, `LIKE`, `ILIKE`, `IS NULL`, `IS NOT NULL`, Scalar Subqueries |
 | **Functions** | String, Math, Date/Time, `CASE WHEN`, `CAST`, `COALESCE`, `NULLIF` |
+| **Procedures** | `CREATE PROCEDURE`, `DROP PROCEDURE`, `CALL` |
 | **Transactions** | `BEGIN`, `COMMIT`, `ROLLBACK`, `SELECT FOR UPDATE` |
 | **COPY** | `COPY FROM stdin` for bulk loading, pg_restore compatible |
 
@@ -151,16 +152,48 @@ pg_restore -h 127.0.0.1 -p 5433 -d postgres --no-owner --no-privileges ./backup/
 | `PG_PORT` | `5433` | PostgreSQL protocol port |
 | `PG_NAMESPACE` | (empty) | Multi-tenant namespace prefix |
 
-## Limitations
+## Constraints
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| RIGHT/FULL OUTER JOIN | ❌ | Only INNER and LEFT JOIN |
-| Recursive CTEs | ❌ | `WITH RECURSIVE` not supported |
-| Materialized Views | ❌ | Only regular views supported |
-| Foreign Keys | ❌ | Parsed but not enforced |
-| CHECK Constraints | ❌ | Parsed but not enforced |
-| Stored Procedures | ❌ | Not implemented |
+| Constraint | Status | Notes |
+|------------|--------|-------|
+| PRIMARY KEY | ✅ | Single and composite keys |
+| NOT NULL | ✅ | Enforced on INSERT/UPDATE |
+| UNIQUE | ✅ | With auto-index creation |
+| CHECK | ✅ | Column-level constraints |
+| FOREIGN KEY | ✅ | Full referential integrity |
+| DEFAULT | ✅ | Including expressions like `NOW()` |
+
+### Foreign Key Actions
+
+| Action | ON DELETE | ON UPDATE |
+|--------|-----------|-----------|
+| CASCADE | ✅ | ✅ |
+| SET NULL | ✅ | ✅ |
+| SET DEFAULT | ✅ | ✅ |
+| RESTRICT | ✅ | ✅ |
+| NO ACTION | ✅ | ✅ |
+
+## Stored Procedures
+
+Basic stored procedure support with parameter passing:
+
+```sql
+-- Create a procedure
+CREATE PROCEDURE update_prices(p_factor INT)
+AS BEGIN
+UPDATE products SET price = price * p_factor
+END;
+
+-- Call the procedure
+CALL update_prices(2);
+
+-- Drop the procedure
+DROP PROCEDURE update_prices;
+```
+
+**Supported**: `CREATE PROCEDURE`, `DROP PROCEDURE`, `CALL`, parameters with type-aware substitution.
+
+**Limitations**: No OUT/INOUT parameters, no control flow (IF/WHILE), no exception handling.
 
 ## Project Structure
 
