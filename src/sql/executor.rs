@@ -4,9 +4,10 @@ use super::ddl;
 use super::dml;
 use super::explain;
 use super::helpers::{
-    collect_having_agg_funcs, dedup_rows, eval_default_expr, eval_having_expr,
+    collect_having_agg_funcs, cte_is_recursive, dedup_rows, eval_default_expr, eval_having_expr,
     eval_having_expr_join, fill_row_defaults, get_select_item_name, get_skip_reason,
-    get_unsupported_reason, infer_data_type, parse_value_for_copy, value_to_sql_expr,
+    get_unsupported_reason, infer_data_type, parse_value_for_copy, set_expr_references_table,
+    value_to_sql_expr,
 };
 use super::planner::{self, ScanType};
 use super::query;
@@ -21,10 +22,9 @@ use crate::storage::TikvStore;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
-    AlterRoleOperation, AlterTableOperation, Assignment, BinaryOperator, ColumnDef as SqlColumnDef,
-    Expr, FunctionArg, FunctionArgExpr, GrantObjects, GroupByExpr, Ident, JoinConstraint,
-    JoinOperator, LockType, ObjectName, OnInsert, OrderByExpr, Password as SqlPassword, Privileges,
-    Query, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableConstraint,
+    AlterTableOperation, Assignment, BinaryOperator, ColumnDef as SqlColumnDef, Expr, FunctionArg,
+    FunctionArgExpr, GroupByExpr, Ident, JoinConstraint, JoinOperator, LockType, ObjectName,
+    OnInsert, OrderByExpr, Query, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement,
     TableFactor, Value as SqlValue, Values,
 };
 use std::collections::HashMap;
@@ -170,8 +170,15 @@ impl Executor {
                     self.execute_create_table_as(txn, name, q, columns, *if_not_exists, *temporary)
                         .await
                 } else {
-                    self.execute_create_table(txn, name, columns, constraints, *if_not_exists)
-                        .await
+                    ddl::execute_create_table(
+                        &self.store,
+                        txn,
+                        name,
+                        columns,
+                        constraints,
+                        *if_not_exists,
+                    )
+                    .await
                 }
             }
             Statement::CreateIndex {
@@ -204,15 +211,23 @@ impl Executor {
             } => {
                 use sqlparser::ast::ObjectType;
                 match object_type {
-                    ObjectType::Table => self.execute_drop_table(txn, names, *if_exists).await,
-                    ObjectType::View => self.execute_drop_view(txn, names, *if_exists).await,
+                    ObjectType::Table => {
+                        ddl::execute_drop_table(&self.store, txn, names, *if_exists).await
+                    }
+                    ObjectType::View => {
+                        ddl::execute_drop_view(&self.store, txn, names, *if_exists).await
+                    }
                     ObjectType::Index => self.execute_drop_index(txn, names, *if_exists).await,
-                    ObjectType::Role => self.execute_drop_role(txn, names, *if_exists).await,
+                    ObjectType::Role => {
+                        rbac::execute_drop_role(&self.auth_manager, txn, names, *if_exists).await
+                    }
                     ObjectType::Sequence => Ok(ExecuteResult::Empty),
                     _ => Ok(ExecuteResult::Empty),
                 }
             }
-            Statement::Truncate { table_name, .. } => self.execute_truncate(txn, table_name).await,
+            Statement::Truncate { table_name, .. } => {
+                ddl::execute_truncate(&self.store, txn, table_name).await
+            }
             Statement::AlterTable {
                 name, operations, ..
             } => {
@@ -276,8 +291,7 @@ impl Executor {
                     self.execute_create_materialized_view(txn, name, query, *or_replace)
                         .await
                 } else {
-                    self.execute_create_view(txn, name, query, *or_replace)
-                        .await
+                    ddl::execute_create_view(&self.store, txn, name, query, *or_replace).await
                 }
             }
             Statement::AlterIndex { .. } => Ok(ExecuteResult::Empty),
@@ -285,32 +299,27 @@ impl Executor {
                 names,
                 if_not_exists,
                 login,
-                inherit,
                 password,
                 superuser,
                 create_db,
                 create_role,
-                connection_limit,
-                valid_until,
                 ..
             } => {
-                self.execute_create_role(
+                rbac::execute_create_role(
+                    &self.auth_manager,
                     txn,
                     names,
                     *if_not_exists,
                     login,
-                    inherit,
                     password,
                     superuser,
                     create_db,
                     create_role,
-                    connection_limit,
-                    valid_until,
                 )
                 .await
             }
             Statement::AlterRole { name, operation } => {
-                self.execute_alter_role(txn, name, operation).await
+                rbac::execute_alter_role(&self.auth_manager, txn, name, operation).await
             }
             Statement::Grant {
                 privileges,
@@ -319,7 +328,8 @@ impl Executor {
                 with_grant_option,
                 ..
             } => {
-                self.execute_grant(
+                rbac::execute_grant(
+                    &self.auth_manager,
                     txn,
                     privileges,
                     &Some(objects.clone()),
@@ -334,8 +344,14 @@ impl Executor {
                 grantees,
                 ..
             } => {
-                self.execute_revoke(txn, privileges, &Some(objects.clone()), grantees)
-                    .await
+                rbac::execute_revoke(
+                    &self.auth_manager,
+                    txn,
+                    privileges,
+                    &Some(objects.clone()),
+                    grantees,
+                )
+                .await
             }
             Statement::Comment { .. } => Ok(ExecuteResult::Empty),
             Statement::Copy { .. } => Ok(ExecuteResult::Empty),
@@ -350,19 +366,6 @@ impl Executor {
             }
             _ => Err(anyhow!("Unsupported statement: {:?}", stmt)),
         }
-    }
-
-    // --- DDL methods (delegated to ddl module) ---
-
-    async fn execute_create_table(
-        &self,
-        txn: &mut Transaction,
-        name: &ObjectName,
-        columns: &[SqlColumnDef],
-        constraints: &[TableConstraint],
-        if_not_exists: bool,
-    ) -> Result<ExecuteResult> {
-        ddl::execute_create_table(&self.store, txn, name, columns, constraints, if_not_exists).await
     }
 
     async fn execute_create_table_as(
@@ -456,25 +459,6 @@ impl Executor {
             rows,
         )
         .await
-    }
-
-    async fn execute_create_view(
-        &self,
-        txn: &mut Transaction,
-        name: &ObjectName,
-        query: &Query,
-        or_replace: bool,
-    ) -> Result<ExecuteResult> {
-        ddl::execute_create_view(&self.store, txn, name, query, or_replace).await
-    }
-
-    async fn execute_drop_view(
-        &self,
-        txn: &mut Transaction,
-        names: &[ObjectName],
-        if_exists: bool,
-    ) -> Result<ExecuteResult> {
-        ddl::execute_drop_view(&self.store, txn, names, if_exists).await
     }
 
     async fn execute_create_materialized_view(
@@ -909,23 +893,6 @@ impl Executor {
         })
     }
 
-    async fn execute_drop_table(
-        &self,
-        txn: &mut Transaction,
-        names: &[ObjectName],
-        if_exists: bool,
-    ) -> Result<ExecuteResult> {
-        ddl::execute_drop_table(&self.store, txn, names, if_exists).await
-    }
-
-    async fn execute_truncate(
-        &self,
-        txn: &mut Transaction,
-        table_name: &ObjectName,
-    ) -> Result<ExecuteResult> {
-        ddl::execute_truncate(&self.store, txn, table_name).await
-    }
-
     async fn execute_alter_table(
         &self,
         txn: &mut Transaction,
@@ -1216,7 +1183,7 @@ impl Executor {
             for cte in &with.cte_tables {
                 let cte_name = cte.alias.name.value.to_lowercase();
 
-                if with.recursive && self.cte_is_recursive(&cte.query, &cte_name) {
+                if with.recursive && cte_is_recursive(&cte.query, &cte_name) {
                     let (schema, rows) = self
                         .execute_recursive_cte(
                             txn,
@@ -1267,51 +1234,6 @@ impl Executor {
         Ok(ctes)
     }
 
-    fn cte_is_recursive(&self, query: &Query, cte_name: &str) -> bool {
-        if let SetExpr::SetOperation { left, right, .. } = &*query.body {
-            self.set_expr_references_table(right, cte_name)
-                || self.set_expr_references_table(left, cte_name)
-        } else {
-            false
-        }
-    }
-
-    fn set_expr_references_table(&self, expr: &SetExpr, table_name: &str) -> bool {
-        match expr {
-            SetExpr::Select(select) => {
-                for from in &select.from {
-                    if self.table_factor_references(&from.relation, table_name) {
-                        return true;
-                    }
-                    for join in &from.joins {
-                        if self.table_factor_references(&join.relation, table_name) {
-                            return true;
-                        }
-                    }
-                }
-                false
-            }
-            SetExpr::SetOperation { left, right, .. } => {
-                self.set_expr_references_table(left, table_name)
-                    || self.set_expr_references_table(right, table_name)
-            }
-            SetExpr::Query(q) => self.set_expr_references_table(&q.body, table_name),
-            _ => false,
-        }
-    }
-
-    fn table_factor_references(&self, factor: &TableFactor, table_name: &str) -> bool {
-        match factor {
-            TableFactor::Table { name, .. } => {
-                name.0.last().map(|i| i.value.to_lowercase()) == Some(table_name.to_lowercase())
-            }
-            TableFactor::Derived { subquery, .. } => {
-                self.set_expr_references_table(&subquery.body, table_name)
-            }
-            _ => false,
-        }
-    }
-
     async fn execute_recursive_cte(
         &self,
         txn: &mut Transaction,
@@ -1328,7 +1250,7 @@ impl Executor {
                 right,
             } => {
                 let is_all = matches!(set_quantifier, SetQuantifier::All);
-                if self.set_expr_references_table(left, cte_name) {
+                if set_expr_references_table(left, cte_name) {
                     (right.clone(), left.clone(), is_all)
                 } else {
                     (left.clone(), right.clone(), is_all)
@@ -2824,80 +2746,5 @@ impl Executor {
         }
 
         result
-    }
-
-    async fn execute_create_role(
-        &self,
-        txn: &mut Transaction,
-        names: &[ObjectName],
-        if_not_exists: bool,
-        login: &Option<bool>,
-        _inherit: &Option<bool>,
-        password: &Option<SqlPassword>,
-        superuser: &Option<bool>,
-        create_db: &Option<bool>,
-        create_role: &Option<bool>,
-        _connection_limit: &Option<Expr>,
-        _valid_until: &Option<Expr>,
-    ) -> Result<ExecuteResult> {
-        rbac::execute_create_role(
-            &self.auth_manager,
-            txn,
-            names,
-            if_not_exists,
-            login,
-            password,
-            superuser,
-            create_db,
-            create_role,
-        )
-        .await
-    }
-
-    async fn execute_alter_role(
-        &self,
-        txn: &mut Transaction,
-        name: &Ident,
-        operation: &AlterRoleOperation,
-    ) -> Result<ExecuteResult> {
-        rbac::execute_alter_role(&self.auth_manager, txn, name, operation).await
-    }
-
-    async fn execute_drop_role(
-        &self,
-        txn: &mut Transaction,
-        names: &[ObjectName],
-        if_exists: bool,
-    ) -> Result<ExecuteResult> {
-        rbac::execute_drop_role(&self.auth_manager, txn, names, if_exists).await
-    }
-
-    async fn execute_grant(
-        &self,
-        txn: &mut Transaction,
-        privileges: &Privileges,
-        objects: &Option<GrantObjects>,
-        grantees: &[Ident],
-        with_grant_option: bool,
-    ) -> Result<ExecuteResult> {
-        rbac::execute_grant(
-            &self.auth_manager,
-            txn,
-            privileges,
-            objects,
-            grantees,
-            with_grant_option,
-        )
-        .await
-    }
-
-    async fn execute_revoke(
-        &self,
-        txn: &mut Transaction,
-        privileges: &Privileges,
-        objects: &Option<GrantObjects>,
-        grantees: &[Ident],
-    ) -> Result<ExecuteResult> {
-        rbac::execute_revoke(&self.auth_manager, txn, privileges, objects, grantees).await
     }
 }

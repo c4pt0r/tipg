@@ -7,7 +7,8 @@ use std::collections::HashSet;
 
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
-    BinaryOperator, DataType as SqlDataType, Expr, FunctionArg, FunctionArgExpr, Value as SqlValue,
+    BinaryOperator, DataType as SqlDataType, Expr, FunctionArg, FunctionArgExpr, Query, SetExpr,
+    TableFactor, Value as SqlValue,
 };
 
 use super::expr::{eval_expr, eval_expr_join, JoinContext};
@@ -748,5 +749,49 @@ pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Value {
                 Value::Text(unescaped)
             }
         }
+    }
+}
+
+pub fn cte_is_recursive(query: &Query, cte_name: &str) -> bool {
+    if let SetExpr::SetOperation { left, right, .. } = &*query.body {
+        set_expr_references_table(right, cte_name) || set_expr_references_table(left, cte_name)
+    } else {
+        false
+    }
+}
+
+pub fn set_expr_references_table(expr: &SetExpr, table_name: &str) -> bool {
+    match expr {
+        SetExpr::Select(select) => {
+            for from in &select.from {
+                if table_factor_references(&from.relation, table_name) {
+                    return true;
+                }
+                for join in &from.joins {
+                    if table_factor_references(&join.relation, table_name) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            set_expr_references_table(left, table_name)
+                || set_expr_references_table(right, table_name)
+        }
+        SetExpr::Query(q) => set_expr_references_table(&q.body, table_name),
+        _ => false,
+    }
+}
+
+pub fn table_factor_references(factor: &TableFactor, table_name: &str) -> bool {
+    match factor {
+        TableFactor::Table { name, .. } => {
+            name.0.last().map(|i| i.value.to_lowercase()) == Some(table_name.to_lowercase())
+        }
+        TableFactor::Derived { subquery, .. } => {
+            set_expr_references_table(&subquery.body, table_name)
+        }
+        _ => false,
     }
 }
