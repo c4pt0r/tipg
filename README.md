@@ -2,10 +2,6 @@
 
 A PostgreSQL-compatible distributed SQL database built on TiKV.
 
-
-<img width="337" height="162" alt="image" src="https://github.com/user-attachments/assets/b1d14c35-efef-4ca7-8f3d-c71451602780" />
-
-
 ## Architecture
 
 ```
