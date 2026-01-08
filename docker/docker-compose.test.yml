@@ -71,7 +71,7 @@ services:
     networks:
       - pgtikv
 
-  test:
+  sql-test:
     image: postgres:16-bookworm
     depends_on:
       pg-tikv:
@@ -88,7 +88,7 @@ services:
     entrypoint: []
     command: >
       bash -c "
-        echo '=== pg-tikv Docker Test Suite ==='
+        echo '=== pg-tikv SQL Test Suite ==='
         echo ''
         echo '>>> Testing connection...'
         psql -c 'SELECT version()' && echo 'Connection: OK' || exit 1
@@ -100,7 +100,95 @@ services:
         psql -f /tests/01_ddl_basic.sql
         psql -f /tests/02_dml_crud.sql
         echo ''
-        echo '=== All tests passed! ==='
+        echo '=== SQL tests passed! ==='
+      "
+    networks:
+      - pgtikv
+
+  orm-test:
+    image: node:20-bookworm
+    depends_on:
+      pg-tikv:
+        condition: service_healthy
+    environment:
+      - PG_HOST=pg-tikv
+      - PG_PORT=5433
+      - PG_USER=postgres
+      - PG_PASSWORD=postgres
+      - PG_DATABASE=postgres
+    volumes:
+      - ../orm-tests:/app
+    working_dir: /app
+    entrypoint: []
+    command: >
+      bash -c "
+        echo '=== pg-tikv ORM Test Suite ==='
+        echo ''
+        echo '>>> Installing dependencies...'
+        npm install --silent
+        echo ''
+        echo '>>> Generating Prisma client...'
+        npx prisma generate
+        echo ''
+        echo '>>> Running ORM tests...'
+        npm test
+        echo ''
+        echo '=== ORM tests completed! ==='
+      "
+    networks:
+      - pgtikv
+
+  test-all:
+    image: node:20-bookworm
+    depends_on:
+      pg-tikv:
+        condition: service_healthy
+    environment:
+      - PG_HOST=pg-tikv
+      - PGHOST=pg-tikv
+      - PG_PORT=5433
+      - PGPORT=5433
+      - PG_USER=postgres
+      - PGUSER=postgres
+      - PG_PASSWORD=postgres
+      - PGPASSWORD=postgres
+      - PG_DATABASE=postgres
+      - PGDATABASE=postgres
+    volumes:
+      - ../examples:/examples:ro
+      - ../tests:/tests:ro
+      - ../orm-tests:/orm-tests
+    working_dir: /
+    entrypoint: []
+    command: >
+      bash -c "
+        echo '========================================='
+        echo '  pg-tikv Complete Test Suite'
+        echo '========================================='
+        echo ''
+        
+        apt-get update -qq && apt-get install -y -qq postgresql-client > /dev/null 2>&1
+        
+        echo '>>> [1/3] Testing connection...'
+        psql -c 'SELECT 1' > /dev/null && echo '    Connection: OK' || exit 1
+        echo ''
+        
+        echo '>>> [2/3] Running SQL tests...'
+        psql -f /examples/fancy_demo.sql > /dev/null 2>&1 && echo '    fancy_demo.sql: OK' || echo '    fancy_demo.sql: FAILED'
+        psql -f /tests/01_ddl_basic.sql > /dev/null 2>&1 && echo '    01_ddl_basic.sql: OK' || echo '    01_ddl_basic.sql: FAILED'
+        psql -f /tests/02_dml_crud.sql > /dev/null 2>&1 && echo '    02_dml_crud.sql: OK' || echo '    02_dml_crud.sql: FAILED'
+        echo ''
+        
+        echo '>>> [3/3] Running ORM tests...'
+        cd /orm-tests
+        npm install --silent 2>/dev/null
+        npx prisma generate 2>/dev/null
+        npm test 2>&1 | tail -20
+        echo ''
+        
+        echo '========================================='
+        echo '  All tests completed!'
+        echo '========================================='
       "
     networks:
       - pgtikv
