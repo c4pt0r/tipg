@@ -7,7 +7,7 @@ use sqlparser::ast::{
 };
 use tikv_client::Transaction;
 
-use super::helpers::{convert_data_type, infer_data_type, is_serial_type};
+use super::helpers::{convert_data_type, infer_data_type, is_serial_type, normalize_ident};
 use super::ExecuteResult;
 use crate::storage::TikvStore;
 use crate::types::{
@@ -26,9 +26,8 @@ pub async fn execute_create_table(
     let table_name = name
         .0
         .last()
-        .ok_or_else(|| anyhow!("Invalid table name"))?
-        .value
-        .clone();
+        .map(normalize_ident)
+        .ok_or_else(|| anyhow!("Invalid table name"))?;
 
     if if_not_exists && store.table_exists(txn, &table_name).await? {
         return Ok(ExecuteResult::CreateTable { table_name });
@@ -41,7 +40,7 @@ pub async fn execute_create_table(
                 columns,
                 is_primary,
                 ..
-            } if *is_primary => Some(columns.iter().map(|c| c.value.clone()).collect::<Vec<_>>()),
+            } if *is_primary => Some(columns.iter().map(normalize_ident).collect::<Vec<_>>()),
             _ => None,
         })
         .flatten()
@@ -60,7 +59,7 @@ pub async fn execute_create_table(
 
     let mut col_defs = Vec::new();
     for col in columns {
-        let col_name = col.name.value.clone();
+        let col_name = normalize_ident(&col.name);
         let (data_type, mut is_serial) = if is_serial_type(&col.data_type) {
             (DataType::Int32, true)
         } else {
@@ -163,7 +162,7 @@ pub async fn execute_create_table(
                 ..
             } => {
                 if !*is_primary {
-                    let col_names: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
+                    let col_names: Vec<String> = columns.iter().map(normalize_ident).collect();
                     let idx_name = name
                         .as_ref()
                         .map(|n| n.value.clone())
@@ -186,14 +185,13 @@ pub async fn execute_create_table(
                 on_update,
                 ..
             } => {
-                let fk_cols: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
+                let fk_cols: Vec<String> = columns.iter().map(normalize_ident).collect();
                 let ref_table = foreign_table
                     .0
                     .last()
-                    .map(|i| i.value.clone())
+                    .map(normalize_ident)
                     .unwrap_or_default();
-                let ref_cols: Vec<String> =
-                    referred_columns.iter().map(|c| c.value.clone()).collect();
+                let ref_cols: Vec<String> = referred_columns.iter().map(normalize_ident).collect();
                 let fk_name = name
                     .as_ref()
                     .map(|n| n.value.clone())
@@ -295,7 +293,7 @@ pub async fn create_table_from_query_result(
         col_defs.extend(explicit_columns.iter().map(|col| {
             let data_type = convert_data_type(&col.data_type).unwrap_or(DataType::Text);
             ColumnDef {
-                name: col.name.value.clone(),
+                name: normalize_ident(&col.name),
                 data_type,
                 nullable: true,
                 primary_key: false,
@@ -417,8 +415,8 @@ pub async fn execute_create_index(
     if_not_exists: bool,
     rows: Vec<Row>,
 ) -> Result<ExecuteResult> {
-    let idx_name_str = idx_name.to_string();
-    let tbl_name = table_name.0.last().unwrap().value.clone();
+    let idx_name_str = idx_name.to_lowercase();
+    let tbl_name = table_name.0.last().map(normalize_ident).unwrap();
 
     let mut schema = store
         .get_schema(txn, &tbl_name)
@@ -437,7 +435,7 @@ pub async fn execute_create_index(
     let mut idx_cols = Vec::new();
     for col_expr in columns {
         if let Expr::Identifier(ident) = &col_expr.expr {
-            let col_name = ident.value.clone();
+            let col_name = normalize_ident(ident);
             if schema.column_index(&col_name).is_none() {
                 return Err(anyhow!("Column not found"));
             }
@@ -488,21 +486,19 @@ pub async fn execute_create_view(
     let view_name = name
         .0
         .last()
-        .ok_or_else(|| anyhow!("Invalid view name"))?
-        .value
-        .clone();
-    let view_name_lower = view_name.to_lowercase();
+        .map(normalize_ident)
+        .ok_or_else(|| anyhow!("Invalid view name"))?;
 
-    if store.get_view(txn, &view_name_lower).await?.is_some() {
+    if store.get_view(txn, &view_name).await?.is_some() {
         if or_replace {
-            store.drop_view(txn, &view_name_lower).await?;
+            store.drop_view(txn, &view_name).await?;
         } else {
             return Err(anyhow!("View '{}' already exists", view_name));
         }
     }
 
     let query_str = query.to_string();
-    store.create_view(txn, &view_name_lower, &query_str).await?;
+    store.create_view(txn, &view_name, &query_str).await?;
 
     Ok(ExecuteResult::CreateView { view_name })
 }
@@ -515,7 +511,7 @@ pub async fn execute_drop_view(
 ) -> Result<ExecuteResult> {
     let mut last = String::new();
     for name in names {
-        let v = name.0.last().unwrap().value.to_lowercase();
+        let v = name.0.last().map(normalize_ident).unwrap();
         if !store.drop_view(txn, &v).await? && !if_exists {
             return Err(anyhow!("View '{}' does not exist", v));
         }
@@ -536,19 +532,17 @@ pub async fn execute_create_materialized_view(
     let view_name = name
         .0
         .last()
-        .ok_or_else(|| anyhow!("Invalid materialized view name"))?
-        .value
-        .clone();
-    let view_name_lower = view_name.to_lowercase();
+        .map(normalize_ident)
+        .ok_or_else(|| anyhow!("Invalid materialized view name"))?;
 
     if store
-        .get_materialized_view(txn, &view_name_lower)
+        .get_materialized_view(txn, &view_name)
         .await?
         .is_some()
     {
         if or_replace {
-            store.drop_materialized_view(txn, &view_name_lower).await?;
-            store.drop_table(txn, &view_name_lower).await?;
+            store.drop_materialized_view(txn, &view_name).await?;
+            store.drop_table(txn, &view_name).await?;
         } else {
             return Err(anyhow!("Materialized view '{}' already exists", view_name));
         }
@@ -556,15 +550,17 @@ pub async fn execute_create_materialized_view(
 
     let query_str = query.to_string();
     store
-        .create_materialized_view(txn, &view_name_lower, &query_str)
+        .create_materialized_view(txn, &view_name, &query_str)
         .await?;
 
     store.create_table(txn, schema).await?;
     for row in rows {
-        store.insert(txn, &view_name_lower, row).await?;
+        store.insert(txn, &view_name, row).await?;
     }
 
-    Ok(ExecuteResult::CreateMaterializedView { view_name })
+    Ok(ExecuteResult::CreateMaterializedView {
+        view_name: view_name.clone(),
+    })
 }
 
 pub async fn execute_drop_materialized_view(
@@ -575,7 +571,7 @@ pub async fn execute_drop_materialized_view(
 ) -> Result<ExecuteResult> {
     let mut last = String::new();
     for name in names {
-        let v = name.0.last().unwrap().value.to_lowercase();
+        let v = name.0.last().map(normalize_ident).unwrap();
         let exists = store.drop_materialized_view(txn, &v).await?;
         if !exists && !if_exists {
             return Err(anyhow!("Materialized view '{}' does not exist", v));
@@ -621,7 +617,7 @@ pub async fn execute_drop_table(
 ) -> Result<ExecuteResult> {
     let mut last = String::new();
     for name in names {
-        let t = name.0.last().unwrap().value.clone();
+        let t = name.0.last().map(normalize_ident).unwrap();
         if !store.drop_table(txn, &t).await? && !if_exists {
             return Err(anyhow!("Table '{}' does not exist", t));
         }
@@ -635,7 +631,7 @@ pub async fn execute_truncate(
     txn: &mut Transaction,
     table_name: &ObjectName,
 ) -> Result<ExecuteResult> {
-    let t = table_name.0.last().unwrap().value.clone();
+    let t = table_name.0.last().map(normalize_ident).unwrap();
     if !store.truncate_table(txn, &t).await? {
         return Err(anyhow!("Table '{}' does not exist", t));
     }
@@ -679,7 +675,7 @@ pub async fn execute_alter_table(
     operation: &AlterTableOperation,
     rows: Vec<Row>,
 ) -> Result<ExecuteResult> {
-    let t = name.0.last().unwrap().value.clone();
+    let t = name.0.last().map(normalize_ident).unwrap();
     let mut schema = store
         .get_schema(txn, &t)
         .await?
@@ -687,7 +683,7 @@ pub async fn execute_alter_table(
 
     match operation {
         AlterTableOperation::AddColumn { column_def, .. } => {
-            let col_name = column_def.name.value.clone();
+            let col_name = normalize_ident(&column_def.name);
             if schema.column_index(&col_name).is_some() {
                 return Err(anyhow!("Column exists"));
             }
@@ -722,7 +718,7 @@ pub async fn execute_alter_table(
                 is_primary,
                 ..
             } if *is_primary => {
-                let pk_names: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
+                let pk_names: Vec<String> = columns.iter().map(normalize_ident).collect();
                 let mut pk_indices = Vec::new();
                 for pk_name in &pk_names {
                     if let Some(idx) = schema.columns.iter().position(|c| c.name == *pk_name) {
@@ -739,7 +735,8 @@ pub async fn execute_alter_table(
             }
             TableConstraint::Unique { columns, .. } => {
                 for col in columns {
-                    if let Some(idx) = schema.columns.iter().position(|c| c.name == col.value) {
+                    let col_name = normalize_ident(col);
+                    if let Some(idx) = schema.columns.iter().position(|c| c.name == col_name) {
                         schema.columns[idx].unique = true;
                     }
                 }
@@ -755,7 +752,7 @@ pub async fn execute_alter_table(
             if_exists,
             ..
         } => {
-            let col_name = column_name.value.clone();
+            let col_name = normalize_ident(column_name);
             let col_idx = schema.column_index(&col_name);
             match col_idx {
                 Some(idx) => {
@@ -798,8 +795,8 @@ pub async fn execute_alter_table(
             old_column_name,
             new_column_name,
         } => {
-            let old_name = old_column_name.value.clone();
-            let new_name = new_column_name.value.clone();
+            let old_name = normalize_ident(old_column_name);
+            let new_name = normalize_ident(new_column_name);
             let col_idx = schema
                 .column_index(&old_name)
                 .ok_or_else(|| anyhow!("Column '{}' does not exist", old_name))?;

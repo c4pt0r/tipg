@@ -7,9 +7,17 @@ use std::collections::HashSet;
 
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
-    BinaryOperator, DataType as SqlDataType, Expr, FunctionArg, FunctionArgExpr, Query, SetExpr,
-    TableFactor, Value as SqlValue,
+    BinaryOperator, DataType as SqlDataType, Expr, FunctionArg, FunctionArgExpr, Ident, Query,
+    SetExpr, TableFactor, Value as SqlValue,
 };
+
+pub fn normalize_ident(ident: &Ident) -> String {
+    if ident.quote_style.is_some() {
+        ident.value.clone()
+    } else {
+        ident.value.to_lowercase()
+    }
+}
 
 use super::expr::{eval_expr, eval_expr_join, JoinContext};
 use super::Aggregator;
