@@ -1,0 +1,52 @@
+{
+  "name": "pg-tikv-orm-compatibility-tests",
+  "version": "1.0.0",
+  "description": "PostgreSQL ORM compatibility tests for pg-tikv",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:typeorm": "vitest run --project typeorm",
+    "test:prisma": "vitest run --project prisma",
+    "test:sequelize": "vitest run --project sequelize",
+    "test:knex": "vitest run --project knex",
+    "test:drizzle": "vitest run --project drizzle",
+    "test:connection": "vitest run -t 'connection'",
+    "test:schema": "vitest run -t 'schema'",
+    "test:crud": "vitest run -t 'crud'",
+    "test:transactions": "vitest run -t 'transaction'",
+    "test:relations": "vitest run -t 'relation'",
+    "prisma:generate": "prisma generate",
+    "prisma:push": "prisma db push",
+    "drizzle:generate": "drizzle-kit generate",
+    "drizzle:push": "drizzle-kit push",
+    "report": "tsx shared/generate-report.ts",
+    "lint": "eslint . --ext .ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/pg": "^8.10.9",
+    "@typescript-eslint/eslint-plugin": "^6.13.0",
+    "@typescript-eslint/parser": "^6.13.0",
+    "eslint": "^8.55.0",
+    "prisma": "^5.7.0",
+    "tsx": "^4.6.0",
+    "typescript": "^5.3.0",
+    "vitest": "^1.0.0"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.7.0",
+    "drizzle-kit": "^0.20.0",
+    "drizzle-orm": "^0.29.0",
+    "knex": "^3.1.0",
+    "pg": "^8.11.0",
+    "postgres": "^3.4.0",
+    "reflect-metadata": "^0.2.0",
+    "sequelize": "^6.35.0",
+    "typeorm": "^0.3.17"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

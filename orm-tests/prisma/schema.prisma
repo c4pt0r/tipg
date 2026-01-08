@@ -1,0 +1,51 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model PrismaUser {
+  id         Int       @id @default(autoincrement())
+  email      String    @unique
+  name       String    @db.VarChar(100)
+  age        Int       @default(0)
+  isActive   Boolean   @default(true)
+  bio        String?   @db.Text
+  metadata   Json?     @db.JsonB
+  externalId String?   @db.Uuid
+  createdAt  DateTime  @default(now()) @db.Timestamptz
+  updatedAt  DateTime  @updatedAt @db.Timestamptz
+  posts      PrismaPost[]
+
+  @@map("prisma_users")
+  @@index([email])
+}
+
+model PrismaPost {
+  id        Int       @id @default(autoincrement())
+  title     String    @db.VarChar(500)
+  content   String    @db.Text
+  published Boolean   @default(false)
+  viewCount Int       @default(0)
+  settings  Json?     @db.JsonB
+  createdAt DateTime  @default(now()) @db.Timestamptz
+  authorId  Int
+  author    PrismaUser @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  tags      PrismaTag[]
+
+  @@map("prisma_posts")
+  @@index([title])
+}
+
+model PrismaTag {
+  id    Int       @id @default(autoincrement())
+  name  String    @unique @db.VarChar(100)
+  color String    @default("#000000") @db.VarChar(7)
+  posts PrismaPost[]
+
+  @@map("prisma_tags")
+  @@index([name])
+}

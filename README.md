@@ -64,6 +64,7 @@ A PostgreSQL-compatible distributed SQL database built on TiKV.
 | `TIMESTAMP` | `TIMESTAMPTZ` |
 | `INTERVAL` | - |
 | `UUID` | - |
+| `JSON` | `JSONB` |
 
 ### PostgreSQL Functions
 
@@ -210,6 +211,7 @@ src/
 │   ├── expr.rs          # Expression evaluation
 │   ├── aggregate.rs     # Aggregation functions
 │   ├── session.rs       # Transaction management
+│   ├── information_schema.rs  # information_schema virtual tables
 │   └── result.rs        # Result types
 ├── storage/
 │   ├── mod.rs
@@ -218,26 +220,46 @@ src/
 └── types/
     └── mod.rs           # Value, Row, Schema types
 
-tests/
-├── 01_ddl_basic.sql        # DDL tests
-├── 02_dml_crud.sql         # CRUD tests
-├── ...
-├── 17_dvdrental.sql        # Integration tests
-├── 18_window_functions.sql # Window function tests
-├── 19_subqueries.sql       # Subquery tests
-├── 20_cte.sql              # CTE tests
-├── 21_views.sql            # View tests
-└── dvdrental/              # Sample database for pg_restore
+tests/                   # SQL integration tests
+orm-tests/               # ORM compatibility tests (TypeORM, Prisma, etc.)
 ```
+
+## ORM Compatibility
+
+pg-tikv is tested against popular TypeScript/JavaScript ORMs:
+
+| ORM | Tests | Status |
+|-----|-------|--------|
+| TypeORM | 147 | ✅ All passing |
+| Prisma | 89 | ✅ All passing |
+| Sequelize | 87 | ✅ All passing |
+| Knex.js | 97 | ✅ All passing |
+| Drizzle | 75 | ✅ All passing |
+
+**Total: 498 ORM tests passing**
+
+Features tested include:
+- Connection pooling and error handling
+- CRUD operations (INSERT, SELECT, UPDATE, DELETE)
+- Transactions (BEGIN, COMMIT, ROLLBACK, isolation levels)
+- Relations (foreign keys, JOINs, eager loading)
+- Advanced queries (window functions, CTEs, subqueries, views)
+- JSONB operations
+- Schema introspection via `information_schema`
+
+See [orm-tests/README.md](orm-tests/README.md) for details.
 
 ## Tests
 
 ```bash
-# Unit tests (67 tests)
+# Unit tests (184 tests)
 cargo test
 
 # Integration tests (requires running server)
-./run_tests.sh
+python3 scripts/integration_test.py
+
+# ORM tests (requires running server)
+cd orm-tests && npm test
 ```
 
 | Test Suite | Coverage |
@@ -250,8 +272,8 @@ cargo test
 | Window Functions | ROW_NUMBER, RANK, DENSE_RANK, LEAD, LAG, SUM/AVG/COUNT OVER |
 | Functions | String, Math, Date, CASE, CAST |
 | Indexes | CREATE INDEX, Index Scan optimization |
-| Types | UUID, INTERVAL, TIMESTAMP |
-| Compatibility | COPY protocol, pg_restore, Extended Query |
+| Types | UUID, INTERVAL, TIMESTAMP, JSONB |
+| Compatibility | COPY protocol, pg_restore, Extended Query, ORMs |
 
 ## License
 

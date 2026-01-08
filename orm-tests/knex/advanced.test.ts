@@ -1,0 +1,547 @@
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import { createKnexClient } from './client.js';
+import type { Knex } from 'knex';
+
+describe('Knex Advanced SQL Features [pg-tikv]', () => {
+  let knex: Knex;
+
+  beforeAll(async () => {
+    knex = createKnexClient();
+
+    await knex.raw(`DROP TABLE IF EXISTS adv_sales CASCADE`);
+    await knex.raw(`DROP TABLE IF EXISTS adv_employees CASCADE`);
+    await knex.raw(`DROP TABLE IF EXISTS adv_departments CASCADE`);
+    await knex.raw(`DROP VIEW IF EXISTS adv_dept_summary`);
+
+    await knex.raw(`
+      CREATE TABLE adv_departments (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        budget DECIMAL(15,2) DEFAULT 0
+      )
+    `);
+
+    await knex.raw(`
+      CREATE TABLE adv_employees (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        email VARCHAR(255),
+        department_id INTEGER REFERENCES adv_departments(id),
+        salary DECIMAL(10,2) NOT NULL,
+        hire_date TIMESTAMPTZ DEFAULT NOW(),
+        metadata JSONB,
+        manager_id INTEGER REFERENCES adv_employees(id)
+      )
+    `);
+
+    await knex.raw(`
+      CREATE TABLE adv_sales (
+        id SERIAL PRIMARY KEY,
+        employee_id INTEGER REFERENCES adv_employees(id),
+        amount DECIMAL(10,2) NOT NULL,
+        sale_date TIMESTAMPTZ DEFAULT NOW(),
+        region VARCHAR(50)
+      )
+    `);
+  });
+
+  afterAll(async () => {
+    await knex.raw(`DROP VIEW IF EXISTS adv_dept_summary`);
+    await knex.raw(`DROP TABLE IF EXISTS adv_sales CASCADE`);
+    await knex.raw(`DROP TABLE IF EXISTS adv_employees CASCADE`);
+    await knex.raw(`DROP TABLE IF EXISTS adv_departments CASCADE`);
+    await knex.destroy();
+  });
+
+  beforeEach(async () => {
+    await knex.raw(`DELETE FROM adv_sales`);
+    await knex.raw(`DELETE FROM adv_employees`);
+    await knex.raw(`DELETE FROM adv_departments`);
+
+    await knex.raw(`
+      INSERT INTO adv_departments (id, name, budget) VALUES
+      (1, 'Engineering', 500000),
+      (2, 'Sales', 300000),
+      (3, 'Marketing', 200000)
+    `);
+
+    await knex.raw(`
+      INSERT INTO adv_employees (id, name, email, department_id, salary, metadata, manager_id) VALUES
+      (1, 'Alice', 'alice@test.com', 1, 80000, '{"level": "senior", "skills": ["rust", "python"]}', NULL),
+      (2, 'Bob', 'bob@test.com', 1, 70000, '{"level": "mid", "skills": ["javascript"]}', 1),
+      (3, 'Charlie', 'charlie@test.com', 2, 60000, '{"level": "junior", "skills": ["sales"]}', NULL),
+      (4, 'Diana', 'diana@test.com', 2, 75000, '{"level": "senior", "skills": ["sales", "marketing"]}', 3),
+      (5, 'Eve', 'eve@test.com', 3, 55000, '{"level": "mid", "skills": ["design"]}', NULL)
+    `);
+
+    await knex.raw(`
+      INSERT INTO adv_sales (employee_id, amount, sale_date, region) VALUES
+      (3, 1000, '2024-01-15', 'North'),
+      (3, 1500, '2024-01-20', 'South'),
+      (4, 2000, '2024-01-18', 'North'),
+      (4, 2500, '2024-02-10', 'East'),
+      (4, 1800, '2024-02-15', 'North')
+    `);
+  });
+
+  describe('window functions', () => {
+    it('should support ROW_NUMBER()', async () => {
+      const result = await knex.raw(`
+        SELECT name, salary, ROW_NUMBER() OVER (ORDER BY salary DESC) as rank
+        FROM adv_employees
+        ORDER BY rank
+      `);
+
+      expect(result.rows).toHaveLength(5);
+      expect(result.rows[0].name).toBe('Alice');
+      expect(Number(result.rows[0].rank)).toBe(1);
+    });
+
+    it('should support RANK() with ties', async () => {
+      await knex.raw(`UPDATE adv_employees SET salary = 70000 WHERE name = 'Charlie'`);
+
+      const result = await knex.raw(`
+        SELECT name, salary, RANK() OVER (ORDER BY salary DESC) as rank
+        FROM adv_employees
+        ORDER BY rank, name
+      `);
+
+      const bobRank = result.rows.find((r: { name: string }) => r.name === 'Bob');
+      const charlieRank = result.rows.find((r: { name: string }) => r.name === 'Charlie');
+      expect(Number(bobRank.rank)).toBe(Number(charlieRank.rank));
+    });
+
+    it('should support DENSE_RANK() with PARTITION BY', async () => {
+      const result = await knex.raw(`
+        SELECT name, department_id, salary,
+               DENSE_RANK() OVER (PARTITION BY department_id ORDER BY salary DESC) as dept_rank
+        FROM adv_employees
+        ORDER BY department_id, dept_rank
+      `);
+
+      const engEmployees = result.rows.filter((r: { department_id: number }) => r.department_id === 1);
+      expect(engEmployees).toHaveLength(2);
+      expect(Number(engEmployees[0].dept_rank)).toBe(1);
+    });
+
+    it('should support LEAD() and LAG()', async () => {
+      const result = await knex.raw(`
+        SELECT name, salary,
+               LAG(salary) OVER (ORDER BY salary) as prev_salary,
+               LEAD(salary) OVER (ORDER BY salary) as next_salary
+        FROM adv_employees
+        ORDER BY salary
+      `);
+
+      expect(result.rows[0].prev_salary).toBeNull();
+      expect(result.rows[4].next_salary).toBeNull();
+    });
+
+    it('should support SUM() OVER partition total', async () => {
+      const result = await knex.raw(`
+        SELECT name, department_id, salary,
+               SUM(salary) OVER (PARTITION BY department_id) as dept_total
+        FROM adv_employees
+        ORDER BY department_id, name
+      `);
+
+      const engEmployees = result.rows.filter((r: { department_id: number }) => r.department_id === 1);
+      expect(Number(engEmployees[0].dept_total)).toBe(150000);
+    });
+
+    it('should support running SUM() OVER', async () => {
+      const result = await knex.raw(`
+        SELECT name, salary,
+               SUM(salary) OVER (ORDER BY salary) as running_total
+        FROM adv_employees
+        ORDER BY salary
+      `);
+
+      expect(Number(result.rows[0].running_total)).toBe(Number(result.rows[0].salary));
+    });
+
+    it('should support AVG() OVER', async () => {
+      const result = await knex.raw(`
+        SELECT name, department_id, salary,
+               AVG(salary) OVER (PARTITION BY department_id) as dept_avg
+        FROM adv_employees
+        WHERE department_id = 1
+      `);
+
+      expect(Number(result.rows[0].dept_avg)).toBe(75000);
+    });
+  });
+
+  describe('CTE (WITH clause)', () => {
+    it('should support simple CTE', async () => {
+      const result = await knex.raw(`
+        WITH high_earners AS (
+          SELECT * FROM adv_employees WHERE salary > 65000
+        )
+        SELECT name, salary FROM high_earners ORDER BY salary DESC
+      `);
+
+      expect(result.rows).toHaveLength(3);
+      expect(result.rows[0].name).toBe('Alice');
+    });
+
+    it('should support multiple CTEs', async () => {
+      const result = await knex.raw(`
+        WITH dept_totals AS (
+          SELECT department_id, SUM(salary) as total
+          FROM adv_employees
+          GROUP BY department_id
+        ),
+        high_budget_depts AS (
+          SELECT d.name, dt.total
+          FROM adv_departments d
+          JOIN dept_totals dt ON d.id = dt.department_id
+          WHERE dt.total > 100000
+        )
+        SELECT * FROM high_budget_depts ORDER BY total DESC
+      `);
+
+      expect(result.rows).toHaveLength(2);
+    });
+
+    it('should support recursive CTE via raw SQL', async () => {
+      const result = await knex.raw(`
+        WITH RECURSIVE numbers AS (
+          SELECT 1 as n
+          UNION ALL
+          SELECT n + 1 FROM numbers WHERE n < 5
+        )
+        SELECT * FROM numbers
+      `);
+
+      expect(result.rows).toHaveLength(5);
+    });
+  });
+
+  describe('recursive CTE', () => {
+    it('should support recursive CTE for hierarchy', async () => {
+      const result = await knex.raw(`
+        WITH RECURSIVE emp_hierarchy AS (
+          SELECT id, name, manager_id, 1 as level
+          FROM adv_employees
+          WHERE manager_id IS NULL
+          UNION ALL
+          SELECT e.id, e.name, e.manager_id, eh.level + 1
+          FROM adv_employees e
+          JOIN emp_hierarchy eh ON e.manager_id = eh.id
+        )
+        SELECT * FROM emp_hierarchy ORDER BY level, name
+      `);
+
+      expect(result.rows.length).toBeGreaterThanOrEqual(5);
+    });
+  });
+
+  describe('subqueries', () => {
+    it('should support subquery in WHERE', async () => {
+      const result = await knex('adv_employees')
+        .whereIn(
+          'department_id',
+          knex('adv_departments').select('id').where('budget', '>', 250000)
+        )
+        .orderBy('salary', 'desc');
+
+      expect(result).toHaveLength(4);
+    });
+
+    it('should support EXISTS', async () => {
+      const result = await knex.raw(`
+        SELECT name
+        FROM adv_employees e
+        WHERE EXISTS (
+          SELECT 1 FROM adv_sales s WHERE s.employee_id = e.id
+        )
+        ORDER BY name
+      `);
+
+      expect(result.rows).toHaveLength(2);
+    });
+
+    it('should support scalar subquery', async () => {
+      const result = await knex.raw(`
+        SELECT name,
+               (SELECT COUNT(*) FROM adv_sales WHERE employee_id = e.id) as sale_count
+        FROM adv_employees e
+        ORDER BY sale_count DESC, name
+      `);
+
+      expect(Number(result.rows[0].sale_count)).toBe(3);
+    });
+
+    it('should support derived table', async () => {
+      const result = await knex.raw(`
+        SELECT dept_name, employee_count
+        FROM (
+          SELECT d.name as dept_name, COUNT(e.id) as employee_count
+          FROM adv_departments d
+          LEFT JOIN adv_employees e ON d.id = e.department_id
+          GROUP BY d.name
+        ) as dept_stats
+        ORDER BY employee_count DESC
+      `);
+
+      expect(result.rows).toHaveLength(3);
+    });
+  });
+
+  describe('views', () => {
+    it('should create and query a view', async () => {
+      await knex.raw(`DROP VIEW IF EXISTS adv_dept_summary`);
+      await knex.raw(`
+        CREATE VIEW adv_dept_summary AS
+        SELECT d.name as dept_name,
+               COUNT(e.id) as employee_count,
+               COALESCE(SUM(e.salary), 0) as total_salary
+        FROM adv_departments d
+        LEFT JOIN adv_employees e ON d.id = e.department_id
+        GROUP BY d.name
+      `);
+
+      const result = await knex('adv_dept_summary').orderBy('total_salary', 'desc');
+
+      expect(result).toHaveLength(3);
+      expect(result[0].dept_name).toBe('Engineering');
+    });
+  });
+
+  describe('JSONB operations', () => {
+    it('should extract JSONB field with ->', async () => {
+      const result = await knex.raw(`
+        SELECT name, metadata->'level' as level
+        FROM adv_employees
+        WHERE metadata IS NOT NULL
+        ORDER BY name
+      `);
+
+      expect(result.rows).toHaveLength(5);
+      expect(result.rows[0].level).toBe('senior');
+    });
+
+    it('should extract text with ->>', async () => {
+      const result = await knex.raw(`
+        SELECT name, metadata->>'level' as level
+        FROM adv_employees
+        WHERE metadata->>'level' = 'senior'
+        ORDER BY name
+      `);
+
+      expect(result.rows).toHaveLength(2);
+    });
+
+    it('should use JSONB containment @>', async () => {
+      const result = await knex.raw(`
+        SELECT name
+        FROM adv_employees
+        WHERE metadata @> '{"level": "senior"}'
+        ORDER BY name
+      `);
+
+      expect(result.rows).toHaveLength(2);
+    });
+  });
+
+  describe('string functions', () => {
+    it('should support UPPER and LOWER', async () => {
+      const result = await knex.raw(`
+        SELECT UPPER(name) as upper_name, LOWER(email) as lower_email
+        FROM adv_employees
+        WHERE name = 'Alice'
+      `);
+
+      expect(result.rows[0].upper_name).toBe('ALICE');
+      expect(result.rows[0].lower_email).toBe('alice@test.com');
+    });
+
+    it('should support CONCAT', async () => {
+      const result = await knex.raw(`
+        SELECT CONCAT(name, ' - ', email) as full_info
+        FROM adv_employees
+        WHERE name = 'Alice'
+      `);
+
+      expect(result.rows[0].full_info).toBe('Alice - alice@test.com');
+    });
+
+    it('should support SUBSTRING', async () => {
+      const result = await knex.raw(`
+        SELECT SUBSTRING(email FROM 1 FOR 5) as prefix
+        FROM adv_employees
+        WHERE name = 'Alice'
+      `);
+
+      expect(result.rows[0].prefix).toBe('alice');
+    });
+
+    it('should support SPLIT_PART', async () => {
+      const result = await knex.raw(`
+        SELECT SPLIT_PART(email, '@', 1) as username
+        FROM adv_employees
+        WHERE name = 'Alice'
+      `);
+
+      expect(result.rows[0].username).toBe('alice');
+    });
+
+    it('should support REPLACE', async () => {
+      const result = await knex.raw(`
+        SELECT REPLACE(email, '@test.com', '@company.com') as new_email
+        FROM adv_employees
+        WHERE name = 'Alice'
+      `);
+
+      expect(result.rows[0].new_email).toBe('alice@company.com');
+    });
+  });
+
+  describe('date/time functions', () => {
+    it('should support DATE_TRUNC', async () => {
+      const result = await knex.raw(`
+        SELECT DATE_TRUNC('month', sale_date) as month, SUM(amount) as total
+        FROM adv_sales
+        GROUP BY DATE_TRUNC('month', sale_date)
+        ORDER BY month
+      `);
+
+      expect(result.rows).toHaveLength(2);
+    });
+
+    it('should support EXTRACT', async () => {
+      const result = await knex.raw(`
+        SELECT EXTRACT(MONTH FROM sale_date) as month, COUNT(*) as count
+        FROM adv_sales
+        GROUP BY EXTRACT(MONTH FROM sale_date)
+        ORDER BY month
+      `);
+
+      expect(result.rows).toHaveLength(2);
+    });
+
+    it('should support interval arithmetic', async () => {
+      const result = await knex.raw(`
+        SELECT NOW() - INTERVAL '1 day' as yesterday
+      `);
+
+      expect(result.rows[0].yesterday).toBeInstanceOf(Date);
+    });
+  });
+
+  describe('aggregate with HAVING', () => {
+    it('should filter groups with HAVING', async () => {
+      const result = await knex('adv_employees')
+        .select('department_id')
+        .count('* as emp_count')
+        .avg('salary as avg_salary')
+        .groupBy('department_id')
+        .having(knex.raw('COUNT(*) > 1'))
+        .orderBy('avg_salary', 'desc');
+
+      expect(result).toHaveLength(2);
+    });
+
+    it('should use SUM in HAVING', async () => {
+      const result = await knex.raw(`
+        SELECT employee_id, SUM(amount) as total
+        FROM adv_sales
+        GROUP BY employee_id
+        HAVING SUM(amount) > 3000
+      `);
+
+      expect(result.rows).toHaveLength(1);
+    });
+  });
+
+  describe('DISTINCT ON', () => {
+    it('should support DISTINCT ON', async () => {
+      const result = await knex.raw(`
+        SELECT DISTINCT ON (department_id) department_id, name, salary
+        FROM adv_employees
+        ORDER BY department_id, salary DESC
+      `);
+
+      expect(result.rows).toHaveLength(3);
+      const eng = result.rows.find((r: { department_id: number }) => r.department_id === 1);
+      expect(eng.name).toBe('Alice');
+    });
+  });
+
+  describe('CASE expressions', () => {
+    it('should support simple CASE', async () => {
+      const result = await knex.raw(`
+        SELECT name,
+               CASE
+                 WHEN salary > 70000 THEN 'high'
+                 WHEN salary > 55000 THEN 'medium'
+                 ELSE 'low'
+               END as salary_level
+        FROM adv_employees
+        ORDER BY salary DESC
+      `);
+
+      expect(result.rows[0].salary_level).toBe('high');
+    });
+  });
+
+  describe('COALESCE and NULLIF', () => {
+    it('should support COALESCE', async () => {
+      await knex.raw(`UPDATE adv_employees SET email = NULL WHERE name = 'Alice'`);
+
+      const result = await knex.raw(`
+        SELECT name, COALESCE(email, 'no-email@default.com') as email
+        FROM adv_employees
+        WHERE name = 'Alice'
+      `);
+
+      expect(result.rows[0].email).toBe('no-email@default.com');
+    });
+
+    it('should support NULLIF', async () => {
+      const result = await knex.raw(`
+        SELECT NULLIF(10, 10) as null_result, NULLIF(10, 5) as not_null_result
+      `);
+
+      expect(result.rows[0].null_result).toBeNull();
+      expect(Number(result.rows[0].not_null_result)).toBe(10);
+    });
+  });
+
+  describe('math functions', () => {
+    it('should support ABS, CEIL, FLOOR, ROUND', async () => {
+      const result = await knex.raw(`
+        SELECT ABS(-5) as abs_val,
+               CEIL(4.2) as ceil_val,
+               FLOOR(4.8) as floor_val,
+               ROUND(4.567, 2) as round_val
+      `);
+
+      expect(Number(result.rows[0].abs_val)).toBe(5);
+      expect(Number(result.rows[0].ceil_val)).toBe(5);
+      expect(Number(result.rows[0].floor_val)).toBe(4);
+    });
+
+    it('should support SQRT, POWER, MOD', async () => {
+      const result = await knex.raw(`
+        SELECT SQRT(16) as sqrt_val, POWER(2, 10) as power_val, MOD(17, 5) as mod_val
+      `);
+
+      expect(Number(result.rows[0].sqrt_val)).toBe(4);
+      expect(Number(result.rows[0].power_val)).toBe(1024);
+      expect(Number(result.rows[0].mod_val)).toBe(2);
+    });
+  });
+
+  describe('foreign key constraints', () => {
+    it('should enforce foreign key on INSERT', async () => {
+      await expect(
+        knex.raw(`
+          INSERT INTO adv_employees (name, email, department_id, salary)
+          VALUES ('Test', 'test@test.com', 999, 50000)
+        `)
+      ).rejects.toThrow();
+    });
+  });
+});
