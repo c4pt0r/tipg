@@ -4,6 +4,9 @@ A PostgreSQL-compatible distributed SQL database built on TiKV.
 
 A DATABASE FOR AI BY AI
 
+<img width="147" height="165" alt="image" src="https://github.com/user-attachments/assets/d61d0eef-6ec4-4c83-8f37-0c198d86e54e" />
+
+
 ## Architecture
 
 ```
