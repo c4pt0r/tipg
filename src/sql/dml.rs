@@ -10,7 +10,45 @@ use tikv_client::Transaction;
 use super::expr::eval_expr;
 use super::helpers::{coerce_value_for_column, eval_default_expr};
 use crate::storage::TikvStore;
-use crate::types::{ColumnDef, Row, TableSchema, Value};
+use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
+
+fn eval_upsert_expr(
+    expr: &Expr,
+    existing_row: &Row,
+    excluded_row: &Row,
+    schema: &TableSchema,
+) -> Result<Value> {
+    match expr {
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            let prefix = parts[0].value.to_uppercase();
+            let col_name = &parts[1].value;
+            if prefix == "EXCLUDED" {
+                let idx = schema
+                    .column_index(col_name)
+                    .ok_or_else(|| anyhow!("Column '{}' not found", col_name))?;
+                Ok(excluded_row.values[idx].clone())
+            } else {
+                let idx = schema
+                    .column_index(col_name)
+                    .ok_or_else(|| anyhow!("Column '{}' not found", col_name))?;
+                Ok(existing_row.values[idx].clone())
+            }
+        }
+        Expr::Identifier(ident) => {
+            let idx = schema
+                .column_index(&ident.value)
+                .ok_or_else(|| anyhow!("Column '{}' not found", ident.value))?;
+            Ok(existing_row.values[idx].clone())
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let left_val = eval_upsert_expr(left, existing_row, excluded_row, schema)?;
+            let right_val = eval_upsert_expr(right, existing_row, excluded_row, schema)?;
+            super::expr::eval_binary_op_public(left_val, op, right_val)
+        }
+        Expr::Nested(inner) => eval_upsert_expr(inner, existing_row, excluded_row, schema),
+        _ => eval_expr(expr, Some(existing_row), Some(schema)),
+    }
+}
 
 pub fn build_returning_columns(
     returning: &Option<Vec<SelectItem>>,
@@ -120,7 +158,7 @@ pub async fn execute_insert_row(
                             .column_index(&col_name)
                             .ok_or_else(|| anyhow!("Unknown column in DO UPDATE: {}", col_name))?;
                         updated_vals[col_idx] =
-                            eval_expr(&assignment.value, Some(existing_row), Some(schema))?;
+                            eval_upsert_expr(&assignment.value, existing_row, &row, schema)?;
                     }
                     let updated_row = Row::new(updated_vals);
                     update_row_indexes(store, txn, schema, existing_row, &updated_row).await?;
@@ -143,7 +181,7 @@ pub async fn execute_insert_row(
                         .column_index(&col_name)
                         .ok_or_else(|| anyhow!("Unknown column: {}", col_name))?;
                     updated_vals[col_idx] =
-                        eval_expr(&assignment.value, Some(existing_row), Some(schema))?;
+                        eval_upsert_expr(&assignment.value, existing_row, &row, schema)?;
                 }
                 let updated_row = Row::new(updated_vals);
                 update_row_indexes(store, txn, schema, existing_row, &updated_row).await?;
@@ -586,7 +624,11 @@ pub async fn fill_missing_columns(
     for (i, c) in schema.columns.iter().enumerate() {
         if !indices.contains(&i) {
             if c.is_serial {
-                row_vals[i] = Value::Int32(store.next_sequence_value(txn, schema.table_id).await?);
+                let seq_val = store.next_sequence_value(txn, schema.table_id).await?;
+                row_vals[i] = match c.data_type {
+                    DataType::Int64 => Value::Int64(seq_val as i64),
+                    _ => Value::Int32(seq_val),
+                };
             } else if let Some(def) = &c.default_expr {
                 row_vals[i] = eval_default_expr(def)?;
             } else if !c.nullable {

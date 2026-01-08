@@ -5,7 +5,16 @@
 -- PART 1: Schema Creation (TPC-C simplified tables)
 -- ============================================================
 
--- Warehouse table
+DROP TABLE IF EXISTS order_line CASCADE;
+DROP TABLE IF EXISTS orders CASCADE;
+DROP TABLE IF EXISTS new_orders CASCADE;
+DROP TABLE IF EXISTS history CASCADE;
+DROP TABLE IF EXISTS customer CASCADE;
+DROP TABLE IF EXISTS stock CASCADE;
+DROP TABLE IF EXISTS item CASCADE;
+DROP TABLE IF EXISTS district CASCADE;
+DROP TABLE IF EXISTS warehouse CASCADE;
+
 CREATE TABLE warehouse (
     w_id INT PRIMARY KEY,
     w_name TEXT,

@@ -1,0 +1,2 @@
+#!/bin/sh
+exec uv run "$(dirname "$0")/scripts/pg_tikv_admin.py" "$@"

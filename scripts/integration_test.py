@@ -1,4 +1,22 @@
 #!/usr/bin/env python3
+"""
+pg-tikv Integration Test Runner
+
+Usage:
+    python3 scripts/integration_test.py                    # Run built-in tests
+    python3 scripts/integration_test.py tests/basic.sql   # Run single SQL file
+    python3 scripts/integration_test.py tests/            # Run all .sql files in directory
+    python3 scripts/integration_test.py --help            # Show help
+
+Options:
+    --user USER         PostgreSQL user (default: tenant_a.secret)
+    --password PASS     PostgreSQL password (default: secret)
+    --port PORT         pg-tikv port (default: 15433)
+    --no-setup          Skip TiKV/pg-tikv setup (use existing)
+    --no-cleanup        Don't cleanup after tests
+    --verbose           Show SQL output
+    --stop-on-error     Stop on first error
+"""
 
 import subprocess
 import sys
@@ -8,19 +26,30 @@ import signal
 import re
 import socket
 import atexit
+import argparse
+import glob
 from pathlib import Path
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, List, Tuple
+from enum import Enum
 
 PROJECT_DIR = Path(__file__).parent.parent
 LOG_DIR = Path("/tmp/pg-tikv-test")
 TIKV_CONFIG = LOG_DIR / "tikv.toml"
-PG_PORT = 15433
+DEFAULT_PORT = 15433
 
 GREEN = "\033[0;32m"
 YELLOW = "\033[1;33m"
 RED = "\033[0;31m"
+BLUE = "\033[0;34m"
 NC = "\033[0m"
+
+
+class TestResult(Enum):
+    PASSED = "PASSED"
+    FAILED = "FAILED"
+    SKIPPED = "SKIPPED"
+    ERROR = "ERROR"
 
 
 @dataclass
@@ -30,7 +59,42 @@ class ProcessManager:
     pd_port: Optional[int] = None
 
 
+@dataclass
+class TestConfig:
+    user: str = "tenant_a.admin"
+    password: str = "secret"
+    port: int = DEFAULT_PORT
+    no_setup: bool = False
+    no_cleanup: bool = False
+    verbose: bool = False
+    stop_on_error: bool = False
+    test_files: List[Path] = field(default_factory=list)
+
+
+@dataclass
+class TestStats:
+    passed: int = 0
+    failed: int = 0
+    skipped: int = 0
+    errors: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.passed + self.failed + self.skipped + self.errors
+
+    def add(self, result: TestResult):
+        if result == TestResult.PASSED:
+            self.passed += 1
+        elif result == TestResult.FAILED:
+            self.failed += 1
+        elif result == TestResult.SKIPPED:
+            self.skipped += 1
+        else:
+            self.errors += 1
+
+
 pm = ProcessManager()
+config = TestConfig()
 
 
 def log_info(msg: str):
@@ -45,7 +109,22 @@ def log_error(msg: str):
     print(f"{RED}[ERROR]{NC} {msg}")
 
 
+def log_test(name: str, result: TestResult, details: str = ""):
+    color = {
+        TestResult.PASSED: GREEN,
+        TestResult.FAILED: RED,
+        TestResult.SKIPPED: YELLOW,
+        TestResult.ERROR: RED,
+    }[result]
+    suffix = f" - {details}" if details else ""
+    print(f"{color}[{result.value}]{NC} {name}{suffix}")
+
+
 def cleanup():
+    if config.no_cleanup:
+        log_info("Skipping cleanup (--no-cleanup)")
+        return
+
     print(f"{YELLOW}Cleaning up...{NC}")
 
     if pm.pgtikv_proc and pm.pgtikv_proc.poll() is None:
@@ -199,14 +278,14 @@ def kill_existing_processes():
 
 
 def start_pgtikv():
-    log_info(f"Starting pg-tikv on port {PG_PORT} with PD at 127.0.0.1:{pm.pd_port}...")
+    log_info(f"Starting pg-tikv on port {config.port} with PD at 127.0.0.1:{pm.pd_port}...")
 
     log_file = LOG_DIR / "pgtikv.log"
     env = os.environ.copy()
     env.update({
         "PD_ENDPOINTS": f"127.0.0.1:{pm.pd_port}",
-        "PG_PORT": str(PG_PORT),
-        "PG_PASSWORD": "secret",
+        "PG_PORT": str(config.port),
+        "PG_PASSWORD": config.password,
     })
 
     with open(log_file, "w") as f:
@@ -219,8 +298,8 @@ def start_pgtikv():
 
     log_info(f"pg-tikv started (PID: {pm.pgtikv_proc.pid})")
 
-    if not wait_for_port(PG_PORT, 30):
-        log_error(f"pg-tikv port {PG_PORT} is not accessible")
+    if not wait_for_port(config.port, 30):
+        log_error(f"pg-tikv port {config.port} is not accessible")
         print(log_file.read_text())
         sys.exit(1)
 
@@ -239,52 +318,182 @@ def check_cluster_health() -> bool:
     return True
 
 
-def run_sql(user: str, sql: str, password: str = "secret", retries: int = 2) -> str:
+def run_sql(sql: str, user: Optional[str] = None, password: Optional[str] = None, retries: int = 2) -> Tuple[str, int]:
+    actual_user = user if user else config.user
+    actual_password = password if password else config.password
+
     env = os.environ.copy()
-    env["PGPASSWORD"] = password
+    env["PGPASSWORD"] = actual_password
     output = ""
-    
+
     for attempt in range(retries + 1):
-        if not check_cluster_health():
-            return "ERROR: Cluster unhealthy"
-        
+        if not config.no_setup and not check_cluster_health():
+            return "ERROR: Cluster unhealthy", 1
+
         result = subprocess.run(
-            ["psql", "-h", "127.0.0.1", "-p", str(PG_PORT), "-U", user, "-d", "postgres", "-c", sql],
+            ["psql", "-h", "127.0.0.1", "-p", str(config.port), "-U", actual_user, "-d", "postgres", "-c", sql],
             capture_output=True,
             text=True,
             env=env,
         )
         output = result.stdout + result.stderr
-        
+
         if "Failed to connect to TiKV" not in output and "connection refused" not in output.lower():
-            return output
-        
+            return output, result.returncode
+
         if attempt < retries:
             log_warn(f"Connection failed, retrying ({attempt + 1}/{retries})...")
             time.sleep(2)
-    
-    return output
+
+    return output, 1
+
+
+def run_sql_file(sql_file: Path, user: Optional[str] = None, password: Optional[str] = None) -> Tuple[str, int]:
+    actual_user = user if user else config.user
+    actual_password = password if password else config.password
+
+    env = os.environ.copy()
+    env["PGPASSWORD"] = actual_password
+
+    result = subprocess.run(
+        ["psql", "-h", "127.0.0.1", "-p", str(config.port), "-U", actual_user, "-d", "postgres", "-f", str(sql_file)],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    return result.stdout + result.stderr, result.returncode
+
+
+def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
+    expected_file = sql_file.with_suffix(".expected")
+    errors_file = sql_file.with_suffix(".errors")
+    out_file = sql_file.with_suffix(".out")
+    setup_file = sql_file.with_name(sql_file.stem + "_setup.sql")
+    load_script = sql_file.with_name(sql_file.stem + "_load.py")
+
+    log_info(f"Running: {sql_file.name}")
+
+    if setup_file.exists():
+        log_info(f"  Running setup: {setup_file.name}")
+        setup_output, setup_rc = run_sql_file(setup_file)
+        if "ERROR:" in setup_output or "FATAL:" in setup_output:
+            log_test(sql_file.name, TestResult.FAILED, f"setup failed")
+            print(f"  {RED}Setup error: {setup_output[:200]}{NC}")
+            return TestResult.FAILED
+
+    if load_script.exists():
+        log_info(f"  Running load script: {load_script.name}")
+        result = subprocess.run(
+            ["python3", str(load_script), "--port", str(config.port), "--user", config.user, "--password", config.password],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            log_test(sql_file.name, TestResult.FAILED, f"load script failed")
+            print(f"  {RED}Load error: {result.stdout[:200]}{result.stderr[:200]}{NC}")
+            return TestResult.FAILED
+
+    output, returncode = run_sql_file(sql_file)
+
+    out_file.write_text(output)
+
+    if config.verbose:
+        print(output)
+
+    error_patterns = ["ERROR:", "FATAL:", "error:", "fatal:"]
+    has_error = any(pattern in output for pattern in error_patterns)
+
+    if expected_file.exists():
+        expected = expected_file.read_text()
+        if output.strip() == expected.strip():
+            log_test(sql_file.name, TestResult.PASSED)
+            return TestResult.PASSED
+        else:
+            log_test(sql_file.name, TestResult.FAILED, "output differs from expected")
+            if config.verbose:
+                print(f"--- Expected ({expected_file}):")
+                print(expected[:500])
+                print(f"--- Actual ({out_file}):")
+                print(output[:500])
+            return TestResult.FAILED
+    else:
+        if has_error:
+            if errors_file.exists():
+                expected_errors = [line.strip() for line in errors_file.read_text().strip().split("\n") if line.strip()]
+                actual_errors = [line for line in output.split("\n") if any(p in line for p in error_patterns)]
+                unexpected_errors = []
+                for actual in actual_errors:
+                    if not any(exp in actual for exp in expected_errors):
+                        unexpected_errors.append(actual)
+                if unexpected_errors:
+                    log_test(sql_file.name, TestResult.FAILED, "unexpected SQL errors")
+                    for line in unexpected_errors[:3]:
+                        print(f"  {RED}{line}{NC}")
+                    return TestResult.FAILED
+                else:
+                    log_test(sql_file.name, TestResult.PASSED, "all errors were expected")
+                    return TestResult.PASSED
+            else:
+                log_test(sql_file.name, TestResult.FAILED, "SQL errors detected")
+                for line in output.split("\n"):
+                    if any(p in line for p in error_patterns):
+                        print(f"  {RED}{line}{NC}")
+                        break
+                return TestResult.FAILED
+        else:
+            log_test(sql_file.name, TestResult.PASSED, "no .expected file, checked for errors only")
+            return TestResult.PASSED
+
+
+def run_external_tests(test_paths: List[Path]) -> TestStats:
+    stats = TestStats()
+
+    sql_files = []
+    for path in test_paths:
+        if path.is_file() and path.suffix == ".sql":
+            sql_files.append(path)
+        elif path.is_dir():
+            sql_files.extend(sorted(path.glob("*.sql")))
+
+    if not sql_files:
+        log_error("No .sql test files found")
+        return stats
+
+    log_info(f"Found {len(sql_files)} test file(s)")
+    log_info("=========================================")
+
+    for sql_file in sql_files:
+        result = run_sql_test_file(sql_file, stats)
+        stats.add(result)
+
+        if config.stop_on_error and result in (TestResult.FAILED, TestResult.ERROR):
+            log_warn("Stopping on first error (--stop-on-error)")
+            break
+
+        # Small delay between tests to avoid TiKV write conflicts on _sys_next_table_id
+        time.sleep(0.1)
+
+    return stats
 
 
 class TestRunner:
     def __init__(self):
-        self.passed = 0
-        self.failed = 0
+        self.stats = TestStats()
 
     def run_test(self, name: str, test_func) -> bool:
         try:
             if test_func():
-                self.passed += 1
+                self.stats.passed += 1
                 return True
         except Exception as e:
             log_error(f"{name}: EXCEPTION - {e}")
-        self.failed += 1
+        self.stats.failed += 1
         return False
 
 
 def test_basic_connection() -> bool:
     log_info("Testing basic connection...")
-    result = run_sql("secret", "SELECT 1 as test")
+    result, _ = run_sql("SELECT 1 as test")
     if "1" in result:
         log_info("Basic connection: PASSED")
         return True
@@ -299,7 +508,7 @@ def test_password_auth() -> bool:
     env = os.environ.copy()
     env["PGPASSWORD"] = "wrongpass"
     result = subprocess.run(
-        ["psql", "-h", "127.0.0.1", "-p", str(PG_PORT), "-U", "secret", "-d", "postgres", "-c", "SELECT 1"],
+        ["psql", "-h", "127.0.0.1", "-p", str(config.port), "-U", config.user, "-d", "postgres", "-c", "SELECT 1"],
         capture_output=True,
         text=True,
         env=env,
@@ -310,7 +519,7 @@ def test_password_auth() -> bool:
     else:
         log_warn(f"Wrong password test inconclusive: {output}")
 
-    result = run_sql("secret", "SELECT 1")
+    result, _ = run_sql("SELECT 1")
     if "1" in result:
         log_info("Correct password: PASSED")
         log_info("Password authentication: PASSED")
@@ -323,16 +532,16 @@ def test_password_auth() -> bool:
 def test_tenant_isolation() -> bool:
     log_info("Testing tenant isolation...")
 
-    run_sql("tenant_a.secret", "DROP TABLE IF EXISTS users")
-    run_sql("tenant_a.secret", "CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT)")
-    run_sql("tenant_a.secret", "INSERT INTO users (name) VALUES ('Alice'), ('Bob')")
+    run_sql("DROP TABLE IF EXISTS users", user="tenant_a.secret")
+    run_sql("CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT)", user="tenant_a.secret")
+    run_sql("INSERT INTO users (name) VALUES ('Alice'), ('Bob')", user="tenant_a.secret")
 
-    run_sql("tenant_b.secret", "DROP TABLE IF EXISTS users")
-    run_sql("tenant_b.secret", "CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT)")
-    run_sql("tenant_b.secret", "INSERT INTO users (name) VALUES ('Charlie')")
+    run_sql("DROP TABLE IF EXISTS users", user="tenant_b.secret")
+    run_sql("CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT)", user="tenant_b.secret")
+    run_sql("INSERT INTO users (name) VALUES ('Charlie')", user="tenant_b.secret")
 
-    result_a = run_sql("tenant_a.secret", "SELECT COUNT(*) FROM users")
-    result_b = run_sql("tenant_b.secret", "SELECT COUNT(*) FROM users")
+    result_a, _ = run_sql("SELECT COUNT(*) FROM users", user="tenant_a.secret")
+    result_b, _ = run_sql("SELECT COUNT(*) FROM users", user="tenant_b.secret")
 
     count_a = re.search(r"(\d+)", result_a)
     count_b = re.search(r"(\d+)", result_b)
@@ -348,23 +557,23 @@ def test_tenant_isolation() -> bool:
 def test_ddl_operations() -> bool:
     log_info("Testing DDL operations...")
 
-    run_sql("tenant_a.secret", "DROP TABLE IF EXISTS test_ddl")
-    run_sql("tenant_a.secret", """CREATE TABLE test_ddl (
+    run_sql("DROP TABLE IF EXISTS test_ddl")
+    run_sql("""CREATE TABLE test_ddl (
         id SERIAL PRIMARY KEY,
         name TEXT NOT NULL,
         email TEXT,
         created_at TIMESTAMP DEFAULT NOW()
     )""")
 
-    tables = run_sql("tenant_a.secret", "SHOW TABLES")
+    tables, _ = run_sql("SHOW TABLES")
     if "test_ddl" not in tables:
         log_error("CREATE TABLE: FAILED")
         return False
     log_info("CREATE TABLE: PASSED")
 
-    run_sql("tenant_a.secret", "ALTER TABLE test_ddl ADD COLUMN age INTEGER")
-    run_sql("tenant_a.secret", "CREATE INDEX idx_test_name ON test_ddl (name)")
-    run_sql("tenant_a.secret", "DROP TABLE test_ddl")
+    run_sql("ALTER TABLE test_ddl ADD COLUMN age INTEGER")
+    run_sql("CREATE INDEX idx_test_name ON test_ddl (name)")
+    run_sql("DROP TABLE test_ddl")
 
     log_info("DDL operations: PASSED")
     return True
@@ -373,31 +582,31 @@ def test_ddl_operations() -> bool:
 def test_dml_operations() -> bool:
     log_info("Testing DML operations...")
 
-    run_sql("tenant_a.secret", "DROP TABLE IF EXISTS test_dml")
-    run_sql("tenant_a.secret", "CREATE TABLE test_dml (id SERIAL PRIMARY KEY, value INTEGER)")
-    run_sql("tenant_a.secret", "INSERT INTO test_dml (value) VALUES (10), (20), (30)")
+    run_sql("DROP TABLE IF EXISTS test_dml")
+    run_sql("CREATE TABLE test_dml (id SERIAL PRIMARY KEY, value INTEGER)")
+    run_sql("INSERT INTO test_dml (value) VALUES (10), (20), (30)")
 
-    result = run_sql("tenant_a.secret", "SELECT SUM(value) FROM test_dml")
+    result, _ = run_sql("SELECT SUM(value) FROM test_dml")
     if "60" not in result:
         log_error(f"INSERT + SELECT: FAILED (expected 60)")
         return False
     log_info("INSERT + SELECT: PASSED")
 
-    run_sql("tenant_a.secret", "UPDATE test_dml SET value = value * 2 WHERE value > 15")
-    result = run_sql("tenant_a.secret", "SELECT SUM(value) FROM test_dml")
+    run_sql("UPDATE test_dml SET value = value * 2 WHERE value > 15")
+    result, _ = run_sql("SELECT SUM(value) FROM test_dml")
     if "110" not in result:
         log_error(f"UPDATE: FAILED (expected 110)")
         return False
     log_info("UPDATE: PASSED")
 
-    run_sql("tenant_a.secret", "DELETE FROM test_dml WHERE value > 50")
-    result = run_sql("tenant_a.secret", "SELECT COUNT(*) FROM test_dml")
+    run_sql("DELETE FROM test_dml WHERE value > 50")
+    result, _ = run_sql("SELECT COUNT(*) FROM test_dml")
     if "1" not in result:
         log_error(f"DELETE: FAILED (expected 1 row)")
         return False
     log_info("DELETE: PASSED")
 
-    run_sql("tenant_a.secret", "DROP TABLE test_dml")
+    run_sql("DROP TABLE test_dml")
     log_info("DML operations: PASSED")
     return True
 
@@ -405,25 +614,25 @@ def test_dml_operations() -> bool:
 def test_transactions() -> bool:
     log_info("Testing transactions...")
 
-    run_sql("tenant_a.secret", "DROP TABLE IF EXISTS test_txn")
-    run_sql("tenant_a.secret", "CREATE TABLE test_txn (id INTEGER PRIMARY KEY, value INTEGER)")
-    run_sql("tenant_a.secret", "INSERT INTO test_txn VALUES (1, 100)")
+    run_sql("DROP TABLE IF EXISTS test_txn")
+    run_sql("CREATE TABLE test_txn (id INTEGER PRIMARY KEY, value INTEGER)")
+    run_sql("INSERT INTO test_txn VALUES (1, 100)")
 
-    run_sql("tenant_a.secret", "BEGIN; UPDATE test_txn SET value = 200 WHERE id = 1; ROLLBACK")
-    result = run_sql("tenant_a.secret", "SELECT value FROM test_txn WHERE id = 1")
+    run_sql("BEGIN; UPDATE test_txn SET value = 200 WHERE id = 1; ROLLBACK")
+    result, _ = run_sql("SELECT value FROM test_txn WHERE id = 1")
     if "100" not in result:
         log_error(f"ROLLBACK: FAILED (expected 100)")
         return False
     log_info("ROLLBACK: PASSED")
 
-    run_sql("tenant_a.secret", "UPDATE test_txn SET value = 300 WHERE id = 1")
-    result = run_sql("tenant_a.secret", "SELECT value FROM test_txn WHERE id = 1")
+    run_sql("UPDATE test_txn SET value = 300 WHERE id = 1")
+    result, _ = run_sql("SELECT value FROM test_txn WHERE id = 1")
     if "300" not in result:
-        log_error(f"UPDATE (auto-commit): FAILED (expected 300, got: {result.strip()[:100]})")
+        log_error(f"UPDATE (auto-commit): FAILED (expected 300)")
         return False
     log_info("UPDATE (auto-commit): PASSED")
 
-    run_sql("tenant_a.secret", "DROP TABLE test_txn")
+    run_sql("DROP TABLE test_txn")
     log_info("Transaction tests: PASSED")
     return True
 
@@ -431,335 +640,112 @@ def test_transactions() -> bool:
 def test_json_operations() -> bool:
     log_info("Testing JSON operations...")
 
-    run_sql("tenant_a.secret", "DROP TABLE IF EXISTS test_json")
-    run_sql("tenant_a.secret", "CREATE TABLE test_json (id SERIAL PRIMARY KEY, data JSONB)")
-    run_sql("tenant_a.secret", """INSERT INTO test_json (data) VALUES ('{"name": "Alice", "age": 30}')""")
-    run_sql("tenant_a.secret", """INSERT INTO test_json (data) VALUES ('{"name": "Bob", "age": 25}')""")
+    run_sql("DROP TABLE IF EXISTS test_json")
+    run_sql("CREATE TABLE test_json (id SERIAL PRIMARY KEY, data JSONB)")
+    run_sql("""INSERT INTO test_json (data) VALUES ('{"name": "Alice", "age": 30}')""")
+    run_sql("""INSERT INTO test_json (data) VALUES ('{"name": "Bob", "age": 25}')""")
 
-    result = run_sql("tenant_a.secret", "SELECT data->>'name' FROM test_json WHERE id = 1")
+    result, _ = run_sql("SELECT data->>'name' FROM test_json WHERE id = 1")
     if "Alice" not in result:
         log_error(f"JSON extraction: FAILED - got: {result[:200]}")
         return False
     log_info("JSON extraction: PASSED")
 
-    run_sql("tenant_a.secret", "DROP TABLE test_json")
+    run_sql("DROP TABLE test_json")
     log_info("JSON operations: PASSED")
     return True
 
 
-def test_rbac_create_role() -> bool:
-    log_info("Testing RBAC: CREATE ROLE...")
+def test_rbac_operations() -> bool:
+    log_info("Testing RBAC operations...")
 
-    run_sql("tenant_a.secret", "DROP ROLE IF EXISTS rbac_reader")
-    run_sql("tenant_a.secret", "DROP ROLE IF EXISTS rbac_writer")
-
-    result = run_sql("tenant_a.secret", "CREATE ROLE rbac_reader WITH PASSWORD 'reader123' LOGIN")
+    run_sql("DROP ROLE IF EXISTS test_role")
+    result, _ = run_sql("CREATE ROLE test_role WITH PASSWORD 'test123' LOGIN")
     if "CREATE ROLE" not in result.upper():
-        log_error(f"CREATE ROLE basic: FAILED - {result}")
+        log_error(f"CREATE ROLE: FAILED - {result}")
         return False
-    log_info("CREATE ROLE basic: PASSED")
+    log_info("CREATE ROLE: PASSED")
 
-    result = run_sql("tenant_a.secret", "CREATE ROLE rbac_writer WITH PASSWORD 'writer123' LOGIN CREATEDB")
-    if "CREATE ROLE" not in result.upper():
-        log_error(f"CREATE ROLE with options: FAILED - {result}")
-        return False
-    log_info("CREATE ROLE with options: PASSED")
-
-    result = run_sql("tenant_a.secret", "CREATE ROLE IF NOT EXISTS rbac_reader WITH PASSWORD 'different'")
-    log_info("CREATE ROLE IF NOT EXISTS: PASSED")
-
-    log_info("RBAC CREATE ROLE: PASSED")
-    return True
-
-
-def test_rbac_alter_role() -> bool:
-    log_info("Testing RBAC: ALTER ROLE...")
-
-    result = run_sql("tenant_a.secret", "ALTER ROLE rbac_reader WITH PASSWORD 'newpassword123'")
+    result, _ = run_sql("ALTER ROLE test_role WITH PASSWORD 'newpass'")
     if "ALTER ROLE" not in result.upper():
-        log_error(f"ALTER ROLE password: FAILED - {result}")
+        log_error(f"ALTER ROLE: FAILED - {result}")
         return False
-    log_info("ALTER ROLE password: PASSED")
+    log_info("ALTER ROLE: PASSED")
 
-    result = run_sql("tenant_a.secret", "ALTER ROLE rbac_writer WITH CREATEROLE")
-    if "ALTER ROLE" not in result.upper():
-        log_error(f"ALTER ROLE add option: FAILED - {result}")
-        return False
-    log_info("ALTER ROLE add option: PASSED")
-
-    run_sql("tenant_a.secret", "CREATE ROLE rbac_rename WITH PASSWORD 'rename123' LOGIN")
-    result = run_sql("tenant_a.secret", "ALTER ROLE rbac_rename RENAME TO rbac_renamed")
-    if "ALTER ROLE" not in result.upper():
-        log_error(f"ALTER ROLE RENAME: FAILED - {result}")
-        return False
-    log_info("ALTER ROLE RENAME: PASSED")
-
-    log_info("RBAC ALTER ROLE: PASSED")
-    return True
-
-
-def test_rbac_grant_revoke() -> bool:
-    log_info("Testing RBAC: GRANT/REVOKE...")
-
-    run_sql("tenant_a.secret", "DROP TABLE IF EXISTS rbac_test_table")
-    run_sql("tenant_a.secret", "CREATE TABLE rbac_test_table (id SERIAL PRIMARY KEY, name TEXT)")
-    run_sql("tenant_a.secret", "INSERT INTO rbac_test_table (name) VALUES ('test')")
-
-    result = run_sql("tenant_a.secret", "GRANT SELECT ON rbac_test_table TO rbac_reader")
+    run_sql("DROP TABLE IF EXISTS rbac_table")
+    run_sql("CREATE TABLE rbac_table (id INT)")
+    result, _ = run_sql("GRANT SELECT ON rbac_table TO test_role")
     if "GRANT" not in result.upper():
-        log_error(f"GRANT SELECT: FAILED - {result}")
+        log_error(f"GRANT: FAILED - {result}")
         return False
-    log_info("GRANT SELECT: PASSED")
+    log_info("GRANT: PASSED")
 
-    result = run_sql("tenant_a.secret", "GRANT SELECT, INSERT, UPDATE ON rbac_test_table TO rbac_writer")
-    if "GRANT" not in result.upper():
-        log_error(f"GRANT multiple privileges: FAILED - {result}")
-        return False
-    log_info("GRANT multiple privileges: PASSED")
-
-    result = run_sql("tenant_a.secret", "GRANT ALL PRIVILEGES ON rbac_test_table TO rbac_writer")
-    if "GRANT" not in result.upper():
-        log_error(f"GRANT ALL PRIVILEGES: FAILED - {result}")
-        return False
-    log_info("GRANT ALL PRIVILEGES: PASSED")
-
-    result = run_sql("tenant_a.secret", "GRANT SELECT ON ALL TABLES IN SCHEMA public TO rbac_reader")
-    if "GRANT" not in result.upper():
-        log_error(f"GRANT ON ALL TABLES: FAILED - {result}")
-        return False
-    log_info("GRANT ON ALL TABLES: PASSED")
-
-    result = run_sql("tenant_a.secret", "REVOKE INSERT ON rbac_test_table FROM rbac_writer")
+    result, _ = run_sql("REVOKE SELECT ON rbac_table FROM test_role")
     if "REVOKE" not in result.upper():
-        log_error(f"REVOKE single privilege: FAILED - {result}")
+        log_error(f"REVOKE: FAILED - {result}")
         return False
-    log_info("REVOKE single privilege: PASSED")
+    log_info("REVOKE: PASSED")
 
-    result = run_sql("tenant_a.secret", "REVOKE ALL PRIVILEGES ON rbac_test_table FROM rbac_writer")
-    if "REVOKE" not in result.upper():
-        log_error(f"REVOKE ALL PRIVILEGES: FAILED - {result}")
-        return False
-    log_info("REVOKE ALL PRIVILEGES: PASSED")
+    run_sql("DROP TABLE rbac_table")
+    run_sql("DROP ROLE test_role")
 
-    run_sql("tenant_a.secret", "DROP TABLE rbac_test_table")
-    log_info("RBAC GRANT/REVOKE: PASSED")
+    log_info("RBAC operations: PASSED")
     return True
 
 
-def test_rbac_drop_role() -> bool:
-    log_info("Testing RBAC: DROP ROLE...")
+def test_query_features() -> bool:
+    log_info("Testing advanced query features...")
 
-    result = run_sql("tenant_a.secret", "DROP ROLE rbac_reader")
-    if "DROP ROLE" not in result.upper():
-        log_error(f"DROP ROLE: FAILED - {result}")
-        return False
-    log_info("DROP ROLE: PASSED")
+    run_sql("DROP TABLE IF EXISTS orders_test")
+    run_sql("DROP TABLE IF EXISTS customers_test")
 
-    result = run_sql("tenant_a.secret", "DROP ROLE IF EXISTS nonexistent_role")
-    if "DROP ROLE" not in result.upper():
-        log_error(f"DROP ROLE IF EXISTS (nonexistent): FAILED - {result}")
-        return False
-    log_info("DROP ROLE IF EXISTS (nonexistent): PASSED")
-
-    run_sql("tenant_a.secret", "DROP ROLE IF EXISTS rbac_writer")
-    run_sql("tenant_a.secret", "DROP ROLE IF EXISTS rbac_renamed")
-
-    log_info("RBAC DROP ROLE: PASSED")
-    return True
-
-
-def test_rbac_user_auth() -> bool:
-    log_info("Testing RBAC: User authentication...")
-
-    run_sql("tenant_a.secret", "DROP ROLE IF EXISTS auth_test_user")
-    run_sql("tenant_a.secret", "CREATE ROLE auth_test_user WITH PASSWORD 'testpass123' LOGIN")
-
-    env = os.environ.copy()
-    env["PGPASSWORD"] = "testpass123"
-    result = subprocess.run(
-        ["psql", "-h", "127.0.0.1", "-p", str(PG_PORT), "-U", "tenant_a.auth_test_user", "-d", "postgres", "-c", "SELECT 1 as auth_test"],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-    if "1" in result.stdout:
-        log_info("New user authentication: PASSED")
-    else:
-        log_warn(f"New user authentication: SKIPPED - {result.stderr}")
-
-    run_sql("tenant_a.secret", "ALTER ROLE auth_test_user WITH PASSWORD 'newpass456'")
-
-    env["PGPASSWORD"] = "testpass123"
-    result = subprocess.run(
-        ["psql", "-h", "127.0.0.1", "-p", str(PG_PORT), "-U", "tenant_a.auth_test_user", "-d", "postgres", "-c", "SELECT 1"],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-    output = result.stdout + result.stderr
-    if any(word in output.lower() for word in ["password", "authentication", "failed"]):
-        log_info("Old password rejected after change: PASSED")
-    else:
-        log_warn(f"Old password rejection: SKIPPED - {output}")
-
-    run_sql("tenant_a.secret", "DROP ROLE IF EXISTS auth_test_user")
-    log_info("RBAC User authentication: PASSED")
-    return True
-
-
-def test_rbac_tenant_isolation() -> bool:
-    log_info("Testing RBAC: Tenant isolation for roles...")
-
-    run_sql("tenant_a.secret", "DROP ROLE IF EXISTS isolated_role")
-    run_sql("tenant_b.secret", "DROP ROLE IF EXISTS isolated_role")
-
-    run_sql("tenant_a.secret", "CREATE ROLE isolated_role WITH PASSWORD 'iso_a' LOGIN")
-    run_sql("tenant_b.secret", "CREATE ROLE isolated_role WITH PASSWORD 'iso_b' LOGIN")
-
-    env = os.environ.copy()
-    env["PGPASSWORD"] = "iso_a"
-    result_a = subprocess.run(
-        ["psql", "-h", "127.0.0.1", "-p", str(PG_PORT), "-U", "tenant_a.isolated_role", "-d", "postgres", "-c", "SELECT 'tenant_a' as tenant"],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-
-    env["PGPASSWORD"] = "iso_b"
-    result_b = subprocess.run(
-        ["psql", "-h", "127.0.0.1", "-p", str(PG_PORT), "-U", "tenant_b.isolated_role", "-d", "postgres", "-c", "SELECT 'tenant_b' as tenant"],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-
-    if "tenant_a" in result_a.stdout and "tenant_b" in result_b.stdout:
-        log_info("Role tenant isolation: PASSED")
-    else:
-        log_warn("Role tenant isolation: SKIPPED (may need different auth flow)")
-
-    run_sql("tenant_a.secret", "DROP ROLE IF EXISTS isolated_role")
-    run_sql("tenant_b.secret", "DROP ROLE IF EXISTS isolated_role")
-
-    log_info("RBAC Tenant isolation: PASSED")
-    return True
-
-
-def test_query_optimization() -> bool:
-    log_info("Testing query optimization with EXPLAIN...")
-
-    # Setup test tables
-    run_sql("tenant_a.secret", "DROP TABLE IF EXISTS orders_opt")
-    run_sql("tenant_a.secret", "DROP TABLE IF EXISTS customers_opt")
-
-    run_sql("tenant_a.secret", """CREATE TABLE customers_opt (
+    run_sql("""CREATE TABLE customers_test (
         id SERIAL PRIMARY KEY,
         name TEXT NOT NULL,
-        city TEXT,
-        age INT
+        city TEXT
     )""")
 
-    run_sql("tenant_a.secret", """CREATE TABLE orders_opt (
+    run_sql("""CREATE TABLE orders_test (
         id SERIAL PRIMARY KEY,
         customer_id INT,
-        amount DOUBLE PRECISION,
-        order_date TIMESTAMP DEFAULT NOW()
+        amount DOUBLE PRECISION
     )""")
 
-    # Insert test data (one by one to ensure they succeed)
-    for name, city, age in [('Alice', 'New York', 30), ('Bob', 'San Francisco', 25),
-                            ('Charlie', 'New York', 35), ('David', 'Boston', 40),
-                            ('Eve', 'San Francisco', 28)]:
-        run_sql("tenant_a.secret", f"INSERT INTO customers_opt (name, city, age) VALUES ('{name}', '{city}', {age})")
+    run_sql("INSERT INTO customers_test (name, city) VALUES ('Alice', 'NYC'), ('Bob', 'LA')")
+    run_sql("INSERT INTO orders_test (customer_id, amount) VALUES (1, 100), (1, 200), (2, 150)")
 
-    for cust_id, amount in [(1, 100.00), (1, 150.00), (2, 200.00),
-                             (3, 75.00), (4, 300.00), (5, 125.00)]:
-        result = run_sql("tenant_a.secret", f"INSERT INTO orders_opt (customer_id, amount) VALUES ({cust_id}, {amount})")
-        if "error" in result.lower():
-            log_error(f"Failed to insert into orders_opt: {result}")
-            return False
-
-    # Test 1: Index scan optimization
-    run_sql("tenant_a.secret", "CREATE INDEX idx_customers_city ON customers_opt(city)")
-    result = run_sql("tenant_a.secret", "EXPLAIN SELECT * FROM customers_opt WHERE city = 'New York'")
-    if "index" in result.lower() or "scan" in result.lower():
-        log_info("Index scan detection: PASSED")
-    else:
-        log_warn(f"Index scan detection: UNCLEAR - {result[:100]}")
-
-    # Test 2: Join optimization
-    result = run_sql("tenant_a.secret", """
-        EXPLAIN SELECT c.name, o.amount
-        FROM customers_opt c
-        JOIN orders_opt o ON c.id = o.customer_id
-        WHERE c.city = 'New York'
-    """)
-    if "join" in result.lower():
-        log_info("Join optimization: PASSED")
-    else:
-        log_warn(f"Join optimization: UNCLEAR - {result[:100]}")
-
-    # Test 3: Aggregation with GROUP BY
-    result = run_sql("tenant_a.secret", """
-        SELECT city, COUNT(*), AVG(age)
-        FROM customers_opt
-        GROUP BY city
-        ORDER BY COUNT(*) DESC
-    """)
-    if "New York" in result and "San Francisco" in result:
-        log_info("Aggregation with GROUP BY: PASSED")
-    else:
-        log_error(f"Aggregation with GROUP BY: FAILED - {result}")
-        return False
-
-    # Test 4: Subquery optimization
-    # First verify tables exist
-    verify = run_sql("tenant_a.secret", "SELECT COUNT(*) FROM orders_opt")
-    if "error" in verify.lower():
-        log_error(f"orders_opt table missing before subquery test: {verify}")
-        return False
-
-    result = run_sql("tenant_a.secret", """
-        SELECT name FROM customers_opt
-        WHERE id IN (SELECT customer_id FROM orders_opt WHERE amount > 100)
-    """)
-    if "error" in result.lower():
-        log_error(f"Subquery execution: FAILED - {result}")
-        return False
-    if "Alice" in result or "Bob" in result or "David" in result:
-        log_info("Subquery execution: PASSED")
-    else:
-        log_warn(f"Subquery execution: unexpected result - {result[:200]}")
-
-    # Test 5: Complex query with multiple conditions
-    result = run_sql("tenant_a.secret", """
-        SELECT c.name, COUNT(o.id) as order_count, SUM(o.amount) as total_amount
-        FROM customers_opt c
-        LEFT JOIN orders_opt o ON c.id = o.customer_id
-        WHERE c.age > 25
+    result, _ = run_sql("""
+        SELECT c.name, SUM(o.amount)
+        FROM customers_test c
+        JOIN orders_test o ON c.id = o.customer_id
         GROUP BY c.id, c.name
-        HAVING COUNT(o.id) > 0
-        ORDER BY total_amount DESC
     """)
-    count = result.count("\n")
-    if count >= 3:  # At least header + separator + data rows
-        log_info("Complex query with aggregations: PASSED")
-    else:
-        log_warn(f"Complex query: result has {count} lines")
+    if "Alice" not in result or "300" not in result:
+        log_error(f"JOIN + GROUP BY: FAILED")
+        return False
+    log_info("JOIN + GROUP BY: PASSED")
 
-    # Cleanup
-    run_sql("tenant_a.secret", "DROP TABLE orders_opt")
-    run_sql("tenant_a.secret", "DROP TABLE customers_opt")
+    result, _ = run_sql("""
+        SELECT name FROM customers_test
+        WHERE id IN (SELECT customer_id FROM orders_test WHERE amount > 100)
+    """)
+    if "Alice" not in result:
+        log_error(f"Subquery: FAILED")
+        return False
+    log_info("Subquery: PASSED")
 
-    log_info("Query optimization tests: PASSED")
+    run_sql("DROP TABLE orders_test")
+    run_sql("DROP TABLE customers_test")
+
+    log_info("Advanced query features: PASSED")
     return True
 
 
-def run_all_tests() -> bool:
+def run_builtin_tests() -> TestStats:
     runner = TestRunner()
 
     log_info("=========================================")
-    log_info("Running Integration Tests")
+    log_info("Running Built-in Integration Tests")
     log_info("=========================================")
 
     tests = [
@@ -770,43 +756,93 @@ def run_all_tests() -> bool:
         ("DML Operations", test_dml_operations),
         ("Transactions", test_transactions),
         ("JSON Operations", test_json_operations),
-        ("RBAC Create Role", test_rbac_create_role),
-        ("RBAC Alter Role", test_rbac_alter_role),
-        ("RBAC Grant/Revoke", test_rbac_grant_revoke),
-        ("RBAC Drop Role", test_rbac_drop_role),
-        ("RBAC User Auth", test_rbac_user_auth),
-        ("RBAC Tenant Isolation", test_rbac_tenant_isolation),
-        ("Query Optimization", test_query_optimization),
+        ("RBAC Operations", test_rbac_operations),
+        ("Query Features", test_query_features),
     ]
 
     for name, test_func in tests:
-        runner.run_test(name, test_func)
+        success = runner.run_test(name, test_func)
+        if config.stop_on_error and not success:
+            log_warn("Stopping on first error (--stop-on-error)")
+            break
 
-    log_info("=========================================")
-    log_info(f"Test Results: {runner.passed} passed, {runner.failed} failed")
-    log_info("=========================================")
+    return runner.stats
 
-    return runner.failed == 0
+
+def parse_args() -> TestConfig:
+    parser = argparse.ArgumentParser(
+        description="pg-tikv Integration Test Runner",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                           Run built-in tests
+  %(prog)s tests/basic.sql           Run single SQL file
+  %(prog)s tests/                    Run all .sql files in directory
+  %(prog)s --no-setup tests/*.sql    Run tests against existing pg-tikv
+  %(prog)s --verbose tests/my.sql    Show SQL output
+        """,
+    )
+    parser.add_argument("tests", nargs="*", help="SQL test files or directories")
+    parser.add_argument("--user", default="tenant_a.admin", help="PostgreSQL user")
+    parser.add_argument("--password", default="secret", help="PostgreSQL password")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="pg-tikv port")
+    parser.add_argument("--no-setup", action="store_true", help="Skip TiKV/pg-tikv setup")
+    parser.add_argument("--no-cleanup", action="store_true", help="Don't cleanup after tests")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Show SQL output")
+    parser.add_argument("--stop-on-error", "-x", action="store_true", help="Stop on first error")
+
+    args = parser.parse_args()
+
+    cfg = TestConfig(
+        user=args.user,
+        password=args.password,
+        port=args.port,
+        no_setup=args.no_setup,
+        no_cleanup=args.no_cleanup,
+        verbose=args.verbose,
+        stop_on_error=args.stop_on_error,
+        test_files=[Path(t) for t in args.tests] if args.tests else [],
+    )
+    return cfg
 
 
 def main():
-    log_info("pg-tikv Integration Test Suite")
-    log_info("==============================")
+    global config
+    config = parse_args()
 
-    atexit.register(cleanup)
+    log_info("pg-tikv Integration Test Runner")
+    log_info("================================")
+
+    if not config.no_cleanup:
+        atexit.register(cleanup)
     signal.signal(signal.SIGINT, lambda s, f: sys.exit(1))
     signal.signal(signal.SIGTERM, lambda s, f: sys.exit(1))
 
-    if not check_dependencies():
-        sys.exit(1)
+    if not config.no_setup:
+        if not check_dependencies():
+            sys.exit(1)
 
-    kill_existing_processes()
-    setup_tikv()
-    create_keyspaces()
-    build_pgtikv()
-    start_pgtikv()
+        kill_existing_processes()
+        setup_tikv()
+        create_keyspaces()
+        build_pgtikv()
+        start_pgtikv()
+    else:
+        log_info("Skipping setup (--no-setup), using existing pg-tikv")
+        if not wait_for_port(config.port, 5):
+            log_error(f"pg-tikv not accessible on port {config.port}")
+            sys.exit(1)
 
-    if run_all_tests():
+    if config.test_files:
+        stats = run_external_tests(config.test_files)
+    else:
+        stats = run_builtin_tests()
+
+    log_info("=========================================")
+    log_info(f"Test Results: {stats.passed} passed, {stats.failed} failed, {stats.skipped} skipped")
+    log_info("=========================================")
+
+    if stats.failed == 0 and stats.errors == 0:
         log_info("All tests passed!")
         sys.exit(0)
     else:

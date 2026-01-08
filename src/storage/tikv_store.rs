@@ -98,7 +98,6 @@ impl TikvStore {
             .await
     }
 
-    /// Get next sequence value for a table (for SERIAL columns)
     pub async fn next_sequence_value(&self, txn: &mut Transaction, table_id: u64) -> Result<i32> {
         let mut raw_key = b"_sys_seq_".to_vec();
         raw_key.extend_from_slice(&table_id.to_be_bytes());
@@ -106,7 +105,19 @@ impl TikvStore {
         Ok(val as i32)
     }
 
-    /// Helper to increment a system key
+    pub async fn set_sequence_value(
+        &self,
+        txn: &mut Transaction,
+        table_id: u64,
+        value: u64,
+    ) -> Result<()> {
+        let mut raw_key = b"_sys_seq_".to_vec();
+        raw_key.extend_from_slice(&table_id.to_be_bytes());
+        let key = self.key(&raw_key);
+        txn.put(key, value.to_be_bytes().to_vec()).await?;
+        Ok(())
+    }
+
     async fn increment_sys_key(&self, txn: &mut Transaction, raw_key: Vec<u8>) -> Result<u64> {
         let key = self.key(&raw_key);
         let current = txn.get(key.clone()).await?;

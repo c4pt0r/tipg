@@ -472,10 +472,52 @@ fn eval_function_join(func: &sqlparser::ast::Function, ctx: &JoinContext) -> Res
                 .as_millis() as i64;
             Ok(Value::Timestamp(ts))
         }
+        "DATE" => {
+            let ts = match args.into_iter().next() {
+                Some(Value::Timestamp(t)) => t,
+                Some(Value::Text(s)) => {
+                    use chrono::NaiveDateTime;
+                    let dt = NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f")
+                        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f"))
+                        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%d"))
+                        .map_err(|e| anyhow!("Invalid date format: {}", e))?;
+                    dt.and_utc().timestamp_millis()
+                }
+                _ => return Ok(Value::Null),
+            };
+            use chrono::{Datelike, TimeZone, Utc};
+            let dt = Utc
+                .timestamp_millis_opt(ts)
+                .single()
+                .ok_or_else(|| anyhow!("Invalid timestamp"))?;
+            let date_only = chrono::NaiveDate::from_ymd_opt(dt.year(), dt.month(), dt.day())
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc();
+            Ok(Value::Timestamp(date_only.timestamp_millis()))
+        }
         "GEN_RANDOM_UUID" | "UUID_GENERATE_V4" => {
             let uuid = uuid::Uuid::new_v4();
             Ok(Value::Uuid(*uuid.as_bytes()))
         }
+        "JSONB_ARRAY_LENGTH"
+        | "JSON_ARRAY_LENGTH"
+        | "JSONB_TYPEOF"
+        | "JSON_TYPEOF"
+        | "JSONB_BUILD_OBJECT"
+        | "JSON_BUILD_OBJECT"
+        | "JSONB_BUILD_ARRAY"
+        | "JSON_BUILD_ARRAY"
+        | "JSONB_OBJECT_KEYS"
+        | "JSON_OBJECT_KEYS"
+        | "JSONB_EXTRACT_PATH"
+        | "JSON_EXTRACT_PATH"
+        | "JSONB_EXTRACT_PATH_TEXT"
+        | "JSON_EXTRACT_PATH_TEXT"
+        | "JSONB_PRETTY"
+        | "TO_JSON"
+        | "TO_JSONB" => eval_function(func, None, None),
         _ => Err(anyhow!("Unsupported function in JOIN: {}", func_name)),
     }
 }
@@ -1292,6 +1334,31 @@ fn eval_function(
             };
             Ok(Value::Timestamp(truncated.timestamp_millis()))
         }
+        "DATE" => {
+            let ts = match args.into_iter().next() {
+                Some(Value::Timestamp(t)) => t,
+                Some(Value::Text(s)) => {
+                    use chrono::NaiveDateTime;
+                    let dt = NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f")
+                        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f"))
+                        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%d"))
+                        .map_err(|e| anyhow!("Invalid date format: {}", e))?;
+                    dt.and_utc().timestamp_millis()
+                }
+                _ => return Ok(Value::Null),
+            };
+            use chrono::{Datelike, TimeZone, Utc};
+            let dt = Utc
+                .timestamp_millis_opt(ts)
+                .single()
+                .ok_or_else(|| anyhow!("Invalid timestamp"))?;
+            let date_only = chrono::NaiveDate::from_ymd_opt(dt.year(), dt.month(), dt.day())
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc();
+            Ok(Value::Timestamp(date_only.timestamp_millis()))
+        }
         "TO_CHAR" => {
             let mut iter = args.into_iter();
             let val = iter.next();
@@ -1475,6 +1542,139 @@ fn eval_function(
                 .filter(|v| compare_values(v, &elem).unwrap_or(1) != 0)
                 .collect();
             Ok(Value::Array(result))
+        }
+        "JSONB_ARRAY_LENGTH" | "JSON_ARRAY_LENGTH" => {
+            let json_str = match args.into_iter().next() {
+                Some(Value::Text(s)) | Some(Value::Json(s)) | Some(Value::Jsonb(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => return Err(anyhow!("jsonb_array_length requires json/jsonb argument")),
+            };
+            let json_val: serde_json::Value =
+                serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+            match json_val {
+                serde_json::Value::Array(arr) => Ok(Value::Int32(arr.len() as i32)),
+                _ => Err(anyhow!("cannot get array length of a non-array")),
+            }
+        }
+        "JSONB_TYPEOF" | "JSON_TYPEOF" => {
+            let json_str = match args.into_iter().next() {
+                Some(Value::Text(s)) | Some(Value::Json(s)) | Some(Value::Jsonb(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => return Err(anyhow!("jsonb_typeof requires json/jsonb argument")),
+            };
+            let json_val: serde_json::Value =
+                serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+            let type_name = match json_val {
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "boolean",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::String(_) => "string",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Object(_) => "object",
+            };
+            Ok(Value::Text(type_name.to_string()))
+        }
+        "JSONB_BUILD_OBJECT" | "JSON_BUILD_OBJECT" => {
+            let mut obj = serde_json::Map::new();
+            let mut iter = args.into_iter();
+            while let Some(key) = iter.next() {
+                let key_str = match key {
+                    Value::Text(s) => s,
+                    Value::Null => "null".to_string(),
+                    v => v.to_string(),
+                };
+                let val = iter.next().unwrap_or(Value::Null);
+                let json_val = value_to_json(&val);
+                obj.insert(key_str, json_val);
+            }
+            Ok(Value::Jsonb(serde_json::Value::Object(obj).to_string()))
+        }
+        "JSONB_BUILD_ARRAY" | "JSON_BUILD_ARRAY" => {
+            let arr: Vec<serde_json::Value> = args.into_iter().map(|v| value_to_json(&v)).collect();
+            Ok(Value::Jsonb(serde_json::Value::Array(arr).to_string()))
+        }
+        "JSONB_OBJECT_KEYS" | "JSON_OBJECT_KEYS" => {
+            let json_str = match args.into_iter().next() {
+                Some(Value::Text(s)) | Some(Value::Json(s)) | Some(Value::Jsonb(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => return Err(anyhow!("jsonb_object_keys requires json/jsonb argument")),
+            };
+            let json_val: serde_json::Value =
+                serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+            match json_val {
+                serde_json::Value::Object(obj) => {
+                    let keys: Vec<Value> = obj.keys().map(|k| Value::Text(k.clone())).collect();
+                    Ok(Value::Array(keys))
+                }
+                _ => Err(anyhow!("cannot call jsonb_object_keys on a non-object")),
+            }
+        }
+        "JSONB_EXTRACT_PATH" | "JSON_EXTRACT_PATH" => {
+            let mut iter = args.into_iter();
+            let json_str = match iter.next() {
+                Some(Value::Text(s)) | Some(Value::Json(s)) | Some(Value::Jsonb(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => return Err(anyhow!("json_extract_path requires json/jsonb argument")),
+            };
+            let mut json_val: serde_json::Value =
+                serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+            for path_part in iter {
+                let key = match path_part {
+                    Value::Text(s) => s,
+                    v => v.to_string(),
+                };
+                json_val = match json_val.get(&key) {
+                    Some(v) => v.clone(),
+                    None => return Ok(Value::Null),
+                };
+            }
+            Ok(Value::Jsonb(json_val.to_string()))
+        }
+        "JSONB_EXTRACT_PATH_TEXT" | "JSON_EXTRACT_PATH_TEXT" => {
+            let mut iter = args.into_iter();
+            let json_str = match iter.next() {
+                Some(Value::Text(s)) | Some(Value::Json(s)) | Some(Value::Jsonb(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => {
+                    return Err(anyhow!(
+                        "json_extract_path_text requires json/jsonb argument"
+                    ))
+                }
+            };
+            let mut json_val: serde_json::Value =
+                serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+            for path_part in iter {
+                let key = match path_part {
+                    Value::Text(s) => s,
+                    v => v.to_string(),
+                };
+                json_val = match json_val.get(&key) {
+                    Some(v) => v.clone(),
+                    None => return Ok(Value::Null),
+                };
+            }
+            match json_val {
+                serde_json::Value::Null => Ok(Value::Null),
+                serde_json::Value::String(s) => Ok(Value::Text(s)),
+                other => Ok(Value::Text(other.to_string())),
+            }
+        }
+        "JSONB_PRETTY" => {
+            let json_str = match args.into_iter().next() {
+                Some(Value::Text(s)) | Some(Value::Json(s)) | Some(Value::Jsonb(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => return Err(anyhow!("jsonb_pretty requires json/jsonb argument")),
+            };
+            let json_val: serde_json::Value =
+                serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+            let pretty = serde_json::to_string_pretty(&json_val)
+                .map_err(|e| anyhow!("Failed to format JSON: {}", e))?;
+            Ok(Value::Text(pretty))
+        }
+        "TO_JSON" | "TO_JSONB" => {
+            let val = args.into_iter().next().unwrap_or(Value::Null);
+            let json_val = value_to_json(&val);
+            Ok(Value::Jsonb(json_val.to_string()))
         }
         _ => Err(anyhow!("Unsupported function: {}", func_name)),
     }
@@ -1750,6 +1950,10 @@ fn mul_values(left: Value, right: Value) -> Result<Value> {
         (Value::Int32(l), Value::Int64(r)) => Ok(Value::Int64(l as i64 * r)),
         (Value::Int64(l), Value::Int32(r)) => Ok(Value::Int64(l * r as i64)),
         (Value::Float64(l), Value::Float64(r)) => Ok(Value::Float64(l * r)),
+        (Value::Int32(l), Value::Float64(r)) => Ok(Value::Float64(l as f64 * r)),
+        (Value::Float64(l), Value::Int32(r)) => Ok(Value::Float64(l * r as f64)),
+        (Value::Int64(l), Value::Float64(r)) => Ok(Value::Float64(l as f64 * r)),
+        (Value::Float64(l), Value::Int64(r)) => Ok(Value::Float64(l * r as f64)),
         _ => Err(anyhow!("Unsupported types for multiplication")),
     }
 }
@@ -1768,7 +1972,23 @@ fn div_values(left: Value, right: Value) -> Result<Value> {
             }
             Ok(Value::Int64(l / r))
         }
+        (Value::Int32(l), Value::Int64(r)) => {
+            if r == 0 {
+                return Err(anyhow!("Division by zero"));
+            }
+            Ok(Value::Int64(l as i64 / r))
+        }
+        (Value::Int64(l), Value::Int32(r)) => {
+            if r == 0 {
+                return Err(anyhow!("Division by zero"));
+            }
+            Ok(Value::Int64(l / r as i64))
+        }
         (Value::Float64(l), Value::Float64(r)) => Ok(Value::Float64(l / r)),
+        (Value::Int32(l), Value::Float64(r)) => Ok(Value::Float64(l as f64 / r)),
+        (Value::Float64(l), Value::Int32(r)) => Ok(Value::Float64(l / r as f64)),
+        (Value::Int64(l), Value::Float64(r)) => Ok(Value::Float64(l as f64 / r)),
+        (Value::Float64(l), Value::Int64(r)) => Ok(Value::Float64(l / r as f64)),
         _ => Err(anyhow!("Unsupported types for division")),
     }
 }
@@ -1902,6 +2122,35 @@ fn eval_json_access_expr(
     row: Option<&Row>,
     schema: Option<&TableSchema>,
 ) -> Result<Value> {
+    if let Expr::InList {
+        expr: in_expr,
+        list,
+        negated,
+    } = right
+    {
+        let json_result = eval_json_access_expr(left, operator, in_expr, row, schema)?;
+        let mut found = false;
+        for item in list {
+            let item_val = eval_expr(item, row, schema)?;
+            if compare_values(&json_result, &item_val).unwrap_or(1) == 0 {
+                found = true;
+                break;
+            }
+        }
+        return Ok(Value::Boolean(if *negated { !found } else { found }));
+    }
+
+    if let Expr::BinaryOp {
+        left: bin_left,
+        op: bin_op,
+        right: bin_right,
+    } = right
+    {
+        let json_result = eval_json_access_expr(left, operator, bin_left, row, schema)?;
+        let right_val = eval_expr(bin_right, row, schema)?;
+        return eval_binary_op(json_result, bin_op, right_val);
+    }
+
     let mut ops: Vec<(&Expr, &JsonOperator)> = Vec::new();
     collect_json_ops(operator, right, &mut ops);
 
@@ -1919,6 +2168,35 @@ fn eval_json_access_expr_join(
     right: &Expr,
     ctx: &JoinContext,
 ) -> Result<Value> {
+    if let Expr::InList {
+        expr: in_expr,
+        list,
+        negated,
+    } = right
+    {
+        let json_result = eval_json_access_expr_join(left, operator, in_expr, ctx)?;
+        let mut found = false;
+        for item in list {
+            let item_val = eval_expr_join(item, ctx)?;
+            if compare_values(&json_result, &item_val).unwrap_or(1) == 0 {
+                found = true;
+                break;
+            }
+        }
+        return Ok(Value::Boolean(if *negated { !found } else { found }));
+    }
+
+    if let Expr::BinaryOp {
+        left: bin_left,
+        op: bin_op,
+        right: bin_right,
+    } = right
+    {
+        let json_result = eval_json_access_expr_join(left, operator, bin_left, ctx)?;
+        let right_val = eval_expr_join(bin_right, ctx)?;
+        return eval_binary_op(json_result, bin_op, right_val);
+    }
+
     let mut ops: Vec<(&Expr, &JsonOperator)> = Vec::new();
     collect_json_ops(operator, right, &mut ops);
 
@@ -2051,6 +2329,27 @@ fn json_contains(a: &serde_json::Value, b: &serde_json::Value) -> bool {
             arr_b.iter().all(|bv| arr_a.iter().any(|av| av == bv))
         }
         _ => a == b,
+    }
+}
+
+fn value_to_json(val: &Value) -> serde_json::Value {
+    match val {
+        Value::Null => serde_json::Value::Null,
+        Value::Boolean(b) => serde_json::Value::Bool(*b),
+        Value::Int32(n) => serde_json::Value::Number(serde_json::Number::from(*n)),
+        Value::Int64(n) => serde_json::Value::Number(serde_json::Number::from(*n)),
+        Value::Float64(n) => serde_json::Number::from_f64(*n)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Value::Text(s) => serde_json::Value::String(s.clone()),
+        Value::Json(s) | Value::Jsonb(s) => {
+            serde_json::from_str(s).unwrap_or(serde_json::Value::String(s.clone()))
+        }
+        Value::Array(arr) => serde_json::Value::Array(arr.iter().map(value_to_json).collect()),
+        Value::Timestamp(ts) => serde_json::Value::Number(serde_json::Number::from(*ts)),
+        Value::Uuid(bytes) => serde_json::Value::String(uuid::Uuid::from_bytes(*bytes).to_string()),
+        Value::Bytes(b) => serde_json::Value::String(format!("\\x{}", hex::encode(b))),
+        Value::Interval(ms) => serde_json::Value::Number(serde_json::Number::from(*ms)),
     }
 }
 

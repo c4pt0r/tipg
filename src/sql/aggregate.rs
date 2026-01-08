@@ -10,7 +10,14 @@ pub enum Aggregator {
     Sum(Value),
     Max(Value),
     Min(Value),
-    Avg { sum: f64, count: i64 },
+    Avg {
+        sum: f64,
+        count: i64,
+    },
+    StringAgg {
+        values: Vec<String>,
+        delimiter: String,
+    },
 }
 
 impl Aggregator {
@@ -21,7 +28,18 @@ impl Aggregator {
             "MAX" => Ok(Aggregator::Max(Value::Null)),
             "MIN" => Ok(Aggregator::Min(Value::Null)),
             "AVG" => Ok(Aggregator::Avg { sum: 0.0, count: 0 }),
+            "STRING_AGG" => Ok(Aggregator::StringAgg {
+                values: Vec::new(),
+                delimiter: ",".to_string(),
+            }),
             _ => Err(anyhow!("Unsupported aggregate function: {}", kind)),
+        }
+    }
+
+    pub fn new_string_agg(delimiter: String) -> Self {
+        Aggregator::StringAgg {
+            values: Vec::new(),
+            delimiter,
         }
     }
 
@@ -77,6 +95,15 @@ impl Aggregator {
                     *count += 1;
                 }
             }
+            Aggregator::StringAgg { values, .. } => {
+                if !matches!(val, Value::Null) {
+                    let s = match val {
+                        Value::Text(s) => s.clone(),
+                        v => v.to_string(),
+                    };
+                    values.push(s);
+                }
+            }
         }
         Ok(())
     }
@@ -92,6 +119,13 @@ impl Aggregator {
                     Value::Null
                 } else {
                     Value::Float64(*sum / *count as f64)
+                }
+            }
+            Aggregator::StringAgg { values, delimiter } => {
+                if values.is_empty() {
+                    Value::Null
+                } else {
+                    Value::Text(values.join(delimiter))
                 }
             }
         }
@@ -238,5 +272,32 @@ mod tests {
         agg.update(&Value::Text("apple".to_string())).unwrap();
         agg.update(&Value::Text("cherry".to_string())).unwrap();
         assert_eq!(agg.result(), Value::Text("apple".to_string()));
+    }
+
+    #[test]
+    fn test_string_agg() {
+        let mut agg = Aggregator::new_string_agg(", ".to_string());
+        agg.update(&Value::Text("apple".to_string())).unwrap();
+        agg.update(&Value::Text("banana".to_string())).unwrap();
+        agg.update(&Value::Text("cherry".to_string())).unwrap();
+        assert_eq!(
+            agg.result(),
+            Value::Text("apple, banana, cherry".to_string())
+        );
+    }
+
+    #[test]
+    fn test_string_agg_with_null() {
+        let mut agg = Aggregator::new_string_agg(",".to_string());
+        agg.update(&Value::Text("a".to_string())).unwrap();
+        agg.update(&Value::Null).unwrap();
+        agg.update(&Value::Text("b".to_string())).unwrap();
+        assert_eq!(agg.result(), Value::Text("a,b".to_string()));
+    }
+
+    #[test]
+    fn test_string_agg_empty() {
+        let agg = Aggregator::new_string_agg(",".to_string());
+        assert_eq!(agg.result(), Value::Null);
     }
 }

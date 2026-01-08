@@ -10,6 +10,9 @@ DROP PROCEDURE IF EXISTS daily_summary;
 DROP PROCEDURE IF EXISTS cascade_delete;
 DROP PROCEDURE IF EXISTS audit_log;
 DROP PROCEDURE IF EXISTS reset_sequence;
+DROP PROCEDURE IF EXISTS update_order_status;
+DROP PROCEDURE IF EXISTS log_event;
+DROP PROCEDURE IF EXISTS cleanup_product;
 
 DROP TABLE IF EXISTS audit_trail;
 DROP TABLE IF EXISTS order_archive;

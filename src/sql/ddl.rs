@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
-    AlterTableOperation, ColumnDef as SqlColumnDef, ColumnOption, Expr, ObjectName, OrderByExpr,
-    Query, TableConstraint,
+    AlterTableOperation, ColumnDef as SqlColumnDef, ColumnOption, Expr, GeneratedAs, ObjectName,
+    OrderByExpr, Query, TableConstraint,
 };
 use tikv_client::Transaction;
 
@@ -12,7 +12,7 @@ use super::ExecuteResult;
 use crate::storage::TikvStore;
 use crate::types::{
     CheckConstraint, ColumnDef, DataType, ForeignKeyAction, ForeignKeyConstraint, IndexDef, Row,
-    TableSchema,
+    TableSchema, Value,
 };
 
 pub async fn execute_create_table(
@@ -61,7 +61,7 @@ pub async fn execute_create_table(
     let mut col_defs = Vec::new();
     for col in columns {
         let col_name = col.name.value.clone();
-        let (data_type, is_serial) = if is_serial_type(&col.data_type) {
+        let (data_type, mut is_serial) = if is_serial_type(&col.data_type) {
             (DataType::Int32, true)
         } else {
             (convert_data_type(&col.data_type)?, false)
@@ -88,6 +88,15 @@ pub async fn execute_create_table(
                         name: None,
                         expr: expr.to_string(),
                     });
+                }
+                ColumnOption::Generated {
+                    generated_as,
+                    generation_expr: None,
+                    ..
+                } => {
+                    if matches!(generated_as, GeneratedAs::Always | GeneratedAs::ByDefault) {
+                        is_serial = true;
+                    }
                 }
                 _ => {}
             }
@@ -254,44 +263,48 @@ pub async fn create_table_from_query_result(
         });
     }
 
-    let col_defs: Vec<ColumnDef> = if explicit_columns.is_empty() {
-        result_cols
-            .iter()
-            .enumerate()
-            .map(|(i, col_name)| {
-                let data_type = if !result_rows.is_empty() {
-                    infer_data_type(&result_rows[0].values[i])
-                } else {
-                    DataType::Text
-                };
-                ColumnDef {
-                    name: col_name.clone(),
-                    data_type,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                }
-            })
-            .collect()
+    // Add synthetic _rowid column as primary key (allows UPDATE/DELETE on tables without explicit PK)
+    let mut col_defs: Vec<ColumnDef> = vec![ColumnDef {
+        name: "_rowid".to_string(),
+        data_type: DataType::Int64,
+        nullable: false,
+        primary_key: true,
+        unique: true,
+        is_serial: true,
+        default_expr: None,
+    }];
+
+    if explicit_columns.is_empty() {
+        col_defs.extend(result_cols.iter().enumerate().map(|(i, col_name)| {
+            let data_type = if !result_rows.is_empty() {
+                infer_data_type(&result_rows[0].values[i])
+            } else {
+                DataType::Text
+            };
+            ColumnDef {
+                name: col_name.clone(),
+                data_type,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }
+        }));
     } else {
-        explicit_columns
-            .iter()
-            .map(|col| {
-                let data_type = convert_data_type(&col.data_type).unwrap_or(DataType::Text);
-                ColumnDef {
-                    name: col.name.value.clone(),
-                    data_type,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                }
-            })
-            .collect()
-    };
+        col_defs.extend(explicit_columns.iter().map(|col| {
+            let data_type = convert_data_type(&col.data_type).unwrap_or(DataType::Text);
+            ColumnDef {
+                name: col.name.value.clone(),
+                data_type,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }
+        }));
+    }
 
     let table_id = store.next_table_id(txn).await?;
     let schema = TableSchema {
@@ -299,15 +312,24 @@ pub async fn create_table_from_query_result(
         table_id,
         columns: col_defs,
         version: 1,
-        pk_indices: vec![],
+        pk_indices: vec![0],
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
     };
-    store.create_table(txn, schema).await?;
+    store.create_table(txn, schema.clone()).await?;
 
-    for row in result_rows {
-        store.upsert(txn, table_name, row).await?;
+    let row_count = result_rows.len();
+    for (i, row) in result_rows.into_iter().enumerate() {
+        let mut values = vec![Value::Int64((i + 1) as i64)];
+        values.extend(row.values);
+        store.upsert(txn, table_name, Row::new(values)).await?;
+    }
+
+    if row_count > 0 {
+        store
+            .set_sequence_value(txn, schema.table_id, row_count as u64)
+            .await?;
     }
 
     Ok(ExecuteResult::CreateTable {
@@ -326,26 +348,33 @@ pub async fn create_table_from_select_into(
         return Err(anyhow!("relation \"{}\" already exists", table_name));
     }
 
-    let col_defs: Vec<ColumnDef> = result_cols
-        .iter()
-        .enumerate()
-        .map(|(i, col_name)| {
-            let data_type = if !result_rows.is_empty() {
-                infer_data_type(&result_rows[0].values[i])
-            } else {
-                DataType::Text
-            };
-            ColumnDef {
-                name: col_name.clone(),
-                data_type,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-            }
-        })
-        .collect();
+    // Add synthetic _rowid column as primary key (allows UPDATE/DELETE on tables without explicit PK)
+    let mut col_defs: Vec<ColumnDef> = vec![ColumnDef {
+        name: "_rowid".to_string(),
+        data_type: DataType::Int64,
+        nullable: false,
+        primary_key: true,
+        unique: true,
+        is_serial: true,
+        default_expr: None,
+    }];
+
+    col_defs.extend(result_cols.iter().enumerate().map(|(i, col_name)| {
+        let data_type = if !result_rows.is_empty() {
+            infer_data_type(&result_rows[0].values[i])
+        } else {
+            DataType::Text
+        };
+        ColumnDef {
+            name: col_name.clone(),
+            data_type,
+            nullable: true,
+            primary_key: false,
+            unique: false,
+            is_serial: false,
+            default_expr: None,
+        }
+    }));
 
     let table_id = store.next_table_id(txn).await?;
     let schema = TableSchema {
@@ -353,16 +382,24 @@ pub async fn create_table_from_select_into(
         table_id,
         columns: col_defs,
         version: 1,
-        pk_indices: vec![],
+        pk_indices: vec![0],
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
     };
-    store.create_table(txn, schema).await?;
+    store.create_table(txn, schema.clone()).await?;
 
     let row_count = result_rows.len();
-    for row in result_rows {
-        store.upsert(txn, table_name, row).await?;
+    for (i, row) in result_rows.into_iter().enumerate() {
+        let mut values = vec![Value::Int64((i + 1) as i64)];
+        values.extend(row.values);
+        store.upsert(txn, table_name, Row::new(values)).await?;
+    }
+
+    if row_count > 0 {
+        store
+            .set_sequence_value(txn, schema.table_id, row_count as u64)
+            .await?;
     }
 
     Ok(ExecuteResult::Insert {

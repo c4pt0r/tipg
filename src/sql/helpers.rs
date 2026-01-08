@@ -28,6 +28,55 @@ pub fn dedup_rows(rows: Vec<Row>) -> Vec<Row> {
     result
 }
 
+pub fn distinct_on_rows(
+    rows: Vec<Row>,
+    on_exprs: &[Expr],
+    row_context: Option<&TableSchema>,
+) -> Vec<Row> {
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    let mut result = Vec::new();
+
+    for row in rows {
+        let key_values: Vec<Value> = on_exprs
+            .iter()
+            .filter_map(|expr| eval_expr(expr, Some(&row), row_context).ok())
+            .collect();
+        let key = bincode::serialize(&key_values).unwrap_or_default();
+        if seen.insert(key) {
+            result.push(row);
+        }
+    }
+    result
+}
+
+pub fn distinct_on_rows_join(
+    rows: Vec<Row>,
+    on_exprs: &[Expr],
+    column_offsets: &std::collections::HashMap<String, usize>,
+    combined_schema: &TableSchema,
+) -> Vec<Row> {
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    let mut result = Vec::new();
+
+    for row in rows {
+        let ctx = JoinContext {
+            tables: std::collections::HashMap::new(),
+            column_offsets: column_offsets.clone(),
+            combined_row: &row,
+            combined_schema,
+        };
+        let key_values: Vec<Value> = on_exprs
+            .iter()
+            .filter_map(|expr| eval_expr_join(expr, &ctx).ok())
+            .collect();
+        let key = bincode::serialize(&key_values).unwrap_or_default();
+        if seen.insert(key) {
+            result.push(row);
+        }
+    }
+    result
+}
+
 /// Coerce a value to match the expected column type
 pub fn coerce_value_for_column(val: Value, col: &ColumnDef) -> Result<Value> {
     match (&val, &col.data_type) {
@@ -179,6 +228,7 @@ pub fn convert_data_type(sql_type: &SqlDataType) -> Result<DataType> {
         SqlDataType::Timestamp(_, _) => Ok(DataType::Timestamp),
         SqlDataType::Date => Ok(DataType::Timestamp),
         SqlDataType::Uuid => Ok(DataType::Uuid),
+        SqlDataType::JSON => Ok(DataType::Jsonb),
         SqlDataType::Custom(name, _) => {
             if let Some(ident) = name.0.last() {
                 let type_name = ident.value.to_uppercase();
@@ -267,7 +317,10 @@ pub fn collect_having_agg_funcs(
                 .map(|i| i.value.to_uppercase())
                 .unwrap_or_default();
             tracing::debug!("Found function in HAVING: {}", func_name);
-            if matches!(func_name.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
+            if matches!(
+                func_name.as_str(),
+                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG"
+            ) {
                 let already_exists = agg_funcs.iter().any(|(_, existing)| {
                     let existing_name = existing
                         .name
@@ -337,22 +390,29 @@ pub fn eval_having_expr(
                     return Ok(aggs[i].result());
                 }
             }
-            let mut temp_agg = Aggregator::new(&func_name)?;
-            let arg_expr = if f.args.is_empty() {
-                None
-            } else {
-                match &f.args[0] {
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
-                    _ => None,
+            if matches!(
+                func_name.as_str(),
+                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG"
+            ) {
+                let mut temp_agg = Aggregator::new(&func_name)?;
+                let arg_expr = if f.args.is_empty() {
+                    None
+                } else {
+                    match &f.args[0] {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                        _ => None,
+                    }
+                };
+                if let Some(e) = arg_expr {
+                    let val = eval_expr(e, Some(row), Some(schema))?;
+                    temp_agg.update(&val)?;
+                } else {
+                    temp_agg.update(&Value::Int32(1))?;
                 }
-            };
-            if let Some(e) = arg_expr {
-                let val = eval_expr(e, Some(row), Some(schema))?;
-                temp_agg.update(&val)?;
+                Ok(temp_agg.result())
             } else {
-                temp_agg.update(&Value::Int32(1))?;
+                eval_expr(expr, Some(row), Some(schema))
             }
-            Ok(temp_agg.result())
         }
         Expr::Nested(e) => eval_having_expr(e, row, schema, agg_funcs, aggs),
         Expr::Value(v) => super::expr::eval_value_public(v),
@@ -391,22 +451,29 @@ pub fn eval_having_expr_join(
                     return Ok(aggs[i].result());
                 }
             }
-            let mut temp_agg = Aggregator::new(&func_name)?;
-            let arg_expr = if f.args.is_empty() {
-                None
-            } else {
-                match &f.args[0] {
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
-                    _ => None,
+            if matches!(
+                func_name.as_str(),
+                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG"
+            ) {
+                let mut temp_agg = Aggregator::new(&func_name)?;
+                let arg_expr = if f.args.is_empty() {
+                    None
+                } else {
+                    match &f.args[0] {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                        _ => None,
+                    }
+                };
+                if let Some(e) = arg_expr {
+                    let val = eval_expr_join(e, ctx)?;
+                    temp_agg.update(&val)?;
+                } else {
+                    temp_agg.update(&Value::Int32(1))?;
                 }
-            };
-            if let Some(e) = arg_expr {
-                let val = eval_expr_join(e, ctx)?;
-                temp_agg.update(&val)?;
+                Ok(temp_agg.result())
             } else {
-                temp_agg.update(&Value::Int32(1))?;
+                eval_expr_join(expr, ctx)
             }
-            Ok(temp_agg.result())
         }
         Expr::Nested(e) => eval_having_expr_join(e, ctx, agg_funcs, aggs),
         Expr::Value(v) => super::expr::eval_value_public(v),

@@ -6,9 +6,9 @@ PostgreSQL-compatible SQL layer on TiKV. Rust + async/await + pgwire + sqlparser
 
 ```bash
 cargo build                    # Debug build
-cargo test                     # Unit tests (146 tests)
+cargo test                     # Unit tests (184 tests)
 cargo clippy -- -D warnings    # Lint
-python3 scripts/integration_test.py  # Integration tests (requires TiKV)
+python3 scripts/integration_test.py  # Integration tests (14 tests, requires TiKV)
 ```
 
 ## Structure
@@ -166,6 +166,53 @@ SELECT SUM(x) OVER (PARTITION BY y ORDER BY z) FROM t;  -- running sum
 SELECT SUM(x) OVER (PARTITION BY y) FROM t;              -- partition total (different!)
 ```
 
+### 7. Window Functions in JOIN Context
+Window functions require separate implementation for JOIN queries. The non-JOIN path uses `compute_window_functions()` with a single schema, but JOIN queries use `JoinContext` with combined schemas and column offsets.
+
+```rust
+// Non-JOIN path (single table)
+compute_window_functions(&rows, &schema, &window_funcs)
+
+// JOIN path (combined tables)
+compute_window_functions_join(&rows, &column_offsets, &combined_schema, &window_funcs)
+```
+
+Key differences:
+- JOIN path uses `eval_expr_join()` instead of `eval_expr()`
+- Column resolution uses `column_offsets` HashMap instead of schema index
+- Must reorder window results when ORDER BY is applied (same as non-JOIN)
+
+### 8. Derived Tables (Subqueries in FROM)
+Derived tables require executing the subquery and constructing a virtual schema from the result columns.
+
+```rust
+// Handle TableFactor::Derived in addition to TableFactor::Table
+TableFactor::Derived { subquery, alias, .. } => {
+    let (schema, rows) = execute_derived_table(txn, subquery, &alias_name, ctes).await?;
+    // Use schema/rows like any other table
+}
+```
+
+Important: Pass CTEs through to derived table execution so inner queries can reference outer CTEs.
+
+### 9. Scalar Functions vs Aggregate Functions Routing
+When implementing functions that can appear in both scalar and aggregate contexts (like in HAVING clauses), ensure proper routing:
+
+```rust
+// WRONG: Treat all functions as aggregates
+if let Expr::Function(f) = expr {
+    Aggregator::new(&func_name)  // Fails for UPPER, COALESCE, etc.
+}
+
+// RIGHT: Check if it's actually an aggregate
+let agg_names = ["COUNT", "SUM", "AVG", "MIN", "MAX", "STRING_AGG"];
+if agg_names.contains(&func_name.as_str()) {
+    Aggregator::new(&func_name)
+} else {
+    eval_expr(expr, row, schema)  // Delegate to scalar evaluation
+}
+```
+
 ## Key Encoding
 
 | Entity | Key Pattern |
@@ -177,8 +224,9 @@ SELECT SUM(x) OVER (PARTITION BY y) FROM t;              -- partition total (dif
 
 ## Tech Debt
 
-- `executor.rs` 2762 lines → split into ddl.rs, dml.rs, query.rs
+- `executor.rs` 2900+ lines → split into ddl.rs, dml.rs, query.rs
 - Duplicate: `eval_expr` vs `eval_expr_join` → unify
+- Duplicate: `compute_window_functions` vs `compute_window_functions_join` → unify with trait
 - No query planner → optimizer picks index directly
 
 ## Multi-Tenant

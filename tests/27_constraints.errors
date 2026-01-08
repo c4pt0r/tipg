@@ -1,0 +1,4 @@
+cannot be null
+Column 'required_col' cannot be null
+CHECK constraint
+violates check constraint

@@ -4,15 +4,17 @@ use super::ddl;
 use super::dml;
 use super::explain;
 use super::helpers::{
-    collect_having_agg_funcs, cte_is_recursive, dedup_rows, eval_default_expr, eval_having_expr,
-    eval_having_expr_join, fill_row_defaults, get_select_item_name, get_skip_reason,
-    get_unsupported_reason, infer_data_type, parse_value_for_copy, set_expr_references_table,
-    value_to_sql_expr,
+    collect_having_agg_funcs, cte_is_recursive, dedup_rows, distinct_on_rows,
+    distinct_on_rows_join, eval_default_expr, eval_having_expr, eval_having_expr_join,
+    fill_row_defaults, get_select_item_name, get_skip_reason, get_unsupported_reason,
+    infer_data_type, parse_value_for_copy, set_expr_references_table, value_to_sql_expr,
 };
 use super::planner::{self, ScanType};
 use super::query;
 use super::rbac;
-use super::window::{compute_window_functions, extract_window_functions};
+use super::window::{
+    compute_window_functions, compute_window_functions_join, extract_window_functions,
+};
 use super::{
     expr::{eval_expr, eval_expr_join, JoinContext},
     parse_sql, Aggregator, ExecuteResult, Session,
@@ -22,10 +24,10 @@ use crate::storage::TikvStore;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
-    AlterTableOperation, Assignment, BinaryOperator, ColumnDef as SqlColumnDef, Expr, FunctionArg,
-    FunctionArgExpr, GroupByExpr, Ident, JoinConstraint, JoinOperator, LockType, ObjectName,
-    OnInsert, OrderByExpr, Query, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement,
-    TableFactor, Value as SqlValue, Values,
+    AlterTableOperation, Assignment, BinaryOperator, ColumnDef as SqlColumnDef, Distinct, Expr,
+    FunctionArg, FunctionArgExpr, GroupByExpr, Ident, JoinConstraint, JoinOperator, LockType,
+    ObjectName, OnInsert, OrderByExpr, Query, SelectItem, SetExpr, SetOperator, SetQuantifier,
+    Statement, TableFactor, Value as SqlValue, Values,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -484,24 +486,39 @@ impl Executor {
             .to_lowercase();
 
         let table_id = self.store.next_table_id(txn).await?;
-        let col_defs: Vec<crate::types::ColumnDef> = columns
-            .iter()
+        let mut col_defs: Vec<crate::types::ColumnDef> = vec![crate::types::ColumnDef {
+            name: "_mv_rowid".to_string(),
+            data_type: crate::types::DataType::Int64,
+            nullable: false,
+            primary_key: true,
+            default_expr: None,
+            is_serial: true,
+            unique: true,
+        }];
+        col_defs.extend(columns.iter().enumerate().map(|(i, col_name)| {
+            let data_type = if rows.is_empty() {
+                crate::types::DataType::Text
+            } else {
+                infer_data_type(&rows[0].values[i])
+            };
+            crate::types::ColumnDef {
+                name: col_name.clone(),
+                data_type,
+                nullable: true,
+                primary_key: false,
+                default_expr: None,
+                is_serial: false,
+                unique: false,
+            }
+        }));
+
+        let rows_with_rowid: Vec<Row> = rows
+            .into_iter()
             .enumerate()
-            .map(|(i, col_name)| {
-                let data_type = if rows.is_empty() {
-                    crate::types::DataType::Text
-                } else {
-                    infer_data_type(&rows[0].values[i])
-                };
-                crate::types::ColumnDef {
-                    name: col_name.clone(),
-                    data_type,
-                    nullable: true,
-                    primary_key: i == 0,
-                    default_expr: None,
-                    is_serial: false,
-                    unique: false,
-                }
+            .map(|(i, mut row)| {
+                let mut values = vec![Value::Int64((i + 1) as i64)];
+                values.append(&mut row.values);
+                Row::new(values)
             })
             .collect();
 
@@ -523,7 +540,7 @@ impl Executor {
             query,
             or_replace,
             schema,
-            rows,
+            rows_with_rowid,
         )
         .await
     }
@@ -574,7 +591,18 @@ impl Executor {
                 _ => return Err(anyhow!("Materialized view must be a SELECT query")),
             };
 
-            ddl::execute_refresh_materialized_view(&self.store, txn, &view_name, rows).await
+            let rows_with_rowid: Vec<Row> = rows
+                .into_iter()
+                .enumerate()
+                .map(|(i, mut row)| {
+                    let mut values = vec![Value::Int64((i + 1) as i64)];
+                    values.append(&mut row.values);
+                    Row::new(values)
+                })
+                .collect();
+
+            ddl::execute_refresh_materialized_view(&self.store, txn, &view_name, rows_with_rowid)
+                .await
         }
         .await;
 
@@ -1399,7 +1427,7 @@ impl Executor {
             return Ok(result);
         }
 
-        let has_joins = !select.from[0].joins.is_empty();
+        let has_joins = !select.from[0].joins.is_empty() || select.from.len() > 1;
 
         if has_joins {
             let result = self
@@ -1413,15 +1441,29 @@ impl Executor {
             return Ok(result);
         }
 
-        let t = match &select.from[0].relation {
-            TableFactor::Table { name, .. } => name.0.last().unwrap().value.clone(),
+        let (t, schema, all_rows_base, is_virtual) = match &select.from[0].relation {
+            TableFactor::Table { name, .. } => {
+                let t = name.0.last().unwrap().value.clone();
+                let t_lower = t.to_lowercase();
+                let (schema, rows) = self.get_table_data(txn, &t, ctes).await?;
+                let is_virtual = ctes.contains_key(&t_lower)
+                    || self.store.get_view(txn, &t_lower).await?.is_some();
+                (t, schema, rows, is_virtual)
+            }
+            TableFactor::Derived {
+                subquery, alias, ..
+            } => {
+                let alias_name = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_else(|| "subquery".to_string());
+                let (schema, rows) = self
+                    .execute_derived_table(txn, subquery, &alias_name, ctes)
+                    .await?;
+                (alias_name, schema, rows, true)
+            }
             _ => return Err(anyhow!("Unsupported table")),
         };
-        let t_lower = t.to_lowercase();
-
-        let (schema, all_rows_base) = self.get_table_data(txn, &t, ctes).await?;
-        let is_virtual =
-            ctes.contains_key(&t_lower) || self.store.get_view(txn, &t_lower).await?.is_some();
 
         let resolved_selection = if let Some(sel) = &select.selection {
             Some(self.resolve_subqueries(txn, sel).await?)
@@ -1553,7 +1595,18 @@ impl Executor {
                     ..
                 } => {
                     if f.over.is_none() {
-                        agg_funcs.push((i, f.clone()));
+                        let func_name = f
+                            .name
+                            .0
+                            .last()
+                            .map(|n| n.value.to_uppercase())
+                            .unwrap_or_default();
+                        if matches!(
+                            func_name.as_str(),
+                            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG"
+                        ) {
+                            agg_funcs.push((i, f.clone()));
+                        }
                     }
                 }
                 _ => {}
@@ -1581,8 +1634,25 @@ impl Executor {
                 if !groups.contains_key(&key_bytes) {
                     let mut aggs = Vec::new();
                     for (_, f) in &agg_funcs {
-                        let name = f.name.0.last().unwrap().value.clone();
-                        aggs.push(Aggregator::new(&name)?);
+                        let name = f.name.0.last().unwrap().value.to_uppercase();
+                        if name == "STRING_AGG" {
+                            let delimiter = if f.args.len() >= 2 {
+                                match &f.args[1] {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                                        match eval_expr(e, Some(&row), Some(&schema))? {
+                                            Value::Text(s) => s,
+                                            _ => ",".to_string(),
+                                        }
+                                    }
+                                    _ => ",".to_string(),
+                                }
+                            } else {
+                                ",".to_string()
+                            };
+                            aggs.push(Aggregator::new_string_agg(delimiter));
+                        } else {
+                            aggs.push(Aggregator::new(&name)?);
+                        }
                     }
                     groups.insert(key_bytes.clone(), aggs);
                     group_rows.insert(key_bytes.clone(), row.clone());
@@ -1641,10 +1711,16 @@ impl Executor {
                 final_rows.push(Row::new(row_values));
             }
 
-            return Ok(ExecuteResult::Select {
+            let result = ExecuteResult::Select {
                 columns: col_names,
                 rows: final_rows,
-            });
+            };
+            if let Some((target_name, _temp)) = select_into_target {
+                return self
+                    .create_table_from_result(txn, &target_name, result)
+                    .await;
+            }
+            return Ok(result);
         }
 
         let window_results = if !window_funcs.is_empty() {
@@ -1741,18 +1817,27 @@ impl Executor {
             .projection
             .iter()
             .any(|p| matches!(p, SelectItem::Wildcard(_)));
+        // Only use fast-path if projection is exactly `*` with no other items
+        let pure_wildcard = wildcard && select.projection.len() == 1;
 
         let mut cols = Vec::new();
         let mut result_rows = Vec::new();
 
-        if wildcard && !has_window_funcs {
+        if pure_wildcard && !has_window_funcs {
             for c in &schema.columns {
                 cols.push(c.name.clone());
             }
             result_rows = final_rows;
         } else {
             for item in &select.projection {
-                cols.push(get_select_item_name(item));
+                match item {
+                    SelectItem::Wildcard(_) => {
+                        for c in &schema.columns {
+                            cols.push(c.name.clone());
+                        }
+                    }
+                    _ => cols.push(get_select_item_name(item)),
+                }
             }
 
             for (row_idx, row) in final_rows.iter().enumerate() {
@@ -1782,8 +1867,14 @@ impl Executor {
             }
         }
 
-        if select.distinct.is_some() {
-            result_rows = dedup_rows(result_rows);
+        match &select.distinct {
+            Some(Distinct::On(on_exprs)) => {
+                result_rows = distinct_on_rows(result_rows, on_exprs, Some(&schema));
+            }
+            Some(Distinct::Distinct) => {
+                result_rows = dedup_rows(result_rows);
+            }
+            None => {}
         }
 
         let result = ExecuteResult::Select {
@@ -1986,6 +2077,47 @@ impl Executor {
         })
     }
 
+    fn execute_derived_table<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        subquery: &'a Query,
+        alias: &'a str,
+        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(TableSchema, Vec<Row>)>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let result = self.execute_query_with_ctes(txn, subquery, ctes).await?;
+            match result {
+                ExecuteResult::Select { columns, rows } => {
+                    let schema = TableSchema {
+                        table_id: 0,
+                        name: alias.to_string(),
+                        columns: columns
+                            .iter()
+                            .map(|n| ColumnDef {
+                                name: n.clone(),
+                                data_type: DataType::Text,
+                                nullable: true,
+                                primary_key: false,
+                                unique: false,
+                                is_serial: false,
+                                default_expr: None,
+                            })
+                            .collect(),
+                        pk_indices: vec![],
+                        indexes: vec![],
+                        version: 1,
+                        check_constraints: vec![],
+                        foreign_keys: vec![],
+                    };
+                    Ok((schema, rows))
+                }
+                _ => Err(anyhow!("Derived table must return SELECT result")),
+            }
+        })
+    }
+
     async fn execute_join_query_with_ctes(
         &self,
         txn: &mut Transaction,
@@ -1993,19 +2125,30 @@ impl Executor {
         select: &sqlparser::ast::Select,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<ExecuteResult> {
-        let (base_table, base_alias) = match &select.from[0].relation {
+        let (base_alias, base_schema, base_rows) = match &select.from[0].relation {
             TableFactor::Table { name, alias, .. } => {
                 let tbl = name.0.last().unwrap().value.clone();
                 let als = alias
                     .as_ref()
                     .map(|a| a.name.value.clone())
                     .unwrap_or_else(|| tbl.clone());
-                (tbl, als)
+                let (schema, rows) = self.get_table_data(txn, &tbl, ctes).await?;
+                (als, schema, rows)
+            }
+            TableFactor::Derived {
+                subquery, alias, ..
+            } => {
+                let alias_name = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_else(|| "subquery".to_string());
+                let (schema, rows) = self
+                    .execute_derived_table(txn, subquery, &alias_name, ctes)
+                    .await?;
+                (alias_name, schema, rows)
             }
             _ => return Err(anyhow!("Unsupported base table")),
         };
-
-        let (base_schema, base_rows) = self.get_table_data(txn, &base_table, ctes).await?;
 
         let mut combined_schemas: Vec<(String, TableSchema)> =
             vec![(base_alias.clone(), base_schema.clone())];
@@ -2013,20 +2156,107 @@ impl Executor {
         let mut has_natural_join = false;
         let mut natural_join_common_cols: Vec<String> = Vec::new();
 
-        for join in &select.from[0].joins {
-            let (join_table, join_alias) = match &join.relation {
+        for from_item in select.from.iter().skip(1) {
+            let (extra_alias, extra_schema, extra_rows) = match &from_item.relation {
                 TableFactor::Table { name, alias, .. } => {
                     let tbl = name.0.last().unwrap().value.clone();
                     let als = alias
                         .as_ref()
                         .map(|a| a.name.value.clone())
                         .unwrap_or_else(|| tbl.clone());
-                    (tbl, als)
+                    let (schema, rows) = self.get_table_data(txn, &tbl, ctes).await?;
+                    (als, schema, rows)
+                }
+                TableFactor::Derived {
+                    subquery, alias, ..
+                } => {
+                    let alias_name = alias
+                        .as_ref()
+                        .map(|a| a.name.value.clone())
+                        .unwrap_or_else(|| "subquery".to_string());
+                    let (schema, rows) = self
+                        .execute_derived_table(txn, subquery, &alias_name, ctes)
+                        .await?;
+                    (alias_name, schema, rows)
+                }
+                _ => return Err(anyhow!("Unsupported table factor in FROM")),
+            };
+
+            let mut new_combined_rows = Vec::new();
+            for left_row in &combined_rows {
+                for right_row in &extra_rows {
+                    let mut combined_values = left_row.values.clone();
+                    combined_values.extend(right_row.values.clone());
+                    new_combined_rows.push(Row::new(combined_values));
+                }
+            }
+            combined_schemas.push((extra_alias, extra_schema));
+            combined_rows = new_combined_rows;
+
+            for extra_join in &from_item.joins {
+                let (join_alias, join_schema, join_rows) = match &extra_join.relation {
+                    TableFactor::Table { name, alias, .. } => {
+                        let tbl = name.0.last().unwrap().value.clone();
+                        let als = alias
+                            .as_ref()
+                            .map(|a| a.name.value.clone())
+                            .unwrap_or_else(|| tbl.clone());
+                        let (schema, rows) = self.get_table_data(txn, &tbl, ctes).await?;
+                        (als, schema, rows)
+                    }
+                    TableFactor::Derived {
+                        subquery, alias, ..
+                    } => {
+                        let alias_name = alias
+                            .as_ref()
+                            .map(|a| a.name.value.clone())
+                            .unwrap_or_else(|| "subquery".to_string());
+                        let (schema, rows) = self
+                            .execute_derived_table(txn, subquery, &alias_name, ctes)
+                            .await?;
+                        (alias_name, schema, rows)
+                    }
+                    _ => return Err(anyhow!("Unsupported join table factor")),
+                };
+
+                let mut new_rows = Vec::new();
+                for left_row in &combined_rows {
+                    for right_row in &join_rows {
+                        let mut combined_values = left_row.values.clone();
+                        combined_values.extend(right_row.values.clone());
+                        new_rows.push(Row::new(combined_values));
+                    }
+                }
+                combined_schemas.push((join_alias, join_schema));
+                combined_rows = new_rows;
+            }
+        }
+
+        for join in &select.from[0].joins {
+            let (join_alias, join_schema, join_rows) = match &join.relation {
+                TableFactor::Table { name, alias, .. } => {
+                    let tbl = name.0.last().unwrap().value.clone();
+                    let als = alias
+                        .as_ref()
+                        .map(|a| a.name.value.clone())
+                        .unwrap_or_else(|| tbl.clone());
+                    let (schema, rows) = self.get_table_data(txn, &tbl, ctes).await?;
+                    (als, schema, rows)
+                }
+                TableFactor::Derived {
+                    subquery, alias, ..
+                } => {
+                    let alias_name = alias
+                        .as_ref()
+                        .map(|a| a.name.value.clone())
+                        .unwrap_or_else(|| "subquery".to_string());
+                    let (schema, rows) = self
+                        .execute_derived_table(txn, subquery, &alias_name, ctes)
+                        .await?;
+                    (alias_name, schema, rows)
                 }
                 _ => return Err(anyhow!("Unsupported join table")),
             };
-
-            let (join_schema, join_rows) = self.get_table_data(txn, &join_table, ctes).await?;
 
             let left_columns: Vec<String> = combined_schemas
                 .iter()
@@ -2201,7 +2431,14 @@ impl Executor {
             foreign_keys: vec![],
         };
 
-        let mut filtered_rows = if let Some(sel) = &select.selection {
+        // Resolve subqueries (EXISTS, IN (SELECT ...), scalar subqueries) in WHERE clause
+        let resolved_selection = if let Some(sel) = &select.selection {
+            Some(self.resolve_subqueries(txn, sel).await?)
+        } else {
+            None
+        };
+
+        let filtered_rows = if let Some(ref sel) = resolved_selection {
             let mut v = Vec::new();
             for row in combined_rows {
                 let ctx = JoinContext {
@@ -2236,13 +2473,19 @@ impl Executor {
                     expr: Expr::Function(f),
                     ..
                 } => {
+                    if f.over.is_some() {
+                        continue;
+                    }
                     let func_name = f
                         .name
                         .0
                         .last()
                         .map(|i| i.value.to_uppercase())
                         .unwrap_or_default();
-                    if matches!(func_name.as_str(), "COUNT" | "SUM" | "AVG" | "MAX" | "MIN") {
+                    if matches!(
+                        func_name.as_str(),
+                        "COUNT" | "SUM" | "AVG" | "MAX" | "MIN" | "STRING_AGG"
+                    ) {
                         agg_funcs.push((i, f.clone()));
                     }
                 }
@@ -2278,8 +2521,25 @@ impl Executor {
                 if !groups.contains_key(&key_bytes) {
                     let mut aggs = Vec::new();
                     for (_, f) in &agg_funcs {
-                        let name = f.name.0.last().unwrap().value.clone();
-                        aggs.push(Aggregator::new(&name)?);
+                        let name = f.name.0.last().unwrap().value.to_uppercase();
+                        if name == "STRING_AGG" {
+                            let delimiter = if f.args.len() >= 2 {
+                                match &f.args[1] {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                                        match eval_expr_join(e, &ctx)? {
+                                            Value::Text(s) => s,
+                                            _ => ",".to_string(),
+                                        }
+                                    }
+                                    _ => ",".to_string(),
+                                }
+                            } else {
+                                ",".to_string()
+                            };
+                            aggs.push(Aggregator::new_string_agg(delimiter));
+                        } else {
+                            aggs.push(Aggregator::new(&name)?);
+                        }
                     }
                     groups.insert(key_bytes.clone(), aggs);
                     group_rows.insert(key_bytes.clone(), row.clone());
@@ -2347,8 +2607,21 @@ impl Executor {
             });
         }
 
-        if !query.order_by.is_empty() {
-            filtered_rows.sort_by(|a, b| {
+        let window_funcs = extract_window_functions(&select.projection);
+        let window_results = if !window_funcs.is_empty() {
+            Some(compute_window_functions_join(
+                &filtered_rows,
+                &final_column_offsets,
+                &final_schema,
+                &window_funcs,
+            )?)
+        } else {
+            None
+        };
+
+        let (filtered_rows, window_results) = if !query.order_by.is_empty() {
+            let mut indexed: Vec<(usize, Row)> = filtered_rows.into_iter().enumerate().collect();
+            indexed.sort_by(|(_, a), (_, b)| {
                 for order_expr in &query.order_by {
                     let ctx_a = JoinContext {
                         tables: HashMap::new(),
@@ -2384,7 +2657,17 @@ impl Executor {
                 }
                 std::cmp::Ordering::Equal
             });
-        }
+            let reordered_wr = window_results.map(|wr| {
+                indexed
+                    .iter()
+                    .map(|(orig_idx, _)| wr[*orig_idx].clone())
+                    .collect()
+            });
+            let reordered_rows: Vec<Row> = indexed.into_iter().map(|(_, r)| r).collect();
+            (reordered_rows, reordered_wr)
+        } else {
+            (filtered_rows, window_results)
+        };
 
         let mut final_rows = filtered_rows;
         if let Some(offset) = &query.offset {
@@ -2466,10 +2749,9 @@ impl Executor {
                     SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
                         cols.push(
                             parts
-                                .iter()
+                                .last()
                                 .map(|p| p.value.clone())
-                                .collect::<Vec<_>>()
-                                .join("."),
+                                .unwrap_or_else(|| "col".to_string()),
                         );
                     }
                     SelectItem::ExprWithAlias { alias, .. } => cols.push(alias.value.clone()),
@@ -2486,15 +2768,36 @@ impl Executor {
                 }
             }
 
-            for row in final_rows {
+            let rows_to_project = match &select.distinct {
+                Some(Distinct::On(on_exprs)) => distinct_on_rows_join(
+                    final_rows,
+                    on_exprs,
+                    &final_column_offsets,
+                    &final_schema,
+                ),
+                _ => final_rows,
+            };
+
+            let has_window_funcs = !window_funcs.is_empty();
+            for (row_idx, row) in rows_to_project.iter().enumerate() {
                 let ctx = JoinContext {
                     tables: HashMap::new(),
                     column_offsets: final_column_offsets.clone(),
-                    combined_row: &row,
+                    combined_row: row,
                     combined_schema: &final_schema,
                 };
                 let mut vals = Vec::new();
-                for item in &resolved_projection {
+                for (proj_idx, item) in resolved_projection.iter().enumerate() {
+                    if has_window_funcs {
+                        if let Some(wf_idx) =
+                            window_funcs.iter().position(|wf| wf.proj_idx == proj_idx)
+                        {
+                            if let Some(ref wr) = window_results {
+                                vals.push(wr[row_idx][wf_idx].clone());
+                                continue;
+                            }
+                        }
+                    }
                     let expr = match item {
                         SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
                         SelectItem::Wildcard(_) => continue,
@@ -2506,7 +2809,7 @@ impl Executor {
             }
         }
 
-        if select.distinct.is_some() {
+        if matches!(&select.distinct, Some(Distinct::Distinct)) {
             result_rows = dedup_rows(result_rows);
         }
 
@@ -2627,6 +2930,63 @@ impl Executor {
                     };
                     let result_bool = if *negated { !exists } else { exists };
                     Ok(Expr::Value(SqlValue::Boolean(result_bool)))
+                }
+                Expr::Case {
+                    operand,
+                    conditions,
+                    results,
+                    else_result,
+                } => {
+                    let resolved_operand = if let Some(op) = operand {
+                        Some(Box::new(self.resolve_subqueries(txn, op).await?))
+                    } else {
+                        None
+                    };
+                    let mut resolved_conditions = Vec::with_capacity(conditions.len());
+                    for cond in conditions {
+                        resolved_conditions.push(self.resolve_subqueries(txn, cond).await?);
+                    }
+                    let mut resolved_results = Vec::with_capacity(results.len());
+                    for res in results {
+                        resolved_results.push(self.resolve_subqueries(txn, res).await?);
+                    }
+                    let resolved_else = if let Some(else_expr) = else_result {
+                        Some(Box::new(self.resolve_subqueries(txn, else_expr).await?))
+                    } else {
+                        None
+                    };
+                    Ok(Expr::Case {
+                        operand: resolved_operand,
+                        conditions: resolved_conditions,
+                        results: resolved_results,
+                        else_result: resolved_else,
+                    })
+                }
+                Expr::Function(func) => {
+                    let mut resolved_args = Vec::new();
+                    for arg in &func.args {
+                        let resolved_arg = match arg {
+                            sqlparser::ast::FunctionArg::Unnamed(
+                                sqlparser::ast::FunctionArgExpr::Expr(e),
+                            ) => sqlparser::ast::FunctionArg::Unnamed(
+                                sqlparser::ast::FunctionArgExpr::Expr(
+                                    self.resolve_subqueries(txn, e).await?,
+                                ),
+                            ),
+                            other => other.clone(),
+                        };
+                        resolved_args.push(resolved_arg);
+                    }
+                    Ok(Expr::Function(sqlparser::ast::Function {
+                        name: func.name.clone(),
+                        args: resolved_args,
+                        filter: func.filter.clone(),
+                        null_treatment: func.null_treatment.clone(),
+                        over: func.over.clone(),
+                        distinct: func.distinct,
+                        special: func.special,
+                        order_by: func.order_by.clone(),
+                    }))
                 }
                 _ => Ok(expr.clone()),
             }
