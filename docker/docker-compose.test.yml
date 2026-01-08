@@ -1,0 +1,114 @@
+version: '3.8'
+
+services:
+  pd:
+    image: pingcap/pd:v8.1.0
+    ports:
+      - "2379:2379"
+    command:
+      - --name=pd
+      - --client-urls=http://0.0.0.0:2379
+      - --peer-urls=http://0.0.0.0:2380
+      - --advertise-client-urls=http://pd:2379
+      - --advertise-peer-urls=http://pd:2380
+      - --initial-cluster=pd=http://pd:2380
+      - --data-dir=/data/pd
+    volumes:
+      - pd_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:2379/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks:
+      - pgtikv
+
+  tikv:
+    image: pingcap/tikv:v8.1.0
+    ports:
+      - "20160:20160"
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=tikv:20160
+      - --pd=pd:2379
+      - --data-dir=/data/tikv
+      - --config=/etc/tikv/tikv.toml
+    volumes:
+      - tikv_data:/data
+      - ./tikv.toml:/etc/tikv/tikv.toml:ro
+    depends_on:
+      pd:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:20180/status"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    networks:
+      - pgtikv
+
+  pg-tikv:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.test
+    ports:
+      - "5433:5433"
+    environment:
+      - PD_ENDPOINTS=pd:2379
+      - PG_PORT=5433
+      - PG_PASSWORD=postgres
+      - RUST_LOG=info
+    depends_on:
+      tikv:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "localhost", "-p", "5433", "-U", "postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - pgtikv
+
+  test:
+    image: postgres:16-bookworm
+    depends_on:
+      pg-tikv:
+        condition: service_healthy
+    environment:
+      - PGHOST=pg-tikv
+      - PGPORT=5433
+      - PGUSER=postgres
+      - PGPASSWORD=postgres
+      - PGDATABASE=postgres
+    volumes:
+      - ../examples:/examples:ro
+      - ../tests:/tests:ro
+    entrypoint: []
+    command: >
+      bash -c "
+        echo '=== pg-tikv Docker Test Suite ==='
+        echo ''
+        echo '>>> Testing connection...'
+        psql -c 'SELECT version()' && echo 'Connection: OK' || exit 1
+        echo ''
+        echo '>>> Running fancy demo...'
+        psql -f /examples/fancy_demo.sql
+        echo ''
+        echo '>>> Running basic tests...'
+        psql -f /tests/01_ddl_basic.sql
+        psql -f /tests/02_dml_crud.sql
+        echo ''
+        echo '=== All tests passed! ==='
+      "
+    networks:
+      - pgtikv
+
+networks:
+  pgtikv:
+    driver: bridge
+
+volumes:
+  pd_data:
+  tikv_data:

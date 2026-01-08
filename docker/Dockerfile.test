@@ -1,0 +1,35 @@
+FROM rust:1.75-bookworm as builder
+
+RUN apt-get update && apt-get install -y \
+    cmake \
+    protobuf-compiler \
+    libssl-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY Cargo.toml Cargo.lock* ./
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs
+RUN cargo build --release 2>/dev/null || true
+RUN rm -rf src
+
+COPY src ./src
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/pg-tikv /usr/local/bin/
+
+ENV PD_ENDPOINTS=pd:2379
+ENV PG_PORT=5433
+ENV PG_PASSWORD=postgres
+
+EXPOSE 5433
+
+CMD ["pg-tikv"]
