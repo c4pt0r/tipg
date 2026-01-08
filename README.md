@@ -2,6 +2,8 @@
 
 A PostgreSQL-compatible distributed SQL database built on TiKV.
 
+A DATABASE FOR AI BY AI
+
 ## Architecture
 
 ```
