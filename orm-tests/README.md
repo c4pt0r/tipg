@@ -260,6 +260,373 @@ describe('ORM New Feature [pg-tikv]', () => {
 npm test -- new-feature.test.ts
 ```
 
+## Examples: Adding Tests for Each ORM
+
+### TypeORM Example
+
+```typescript
+// typeorm/array-ops.test.ts
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { DataSource } from 'typeorm';
+import { createDataSource } from './datasource.js';
+
+describe('TypeORM Array Operations [pg-tikv]', () => {
+  let dataSource: DataSource;
+
+  beforeAll(async () => {
+    dataSource = createDataSource({ synchronize: false });
+    await dataSource.initialize();
+    
+    // Create test table
+    await dataSource.query(`
+      DROP TABLE IF EXISTS typeorm_array_test;
+      CREATE TABLE typeorm_array_test (
+        id SERIAL PRIMARY KEY,
+        tags TEXT[],
+        scores INTEGER[]
+      )
+    `);
+  });
+
+  afterAll(async () => {
+    await dataSource.query('DROP TABLE IF EXISTS typeorm_array_test');
+    await dataSource.destroy();
+  });
+
+  it('should insert and query arrays', async () => {
+    await dataSource.query(
+      `INSERT INTO typeorm_array_test (tags, scores) VALUES ($1, $2)`,
+      [['rust', 'postgres'], [95, 87, 92]]
+    );
+
+    const result = await dataSource.query(
+      `SELECT * FROM typeorm_array_test WHERE 'rust' = ANY(tags)`
+    );
+    
+    expect(result).toHaveLength(1);
+    expect(result[0].tags).toContain('rust');
+  });
+
+  it('should use array functions', async () => {
+    const result = await dataSource.query(
+      `SELECT array_length(scores, 1) as len FROM typeorm_array_test`
+    );
+    
+    expect(result[0].len).toBe(3);
+  });
+});
+```
+
+### Prisma Example
+
+```typescript
+// prisma/json-ops.test.ts
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { PrismaClient } from '@prisma/client';
+import { createPrismaClient } from './client.js';
+
+describe('Prisma JSON Operations [pg-tikv]', () => {
+  let prisma: PrismaClient;
+
+  beforeAll(async () => {
+    prisma = createPrismaClient();
+    
+    // Create test table using raw SQL
+    await prisma.$executeRaw`
+      DROP TABLE IF EXISTS prisma_json_test;
+      CREATE TABLE prisma_json_test (
+        id SERIAL PRIMARY KEY,
+        metadata JSONB
+      )
+    `;
+  });
+
+  afterAll(async () => {
+    await prisma.$executeRaw`DROP TABLE IF EXISTS prisma_json_test`;
+    await prisma.$disconnect();
+  });
+
+  it('should query JSONB with operators', async () => {
+    await prisma.$executeRaw`
+      INSERT INTO prisma_json_test (metadata) 
+      VALUES ('{"name": "Alice", "age": 30, "skills": ["rust", "go"]}')
+    `;
+
+    const result = await prisma.$queryRaw<any[]>`
+      SELECT metadata->>'name' as name, metadata->'age' as age
+      FROM prisma_json_test
+      WHERE metadata @> '{"name": "Alice"}'
+    `;
+    
+    expect(result[0].name).toBe('Alice');
+  });
+
+  it('should use JSONB array access', async () => {
+    const result = await prisma.$queryRaw<any[]>`
+      SELECT metadata->'skills'->0 as first_skill
+      FROM prisma_json_test
+    `;
+    
+    expect(result[0].first_skill).toBe('rust');
+  });
+});
+```
+
+### Knex Example
+
+```typescript
+// knex/window-funcs.test.ts
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { createKnexClient } from './client.js';
+import type { Knex } from 'knex';
+
+describe('Knex Window Functions [pg-tikv]', () => {
+  let knex: Knex;
+
+  beforeAll(async () => {
+    knex = createKnexClient();
+    
+    // Create and populate test table
+    await knex.raw(`DROP TABLE IF EXISTS knex_sales`);
+    await knex.raw(`
+      CREATE TABLE knex_sales (
+        id SERIAL PRIMARY KEY,
+        region TEXT,
+        amount DOUBLE PRECISION,
+        sale_date DATE
+      )
+    `);
+    
+    await knex.raw(`
+      INSERT INTO knex_sales (region, amount, sale_date) VALUES
+      ('North', 1000, '2024-01-15'),
+      ('North', 1500, '2024-01-20'),
+      ('South', 800, '2024-01-10'),
+      ('South', 1200, '2024-01-25')
+    `);
+  });
+
+  afterAll(async () => {
+    await knex.raw('DROP TABLE IF EXISTS knex_sales');
+    await knex.destroy();
+  });
+
+  it('should support ROW_NUMBER', async () => {
+    const result = await knex.raw(`
+      SELECT region, amount,
+        ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC) as rank
+      FROM knex_sales
+    `);
+    
+    expect(result.rows).toHaveLength(4);
+    // First row of each partition should have rank 1
+    const northFirst = result.rows.find(
+      (r: any) => r.region === 'North' && r.rank === '1'
+    );
+    expect(Number(northFirst.amount)).toBe(1500);
+  });
+
+  it('should support running totals', async () => {
+    const result = await knex.raw(`
+      SELECT region, amount,
+        SUM(amount) OVER (PARTITION BY region ORDER BY sale_date) as running_total
+      FROM knex_sales
+      ORDER BY region, sale_date
+    `);
+    
+    expect(result.rows).toHaveLength(4);
+  });
+});
+```
+
+### Sequelize Example
+
+```typescript
+// sequelize/cte.test.ts
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { createSequelize } from './connection.js';
+import { Sequelize, QueryTypes } from 'sequelize';
+
+describe('Sequelize CTE Support [pg-tikv]', () => {
+  let sequelize: Sequelize;
+
+  beforeAll(async () => {
+    sequelize = createSequelize();
+    
+    await sequelize.query(`DROP TABLE IF EXISTS seq_employees`);
+    await sequelize.query(`
+      CREATE TABLE seq_employees (
+        id SERIAL PRIMARY KEY,
+        name TEXT,
+        manager_id INTEGER,
+        department TEXT
+      )
+    `);
+    
+    await sequelize.query(`
+      INSERT INTO seq_employees (name, manager_id, department) VALUES
+      ('CEO', NULL, 'Executive'),
+      ('CTO', 1, 'Tech'),
+      ('Engineer', 2, 'Tech'),
+      ('CFO', 1, 'Finance')
+    `);
+  });
+
+  afterAll(async () => {
+    await sequelize.query('DROP TABLE IF EXISTS seq_employees');
+    await sequelize.close();
+  });
+
+  it('should support simple CTE', async () => {
+    const [results] = await sequelize.query(`
+      WITH tech_team AS (
+        SELECT * FROM seq_employees WHERE department = 'Tech'
+      )
+      SELECT name FROM tech_team ORDER BY name
+    `);
+    
+    expect(results).toHaveLength(2);
+  });
+
+  it('should support recursive CTE for hierarchy', async () => {
+    const [results] = await sequelize.query(`
+      WITH RECURSIVE org_tree AS (
+        SELECT id, name, manager_id, 1 as level
+        FROM seq_employees WHERE manager_id IS NULL
+        
+        UNION ALL
+        
+        SELECT e.id, e.name, e.manager_id, t.level + 1
+        FROM seq_employees e
+        JOIN org_tree t ON e.manager_id = t.id
+      )
+      SELECT name, level FROM org_tree ORDER BY level, name
+    `);
+    
+    expect(results).toHaveLength(4);
+    expect((results[0] as any).level).toBe(1); // CEO at level 1
+  });
+});
+```
+
+### Drizzle Example
+
+```typescript
+// drizzle/subquery.test.ts
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { drizzle } from 'drizzle-orm/node-postgres';
+import { sql } from 'drizzle-orm';
+import { createDrizzleClient, pool } from './client.js';
+
+describe('Drizzle Subquery Support [pg-tikv]', () => {
+  let db: ReturnType<typeof drizzle>;
+
+  beforeAll(async () => {
+    db = createDrizzleClient();
+    
+    await db.execute(sql`DROP TABLE IF EXISTS drizzle_orders`);
+    await db.execute(sql`DROP TABLE IF EXISTS drizzle_products`);
+    
+    await db.execute(sql`
+      CREATE TABLE drizzle_products (
+        id SERIAL PRIMARY KEY,
+        name TEXT,
+        price DOUBLE PRECISION
+      )
+    `);
+    
+    await db.execute(sql`
+      CREATE TABLE drizzle_orders (
+        id SERIAL PRIMARY KEY,
+        product_id INTEGER,
+        quantity INTEGER
+      )
+    `);
+    
+    await db.execute(sql`
+      INSERT INTO drizzle_products (name, price) VALUES
+      ('Widget', 10.00), ('Gadget', 25.00), ('Gizmo', 15.00)
+    `);
+    
+    await db.execute(sql`
+      INSERT INTO drizzle_orders (product_id, quantity) VALUES
+      (1, 5), (2, 3), (1, 2)
+    `);
+  });
+
+  afterAll(async () => {
+    await db.execute(sql`DROP TABLE IF EXISTS drizzle_orders`);
+    await db.execute(sql`DROP TABLE IF EXISTS drizzle_products`);
+    await pool.end();
+  });
+
+  it('should support IN subquery', async () => {
+    const result = await db.execute(sql`
+      SELECT name FROM drizzle_products
+      WHERE id IN (SELECT DISTINCT product_id FROM drizzle_orders)
+      ORDER BY name
+    `);
+    
+    expect(result.rows).toHaveLength(2);
+  });
+
+  it('should support scalar subquery', async () => {
+    const result = await db.execute(sql`
+      SELECT name,
+        (SELECT SUM(quantity) FROM drizzle_orders WHERE product_id = drizzle_products.id) as total_ordered
+      FROM drizzle_products
+      ORDER BY name
+    `);
+    
+    expect(result.rows).toHaveLength(3);
+    const widget = result.rows.find((r: any) => r.name === 'Widget');
+    expect(Number(widget.total_ordered)).toBe(7);
+  });
+
+  it('should support EXISTS subquery', async () => {
+    const result = await db.execute(sql`
+      SELECT name FROM drizzle_products p
+      WHERE EXISTS (
+        SELECT 1 FROM drizzle_orders o WHERE o.product_id = p.id
+      )
+      ORDER BY name
+    `);
+    
+    expect(result.rows).toHaveLength(2);
+  });
+});
+```
+
+### Best Practices
+
+1. **Isolate test data**: Use ORM-prefixed table names (`typeorm_`, `prisma_`, etc.)
+
+2. **Clean up properly**: Always drop tables in `afterAll` to avoid conflicts
+
+3. **Test both ORM methods and raw SQL**: Some features require `$queryRaw` or equivalent
+
+4. **Check actual values**: Don't just check row counts, verify data correctness
+
+5. **Handle async properly**: Always `await` database operations
+
+6. **Use descriptive test names**: `'should support ROW_NUMBER with PARTITION BY'`
+
+7. **Group related tests**: Use nested `describe` blocks for features
+
+```typescript
+describe('Knex Advanced Queries [pg-tikv]', () => {
+  describe('window functions', () => {
+    it('should support ROW_NUMBER', async () => { ... });
+    it('should support RANK', async () => { ... });
+  });
+  
+  describe('CTEs', () => {
+    it('should support simple CTE', async () => { ... });
+    it('should support recursive CTE', async () => { ... });
+  });
+});
+```
+
 ## CI Integration
 
 GitHub Actions workflow is configured in `.github/workflows/orm-tests.yml`.
