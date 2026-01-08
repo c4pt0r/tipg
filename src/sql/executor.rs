@@ -34,6 +34,18 @@ use std::sync::Arc;
 use tikv_client::Transaction;
 use tracing::debug;
 
+fn get_full_table_name(name: &ObjectName) -> String {
+    name.0
+        .iter()
+        .map(|i| i.value.clone())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn get_simple_table_name(name: &ObjectName) -> String {
+    name.0.last().map(|i| i.value.clone()).unwrap_or_default()
+}
+
 pub struct Executor {
     store: Arc<TikvStore>,
     auth_manager: AuthManager,
@@ -1443,12 +1455,22 @@ impl Executor {
 
         let (t, schema, all_rows_base, is_virtual) = match &select.from[0].relation {
             TableFactor::Table { name, .. } => {
-                let t = name.0.last().unwrap().value.clone();
-                let t_lower = t.to_lowercase();
-                let (schema, rows) = self.get_table_data(txn, &t, ctes).await?;
+                let full_name = get_full_table_name(name);
+                let simple_name = get_simple_table_name(name);
+                let lookup_name =
+                    if super::information_schema::get_information_schema_schema(&full_name)
+                        .is_some()
+                    {
+                        full_name.clone()
+                    } else {
+                        simple_name.clone()
+                    };
+                let t_lower = lookup_name.to_lowercase();
+                let (schema, rows) = self.get_table_data(txn, &lookup_name, ctes).await?;
                 let is_virtual = ctes.contains_key(&t_lower)
+                    || super::information_schema::get_information_schema_schema(&t_lower).is_some()
                     || self.store.get_view(txn, &t_lower).await?.is_some();
-                (t, schema, rows, is_virtual)
+                (simple_name, schema, rows, is_virtual)
             }
             TableFactor::Derived {
                 subquery, alias, ..
@@ -2018,6 +2040,15 @@ impl Executor {
         let t_lower = table_name.to_lowercase();
         if let Some((schema, rows)) = ctes.get(&t_lower) {
             return Ok((schema.clone(), rows.clone()));
+        }
+
+        if super::information_schema::get_information_schema_schema(&t_lower).is_some() {
+            return super::information_schema::get_information_schema_data(
+                &self.store,
+                txn,
+                &t_lower,
+            )
+            .await;
         }
 
         if let Some(view_query) = self.store.get_view(txn, &t_lower).await? {

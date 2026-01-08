@@ -2,7 +2,7 @@ use crate::auth::AuthManager;
 use crate::pool::TikvClientPool;
 use crate::sql::{ExecuteResult, Executor, Session};
 use crate::storage::TikvStore;
-use crate::types::Value;
+use crate::types::{DataType, Value};
 use async_trait::async_trait;
 use futures::{stream, Sink, SinkExt};
 use pgwire::api::auth::{ServerParameterProvider, StartupHandler};
@@ -1327,12 +1327,42 @@ impl PgWireServerHandlers for HandlerFactory {
     }
 }
 
+fn datatype_to_pgtype(dt: Option<&DataType>) -> Type {
+    match dt {
+        Some(DataType::Boolean) => Type::BOOL,
+        Some(DataType::Int32) => Type::INT4,
+        Some(DataType::Int64) => Type::INT8,
+        Some(DataType::Float64) => Type::FLOAT8,
+        Some(DataType::Timestamp) => Type::TIMESTAMPTZ,
+        Some(DataType::Interval) => Type::INTERVAL,
+        Some(DataType::Uuid) => Type::UUID,
+        Some(DataType::Bytes) => Type::BYTEA,
+        Some(DataType::Json) => Type::JSON,
+        Some(DataType::Jsonb) => Type::JSONB,
+        Some(DataType::Array(_)) | Some(DataType::Text) | None => Type::TEXT,
+    }
+}
+
 fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> {
     match result {
         ExecuteResult::Select { columns, rows } => {
+            let inferred_types: Vec<Type> = if let Some(first_row) = rows.first() {
+                first_row
+                    .values
+                    .iter()
+                    .map(|v| datatype_to_pgtype(v.data_type().as_ref()))
+                    .collect()
+            } else {
+                vec![Type::TEXT; columns.len()]
+            };
+
             let fields: Vec<FieldInfo> = columns
                 .iter()
-                .map(|name| FieldInfo::new(name.clone(), None, None, Type::TEXT, FieldFormat::Text))
+                .enumerate()
+                .map(|(i, name)| {
+                    let pg_type = inferred_types.get(i).cloned().unwrap_or(Type::TEXT);
+                    FieldInfo::new(name.clone(), None, None, pg_type, FieldFormat::Text)
+                })
                 .collect();
 
             let fields = Arc::new(fields);

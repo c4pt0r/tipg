@@ -6,6 +6,7 @@ mod executor;
 mod explain;
 mod expr;
 mod helpers;
+mod information_schema;
 mod parser;
 mod planner;
 mod query;
