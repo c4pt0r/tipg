@@ -137,6 +137,16 @@ pub fn value_to_sql_expr(v: &Value) -> Expr {
                 named: true,
             })
         }
+        Value::Vector(vec) => {
+            let vec_str = format!(
+                "[{}]",
+                vec.iter()
+                    .map(|f| f.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            Expr::Value(SqlValue::SingleQuotedString(vec_str))
+        }
         Value::Json(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
         Value::Jsonb(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
     }
@@ -237,7 +247,7 @@ pub fn convert_data_type(sql_type: &SqlDataType) -> Result<DataType> {
         SqlDataType::Date => Ok(DataType::Timestamp),
         SqlDataType::Uuid => Ok(DataType::Uuid),
         SqlDataType::JSON => Ok(DataType::Jsonb),
-        SqlDataType::Custom(name, _) => {
+        SqlDataType::Custom(name, modifiers) => {
             if let Some(ident) = name.0.last() {
                 let type_name = ident.value.to_uppercase();
                 match type_name.as_str() {
@@ -245,6 +255,13 @@ pub fn convert_data_type(sql_type: &SqlDataType) -> Result<DataType> {
                     "BIGSERIAL" => Ok(DataType::Int64),
                     "JSON" => Ok(DataType::Json),
                     "JSONB" => Ok(DataType::Jsonb),
+                    "VECTOR" => {
+                        // Extract dimension from type modifiers if available
+                        // For now, use default dimension of 1536 (OpenAI embedding dimension)
+                        // TODO: Parse dimension from modifiers when sqlparser supports it
+                        let dim = 1536;
+                        Ok(DataType::Vector(dim))
+                    }
                     _ => Ok(DataType::Text),
                 }
             } else {
@@ -526,6 +543,7 @@ pub fn infer_data_type(value: &Value) -> DataType {
         Value::Timestamp(_) => DataType::Timestamp,
         Value::Interval { .. } => DataType::Interval,
         Value::Uuid(_) => DataType::Uuid,
+        Value::Vector(vec) => DataType::Vector(vec.len() as u32),
         Value::Json(_) => DataType::Json,
         Value::Jsonb(_) => DataType::Jsonb,
         Value::Array(_) => DataType::Text,
@@ -820,6 +838,23 @@ pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Value {
         DataType::Jsonb => {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&unescaped) {
                 Value::Jsonb(parsed.to_string())
+            } else {
+                Value::Text(unescaped)
+            }
+        }
+        DataType::Vector(_) => {
+            // Parse vector literal: [1.0, 2.0, 3.0]
+            if unescaped.starts_with('[') && unescaped.ends_with(']') {
+                let inner = &unescaped[1..unescaped.len() - 1];
+                let elements: Result<Vec<f64>, _> = inner
+                    .split(',')
+                    .map(|s| s.trim().parse::<f64>())
+                    .collect();
+                if let Ok(vec) = elements {
+                    Value::Vector(vec)
+                } else {
+                    Value::Text(unescaped)
+                }
             } else {
                 Value::Text(unescaped)
             }

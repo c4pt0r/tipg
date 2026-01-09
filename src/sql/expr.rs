@@ -1,7 +1,7 @@
 //! Expression evaluation logic
 
 use crate::types::{Row, TableSchema, Value};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use sqlparser::ast::{BinaryOperator, Expr, JsonOperator, Value as SqlValue};
 use std::collections::HashMap;
 
@@ -1676,6 +1676,47 @@ fn eval_function(
             let json_val = value_to_json(&val);
             Ok(Value::Jsonb(json_val.to_string()))
         }
+        "L2_DISTANCE" => {
+            if args.len() != 2 {
+                return Err(anyhow!("l2_distance requires exactly 2 arguments"));
+            }
+            let vec1 = extract_vector(&args[0])?;
+            let vec2 = extract_vector(&args[1])?;
+            let dist = l2_distance(&vec1, &vec2)?;
+            Ok(Value::Float64(dist))
+        }
+        "COSINE_DISTANCE" => {
+            if args.len() != 2 {
+                return Err(anyhow!("cosine_distance requires exactly 2 arguments"));
+            }
+            let vec1 = extract_vector(&args[0])?;
+            let vec2 = extract_vector(&args[1])?;
+            let dist = cosine_distance(&vec1, &vec2)?;
+            Ok(Value::Float64(dist))
+        }
+        "INNER_PRODUCT" => {
+            if args.len() != 2 {
+                return Err(anyhow!("inner_product requires exactly 2 arguments"));
+            }
+            let vec1 = extract_vector(&args[0])?;
+            let vec2 = extract_vector(&args[1])?;
+            let prod = inner_product(&vec1, &vec2)?;
+            Ok(Value::Float64(prod))
+        }
+        "VECTOR_DIMS" => {
+            if args.is_empty() {
+                return Err(anyhow!("vector_dims requires 1 argument"));
+            }
+            let vec = extract_vector(&args[0])?;
+            Ok(Value::Int32(vec.len() as i32))
+        }
+        "VECTOR_NORM" => {
+            if args.is_empty() {
+                return Err(anyhow!("vector_norm requires 1 argument"));
+            }
+            let vec = extract_vector(&args[0])?;
+            Ok(Value::Float64(vector_norm(&vec)))
+        }
         _ => Err(anyhow!("Unsupported function: {}", func_name)),
     }
 }
@@ -1765,6 +1806,11 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
                             .map_err(|e| anyhow!("invalid input syntax for type jsonb: {}", e))?;
                         Ok(Value::Jsonb(parsed.to_string()))
                     }
+                    "VECTOR" => match &v {
+                        Value::Text(s) => parse_vector_literal(s).map(Value::Vector),
+                        Value::Vector(_) => Ok(v),
+                        _ => Err(anyhow!("Cannot cast {} to vector", v)),
+                    },
                     _ => Ok(v),
                 }
             } else {
@@ -1859,6 +1905,12 @@ fn eval_value(v: &SqlValue) -> Result<Value> {
             }
         }
         SqlValue::SingleQuotedString(s) | SqlValue::DoubleQuotedString(s) => {
+            // Try parsing as vector if starts with [
+            if s.starts_with('[') && s.ends_with(']') {
+                if let Ok(vec) = parse_vector_literal(s) {
+                    return Ok(Value::Vector(vec));
+                }
+            }
             Ok(Value::Text(s.clone()))
         }
         _ => Err(anyhow!("Unsupported value literal: {:?}", v)),
@@ -2107,6 +2159,9 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
         (Value::Jsonb(_), _) | (_, Value::Jsonb(_)) => Err(anyhow!(
             "could not identify an ordering operator for type jsonb"
         )),
+        (Value::Vector(_), _) | (_, Value::Vector(_)) => Err(anyhow!(
+            "Vectors cannot be directly compared. Use vector distance functions instead."
+        )),
         _ => Err(anyhow!(
             "Cannot compare distinct types: {:?} vs {:?}",
             left,
@@ -2350,6 +2405,12 @@ fn value_to_json(val: &Value) -> serde_json::Value {
         Value::Uuid(bytes) => serde_json::Value::String(uuid::Uuid::from_bytes(*bytes).to_string()),
         Value::Bytes(b) => serde_json::Value::String(format!("\\x{}", hex::encode(b))),
         Value::Interval(ms) => serde_json::Value::Number(serde_json::Number::from(*ms)),
+        Value::Vector(vec) => serde_json::Value::Array(
+            vec.iter()
+                .filter_map(|f| serde_json::Number::from_f64(*f))
+                .map(serde_json::Value::Number)
+                .collect(),
+        ),
     }
 }
 
@@ -2404,6 +2465,128 @@ fn eval_array_index_join(arr_val: Value, indexes: &[Expr], ctx: &JoinContext) ->
         current = arr.get(pg_idx).cloned().unwrap_or(Value::Null);
     }
     Ok(current)
+}
+
+// ============================================================================
+// Vector Support Functions
+// ============================================================================
+
+/// Parse a vector literal from a string like "[1.0, 2.0, 3.0]"
+fn parse_vector_literal(s: &str) -> Result<Vec<f64>> {
+    let s = s.trim();
+    if !s.starts_with('[') || !s.ends_with(']') {
+        return Err(anyhow!("Vector literal must be enclosed in brackets"));
+    }
+
+    let s = &s[1..s.len() - 1]; // Remove brackets
+    if s.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let elements: Result<Vec<f64>> = s
+        .split(',')
+        .map(|elem| {
+            elem.trim()
+                .parse::<f64>()
+                .with_context(|| format!("Invalid vector element: {}", elem))
+        })
+        .collect();
+
+    elements
+}
+
+/// Extract a vector from a Value (handles both Vector and Array types)
+fn extract_vector(val: &Value) -> Result<Vec<f64>> {
+    match val {
+        Value::Vector(vec) => Ok(vec.clone()),
+        Value::Array(arr) => {
+            // Convert array of numbers to vector
+            arr.iter()
+                .map(|v| match v {
+                    Value::Float64(f) => Ok(*f),
+                    Value::Int32(i) => Ok(*i as f64),
+                    Value::Int64(i) => Ok(*i as f64),
+                    _ => Err(anyhow!("Vector elements must be numeric")),
+                })
+                .collect()
+        }
+        _ => Err(anyhow!("Expected vector or array type")),
+    }
+}
+
+/// Calculate L2 (Euclidean) distance between two vectors
+fn l2_distance(vec1: &[f64], vec2: &[f64]) -> Result<f64> {
+    if vec1.len() != vec2.len() {
+        return Err(anyhow!(
+            "Vectors must have same dimensions ({} vs {})",
+            vec1.len(),
+            vec2.len()
+        ));
+    }
+
+    let sum: f64 = vec1
+        .iter()
+        .zip(vec2.iter())
+        .map(|(a, b)| {
+            let diff = a - b;
+            diff * diff
+        })
+        .sum();
+
+    Ok(sum.sqrt())
+}
+
+/// Calculate cosine distance between two vectors (1 - cosine similarity)
+fn cosine_distance(vec1: &[f64], vec2: &[f64]) -> Result<f64> {
+    if vec1.len() != vec2.len() {
+        return Err(anyhow!(
+            "Vectors must have same dimensions ({} vs {})",
+            vec1.len(),
+            vec2.len()
+        ));
+    }
+
+    let mut dot_product = 0.0;
+    let mut norm1 = 0.0;
+    let mut norm2 = 0.0;
+
+    for (a, b) in vec1.iter().zip(vec2.iter()) {
+        dot_product += a * b;
+        norm1 += a * a;
+        norm2 += b * b;
+    }
+
+    if norm1 == 0.0 || norm2 == 0.0 {
+        return Ok(1.0); // Maximum distance if either vector is zero
+    }
+
+    let cosine_similarity = dot_product / (norm1.sqrt() * norm2.sqrt());
+    // Clamp to [-1, 1] to handle floating point errors
+    let cosine_similarity = cosine_similarity.max(-1.0).min(1.0);
+
+    // Return distance: 1 - similarity
+    Ok(1.0 - cosine_similarity)
+}
+
+/// Calculate inner product (negative for ORDER BY compatibility)
+fn inner_product(vec1: &[f64], vec2: &[f64]) -> Result<f64> {
+    if vec1.len() != vec2.len() {
+        return Err(anyhow!(
+            "Vectors must have same dimensions ({} vs {})",
+            vec1.len(),
+            vec2.len()
+        ));
+    }
+
+    let dot: f64 = vec1.iter().zip(vec2.iter()).map(|(a, b)| a * b).sum();
+
+    // Return negative inner product (for ORDER BY compatibility like pgvector)
+    Ok(-dot)
+}
+
+/// Calculate Euclidean norm (L2 norm) of a vector
+fn vector_norm(vec: &[f64]) -> f64 {
+    vec.iter().map(|x| x * x).sum::<f64>().sqrt()
 }
 
 #[cfg(test)]
@@ -3276,5 +3459,88 @@ mod tests {
             .unwrap(),
             Value::Boolean(false)
         );
+    }
+
+    #[test]
+    fn test_parse_vector_literal() {
+        let vec = parse_vector_literal("[1.0, 2.0, 3.0]").unwrap();
+        assert_eq!(vec, vec![1.0, 2.0, 3.0]);
+
+        let vec2 = parse_vector_literal("[1,2,3]").unwrap();
+        assert_eq!(vec2, vec![1.0, 2.0, 3.0]);
+
+        assert!(parse_vector_literal("not a vector").is_err());
+        assert!(parse_vector_literal("[1, 2, abc]").is_err());
+    }
+
+    #[test]
+    fn test_l2_distance() {
+        let v1 = vec![1.0, 0.0, 0.0];
+        let v2 = vec![0.0, 1.0, 0.0];
+        let dist = l2_distance(&v1, &v2).unwrap();
+        assert!((dist - 1.414213).abs() < 0.001);
+
+        let v3 = vec![1.0, 2.0, 3.0];
+        let v4 = vec![1.0, 2.0, 3.0];
+        let dist2 = l2_distance(&v3, &v4).unwrap();
+        assert!(dist2.abs() < 0.001); // Same vectors = 0 distance
+    }
+
+    #[test]
+    fn test_cosine_distance() {
+        let v1 = vec![1.0, 0.0, 0.0];
+        let v2 = vec![1.0, 0.0, 0.0];
+        let dist = cosine_distance(&v1, &v2).unwrap();
+        assert!(dist.abs() < 0.001); // Same vectors = 0 distance
+
+        let v3 = vec![1.0, 0.0, 0.0];
+        let v4 = vec![0.0, 1.0, 0.0];
+        let dist2 = cosine_distance(&v3, &v4).unwrap();
+        assert!((dist2 - 1.0).abs() < 0.001); // Orthogonal = max distance
+    }
+
+    #[test]
+    fn test_inner_product() {
+        let v1 = vec![1.0, 2.0, 3.0];
+        let v2 = vec![4.0, 5.0, 6.0];
+        let prod = inner_product(&v1, &v2).unwrap();
+        assert_eq!(prod, -(4.0 + 10.0 + 18.0)); // negative for ORDER BY
+    }
+
+    #[test]
+    fn test_vector_norm() {
+        let v1 = vec![3.0, 4.0];
+        let norm = vector_norm(&v1);
+        assert_eq!(norm, 5.0); // 3-4-5 triangle
+
+        let v2 = vec![1.0, 0.0, 0.0];
+        let norm2 = vector_norm(&v2);
+        assert_eq!(norm2, 1.0);
+    }
+
+    #[test]
+    fn test_extract_vector() {
+        // Test with Vector value
+        let vec_val = Value::Vector(vec![1.0, 2.0, 3.0]);
+        let extracted = extract_vector(&vec_val).unwrap();
+        assert_eq!(extracted, vec![1.0, 2.0, 3.0]);
+
+        // Test with Array value
+        let arr_val = Value::Array(vec![
+            Value::Float64(1.0),
+            Value::Float64(2.0),
+            Value::Float64(3.0),
+        ]);
+        let extracted2 = extract_vector(&arr_val).unwrap();
+        assert_eq!(extracted2, vec![1.0, 2.0, 3.0]);
+
+        // Test with Int32 array
+        let arr_int = Value::Array(vec![
+            Value::Int32(1),
+            Value::Int32(2),
+            Value::Int32(3),
+        ]);
+        let extracted3 = extract_vector(&arr_int).unwrap();
+        assert_eq!(extracted3, vec![1.0, 2.0, 3.0]);
     }
 }

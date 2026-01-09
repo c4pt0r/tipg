@@ -16,6 +16,7 @@ pub enum DataType {
     Interval,
     Uuid,
     Array(Box<DataType>),
+    Vector(u32), // dimension count
     // NOTE: Json and Jsonb MUST remain at end of enum to preserve bincode compatibility
     // with existing serialized schemas. Do not reorder!
     Json,
@@ -35,6 +36,7 @@ impl DataType {
             DataType::Interval => 8,
             DataType::Uuid => 16,
             DataType::Array(_) => 64,
+            DataType::Vector(dim) => (*dim as usize) * 8, // 8 bytes per f64
             DataType::Json => 64,
             DataType::Jsonb => 64,
         }
@@ -54,6 +56,7 @@ impl fmt::Display for DataType {
             DataType::Interval => write!(f, "INTERVAL"),
             DataType::Uuid => write!(f, "UUID"),
             DataType::Array(elem_type) => write!(f, "{}[]", elem_type),
+            DataType::Vector(dim) => write!(f, "vector({})", dim),
             DataType::Json => write!(f, "JSON"),
             DataType::Jsonb => write!(f, "JSONB"),
         }
@@ -74,6 +77,7 @@ pub enum Value {
     Interval(i64),
     Uuid([u8; 16]),
     Array(Vec<Value>),
+    Vector(Vec<f64>), // embedding as f64 array
     Json(String),
     Jsonb(String),
 }
@@ -97,6 +101,7 @@ impl Value {
                     elem_type.unwrap_or(DataType::Text),
                 )))
             }
+            Value::Vector(vec) => Some(DataType::Vector(vec.len() as u32)),
             Value::Json(_) => Some(DataType::Json),
             Value::Jsonb(_) => Some(DataType::Jsonb),
         }
@@ -150,6 +155,16 @@ impl fmt::Display for Value {
                     }
                 }
                 write!(f, "}}")
+            }
+            Value::Vector(vec) => {
+                write!(f, "[")?;
+                for (i, v) in vec.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ",")?;
+                    }
+                    write!(f, "{}", v)?;
+                }
+                write!(f, "]")
             }
             Value::Json(s) => write!(f, "{}", s),
             Value::Jsonb(s) => write!(f, "{}", s),

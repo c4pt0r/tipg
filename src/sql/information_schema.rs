@@ -312,6 +312,7 @@ fn data_type_to_pg_type(dt: &DataType) -> &'static str {
         },
         DataType::Json => "json",
         DataType::Jsonb => "jsonb",
+        DataType::Vector(_) => "vector",
     }
 }
 

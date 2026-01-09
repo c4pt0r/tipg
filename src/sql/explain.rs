@@ -453,6 +453,10 @@ fn format_value(value: &crate::types::Value) -> String {
             let elems: Vec<String> = arr.iter().map(format_value).collect();
             format!("ARRAY[{}]", elems.join(", "))
         }
+        crate::types::Value::Vector(vec) => {
+            let elems: Vec<String> = vec.iter().map(|f| f.to_string()).collect();
+            format!("'[{}]'", elems.join(","))
+        }
     }
 }
 

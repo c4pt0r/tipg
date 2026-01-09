@@ -1339,7 +1339,7 @@ fn datatype_to_pgtype(dt: Option<&DataType>) -> Type {
         Some(DataType::Bytes) => Type::BYTEA,
         Some(DataType::Json) => Type::JSON,
         Some(DataType::Jsonb) => Type::JSONB,
-        Some(DataType::Array(_)) | Some(DataType::Text) | None => Type::TEXT,
+        Some(DataType::Vector(_)) | Some(DataType::Array(_)) | Some(DataType::Text) | None => Type::TEXT,
     }
 }
 
@@ -1603,6 +1603,17 @@ fn encode_value(encoder: &mut DataRowEncoder, value: &Value) -> PgWireResult<()>
         }
         Value::Json(s) => encoder.encode_field(s),
         Value::Jsonb(s) => encoder.encode_field(s),
+        Value::Vector(vec) => {
+            // Encode as text: [1.0,2.0,3.0]
+            let vec_str = format!(
+                "[{}]",
+                vec.iter()
+                    .map(|f| f.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            encoder.encode_field(&vec_str)
+        }
     }
 }
 
