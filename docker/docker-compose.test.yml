@@ -53,7 +53,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.test
     ports:
-      - "5433:5433"
+      - "5434:5433"
     environment:
       - PD_ENDPOINTS=pd:2379
       - PG_PORT=5433

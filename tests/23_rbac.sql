@@ -1,6 +1,14 @@
 -- RBAC (Role-Based Access Control) Integration Tests
 -- Tests CREATE ROLE, ALTER ROLE, DROP ROLE, GRANT, REVOKE
 
+-- Cleanup from previous runs
+DROP ROLE IF EXISTS test_reader;
+DROP ROLE IF EXISTS test_writer;
+DROP ROLE IF EXISTS test_admin;
+DROP ROLE IF EXISTS test_dba;
+DROP ROLE IF EXISTS test_nologin;
+DROP ROLE IF EXISTS new_role;
+
 -- ============================================
 -- Test 1: CREATE ROLE basic
 -- ============================================

@@ -90,16 +90,16 @@ DROP TABLE join_right;
 -- ============================================
 -- 6. JSON Operators Tests
 -- ============================================
-SELECT '{"name": "Alice", "age": 30}'::text -> 'name';
-SELECT '{"name": "Alice", "age": 30}'::text ->> 'name';
-SELECT '{"name": "Alice", "age": 30}'::text ->> 'age';
+SELECT '{"name": "Alice", "age": 30}'::jsonb -> 'name';
+SELECT '{"name": "Alice", "age": 30}'::jsonb ->> 'name';
+SELECT '{"name": "Alice", "age": 30}'::jsonb ->> 'age';
 
-SELECT '{"user": {"name": "Bob"}}'::text -> 'user' ->> 'name';
+SELECT '{"user": {"name": "Bob"}}'::jsonb -> 'user' ->> 'name';
 
-SELECT '[1, 2, 3]'::text -> 0;
-SELECT '["a", "b", "c"]'::text ->> 1;
+SELECT '[1, 2, 3]'::jsonb -> 0;
+SELECT '["a", "b", "c"]'::jsonb ->> 1;
 
-SELECT '{"items": [1, 2, 3]}'::text -> 'items' -> 0;
+SELECT '{"items": [1, 2, 3]}'::jsonb -> 'items' -> 0;
 
 -- ============================================
 -- 7. ARRAY Tests

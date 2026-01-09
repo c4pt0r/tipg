@@ -100,6 +100,10 @@ impl Executor {
             return self.execute_drop_procedure_cmd(session, sql).await;
         }
 
+        if sql_upper.starts_with("CREATE PROCEDURE") {
+            return self.execute_create_procedure_cmd(session, sql).await;
+        }
+
         let statements = match parse_sql(sql) {
             Ok(stmts) => stmts,
             Err(e) => {
@@ -825,6 +829,74 @@ impl Executor {
             }
 
             Ok(ExecuteResult::Call)
+        }
+        .await;
+
+        if is_autocommit {
+            if result.is_ok() {
+                session.commit().await?;
+            } else {
+                session.rollback().await?;
+            }
+        }
+
+        result
+    }
+
+    async fn execute_create_procedure_cmd(
+        &self,
+        session: &mut Session,
+        sql: &str,
+    ) -> Result<ExecuteResult> {
+        let sql_trimmed = sql.trim();
+        let rest = sql_trimmed
+            .strip_prefix("CREATE PROCEDURE")
+            .or_else(|| sql_trimmed.strip_prefix("CREATE OR REPLACE PROCEDURE"))
+            .or_else(|| sql_trimmed.strip_prefix("create procedure"))
+            .or_else(|| sql_trimmed.strip_prefix("create or replace procedure"))
+            .ok_or_else(|| anyhow!("Invalid CREATE PROCEDURE syntax"))?
+            .trim();
+
+        let (name_and_params, body) = rest
+            .split_once("AS BEGIN")
+            .or_else(|| rest.split_once("as begin"))
+            .or_else(|| rest.split_once("AS\nBEGIN"))
+            .or_else(|| rest.split_once("as\nbegin"))
+            .ok_or_else(|| anyhow!("CREATE PROCEDURE requires AS BEGIN ... END syntax"))?;
+
+        let body = body
+            .strip_suffix("END;")
+            .or_else(|| body.strip_suffix("END"))
+            .or_else(|| body.strip_suffix("end;"))
+            .or_else(|| body.strip_suffix("end"))
+            .unwrap_or(body)
+            .trim();
+
+        let name_and_params = name_and_params.trim();
+        let (proc_name, params_str) = if let Some(paren_pos) = name_and_params.find('(') {
+            let name = name_and_params[..paren_pos].trim().to_lowercase();
+            let params = name_and_params[paren_pos..]
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .trim();
+            (name, params)
+        } else {
+            (name_and_params.to_lowercase(), "")
+        };
+
+        let definition = format!("PARAMS:{}\nBODY:{}", params_str, body);
+
+        let is_autocommit = !session.is_in_transaction();
+        if is_autocommit {
+            session.begin().await?;
+        }
+
+        let result = async {
+            let txn = session.get_mut_txn().expect("Transaction must be active");
+            self.store
+                .create_procedure(txn, &proc_name, &definition)
+                .await?;
+            Ok(ExecuteResult::CreateProcedure { proc_name })
         }
         .await;
 
